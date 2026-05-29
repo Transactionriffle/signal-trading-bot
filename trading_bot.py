@@ -282,7 +282,7 @@ def find_best_entry(exclude: list[str]) -> dict | None:
         if result and result["signal"] == "BUY" and result["confidence"] >= MIN_CONFIDENCE:
             candidates.append(result)
             log.info(f"  {symbol}: composite={result['composite']:.2f}, confidence={result['confidence']}%")
-        time.sleep(2)
+        time.sleep(8)
 
     if not candidates:
         log.info("No qualifying BUY signals found.")
