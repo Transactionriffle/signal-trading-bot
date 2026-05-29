@@ -1,0 +1,25 @@
+services:
+  - type: worker
+    name: signal-trading-bot
+    runtime: python
+    buildCommand: pip install -r requirements_bot.txt
+    startCommand: python trading_bot.py
+    envVars:
+      - key: ALPACA_API_KEY
+        value: PKRTBHHT6MGSTV6NJ6HU45PVW4
+      - key: ALPACA_SECRET_KEY
+        value: 6QaZu55EcVuEiEYWZFZksFAUxFE3WxMSHvWky49ULah3
+      - key: ALPACA_BASE_URL
+        value: https://paper-api.alpaca.markets
+      - key: ANTHROPIC_API_KEY
+        value: YOUR_ANTHROPIC_API_KEY
+      - key: CLOUDFLARE_WORKER
+        value: https://winter-cake-6aae.dimitridesplace-65f.workers.dev
+      - key: TECH_WEIGHT
+        value: "60"
+      - key: PROFIT_TARGET
+        value: "0.05"
+      - key: MIN_CONFIDENCE
+        value: "80"
+      - key: SCAN_UNIVERSE
+        value: NVDA,AAPL,MSFT,AMZN,META,GOOG,TSLA,AMD,AVGO,QCOM,ARM,PANW,ASML,SMCI,MU,ORCL,CRM,SNOW,PLTR,LLY,NVO,ABBV,UNH,JPM,GS,V,MA,XOM,CVX,NEE,ENPH,GE,CAT,UBER,SPOT
