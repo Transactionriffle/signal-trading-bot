@@ -233,7 +233,7 @@ Return ONLY valid JSON (no markdown):
 }}"""
 
         response = ai_client.messages.create(
-            model="claude-sonnet-4-5",
+            model="claude-sonnet-4-20250514",
             max_tokens=300,
             tools=[{"type": "web_search_20250305", "name": "web_search"}],
             messages=[{"role": "user", "content": prompt}],
@@ -272,7 +272,8 @@ def compute_signal(symbol: str) -> dict | None:
         "thesis":     fund.get("thesis", ""),
     }
 
-def find_best_entry(exclude: list[str]) -> dict | None:
+def find_candidates(exclude: list[str]) -> list[dict]:
+    """Scans universe and returns all qualifying BUY signals sorted by confidence desc."""
     candidates = []
     targets = [s for s in SCAN_UNIVERSE if s not in exclude]
     log.info(f"Scanning {len(targets)} tickers...")
@@ -284,13 +285,8 @@ def find_best_entry(exclude: list[str]) -> dict | None:
             log.info(f"  {symbol}: composite={result['composite']:.2f}, confidence={result['confidence']}%")
         time.sleep(8)
 
-    if not candidates:
-        log.info("No qualifying BUY signals found.")
-        return None
-
-    best = max(candidates, key=lambda x: x["confidence"])
-    log.info(f"Best entry: {best['symbol']} @ {best['confidence']}% confidence — {best['thesis']}")
-    return best
+    candidates.sort(key=lambda x: x["confidence"], reverse=True)
+    return candidates
 
 # ══════════════════════════════════════════════════════════════
 # TRADING ACTIONS
@@ -311,29 +307,54 @@ def check_profit_targets(positions: dict) -> list[str]:
     return closed
 
 def reinvest(current_positions: dict, account):
+    """
+    Allocation rule:
+    - 1 qualifying signal  → 100% of cash into it
+    - 2+ qualifying signals → 50% into highest confidence, rest split equally
+    """
     cash = float(account.cash)
     if cash < 100:
         log.info(f"Not enough cash to reinvest (${cash:.2f})")
         return
 
     log.info(f"Reinvesting ${cash:,.2f}...")
-    best = find_best_entry(exclude=list(current_positions.keys()))
-    if not best:
-        log.info("No qualifying signal — cash stays idle")
+    candidates = find_candidates(exclude=list(current_positions.keys()))
+
+    if not candidates:
+        log.info("No qualifying signals — cash stays idle")
         return
 
-    symbol, price = best["symbol"], best["price"]
-    if price <= 0:
-        log.warning(f"Invalid price for {symbol}")
-        return
+    # Build allocation: {symbol: cash_amount}
+    allocations = {}
+    if len(candidates) == 1:
+        allocations[candidates[0]["symbol"]] = cash
+        log.info(f"Single signal — deploying 100% into {candidates[0]['symbol']}")
+    else:
+        top    = candidates[0]
+        rest   = candidates[1:]
+        top_cash  = cash * 0.50
+        rest_cash = (cash * 0.50) / len(rest)
+        allocations[top["symbol"]] = top_cash
+        for c in rest:
+            allocations[c["symbol"]] = rest_cash
+        log.info(f"Multi-signal split: {top['symbol']} gets 50% (${top_cash:,.0f}), "
+                 f"{[c['symbol'] for c in rest]} split remaining 50% (${rest_cash:,.0f} each)")
 
-    qty = int(cash / price)
-    if qty < 1:
-        log.info(f"Not enough cash to buy 1 share of {symbol} at ${price:.2f}")
-        return
+    # Build price lookup
+    price_map = {c["symbol"]: c["price"] for c in candidates}
 
-    log.info(f"Deploying ${cash:,.2f} → {qty}x {symbol} @ ~${price:.2f}")
-    place_buy(symbol, qty)
+    # Place orders
+    for symbol, alloc in allocations.items():
+        price = price_map.get(symbol, 0)
+        if price <= 0:
+            log.warning(f"Invalid price for {symbol} — skipping")
+            continue
+        qty = int(alloc / price)
+        if qty < 1:
+            log.info(f"Not enough allocation (${alloc:.0f}) to buy 1 share of {symbol} at ${price:.2f} — skipping")
+            continue
+        log.info(f"  {symbol}: ${alloc:,.0f} → {qty} shares @ ~${price:.2f}")
+        place_buy(symbol, qty)
 
 # ══════════════════════════════════════════════════════════════
 # MAIN LOOP
