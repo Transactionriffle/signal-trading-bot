@@ -25,7 +25,7 @@ Environment variables (set in Render):
     MAX_DRAWDOWN_PCT       (default: 0.15)
     PAUSED                 (set "true" to halt instantly)
     TOP_ACTIVE             (default: 50 — most active by volume)
-    TOP_MOVERS             (default: 20 — top gainers and losers each)
+    TOP_MOVERS             (default: 20 — top gainers only)
 
 Risk thresholds (hardcoded):
     PROFIT_TARGET = +5%   sell at full target
@@ -105,9 +105,8 @@ ai_client = anthropic.Anthropic(api_key=ANTHROPIC_KEY)
 def build_universe() -> list[str]:
     """
     Builds a fresh dynamic universe from Alpaca market data:
-    - Top N most active stocks by volume
-    - Top N gainers
-    - Top N losers
+    - Top N most active stocks by volume  → momentum confirmation
+    - Top N gainers                       → breakout candidates
     Deduplicates and filters to tradeable US equities only.
     Called once per trading day at market open, and again on each reinvestment.
     """
@@ -123,23 +122,16 @@ def build_universe() -> list[str]:
         log.warning(f"Most active fetch failed: {e}")
 
     try:
-        # Top gainers and losers
+        # Top gainers only — momentum aligned with strategy
         movers = trade_client.get_market_movers(top=TOP_MOVERS)
-
         if hasattr(movers, 'gainers') and movers.gainers:
             gainer_symbols = [s.symbol for s in movers.gainers]
             symbols.update(gainer_symbols)
             log.info(f"Top gainers ({len(gainer_symbols)}): {gainer_symbols[:5]}...")
-
-        if hasattr(movers, 'losers') and movers.losers:
-            loser_symbols = [s.symbol for s in movers.losers]
-            symbols.update(loser_symbols)
-            log.info(f"Top losers ({len(loser_symbols)}): {loser_symbols[:5]}...")
-
     except Exception as e:
         log.warning(f"Market movers fetch failed: {e}")
 
-    # Filter out symbols with special characters (ETFs, preferred shares, warrants)
+    # Filter out ETFs, preferred shares, warrants (contain numbers or special chars)
     clean = [s for s in symbols if s.isalpha() and len(s) <= 5]
 
     if not clean:
@@ -149,7 +141,7 @@ def build_universe() -> list[str]:
             "AVGO","QCOM","ARM","PANW","LLY","JPM","V","XOM",
         ]
 
-    log.info(f"Dynamic universe built: {len(clean)} unique tickers")
+    log.info(f"Dynamic universe built: {len(clean)} unique tickers (most active + gainers)")
     return clean
 
 
@@ -474,7 +466,7 @@ def reinvest(current_positions: dict, account):
 def run():
     log.info("=" * 60)
     log.info("SIGNAL Trading Bot started")
-    log.info(f"  Universe:           DYNAMIC — top {TOP_ACTIVE} active + top/bottom {TOP_MOVERS} movers")
+    log.info(f"  Universe:           DYNAMIC — top {TOP_ACTIVE} most active + top {TOP_MOVERS} gainers")
     log.info(f"  Profit target:      +{PROFIT_TARGET*100:.0f}%")
     log.info(f"  Trailing:           peak >={PEAK_TRIGGER*100:.0f}% → sell at +{TRAIL_SELL*100:.0f}%")
     log.info(f"  Stop loss:          -{abs(STOP_LOSS)*100:.0f}%")
