@@ -1,33 +1,37 @@
 """
 SIGNAL Trading Bot
 ==================
+- Builds a dynamic universe every morning from Alpaca market data:
+    Top 50 most active by volume  → momentum confirmation
+    Top 20 gainers                → breakout candidates
+    Top 20 losers                 → oversold reversal candidates
 - Scans positions every 60 seconds during market hours
-- Closes any position that hits +5% gain
-- Reinvests freed cash into the next highest-signal stock
+- Three exit rules per position:
+    +5%        → profit target, sell immediately
+    +4% → +2%  → trailing protection, lock in gain
+    -5%        → stop loss, cut losses
+- Reinvests freed cash using 50% / equal split allocation rule
 - Runs 24/7 on Render as a background worker
 
-Risk Controls (borrowed from fail-safe design principles):
-- PAUSED env var: set to "true" to instantly halt all trading
-- MAX_TRADES_PER_DAY: hard cap on daily buy orders
-- MAX_DRAWDOWN_PCT: circuit breaker — disarms if portfolio drops X% from start
-- CIRCUIT_BREAKER_TRIGGERED: auto-set internally when drawdown fires
-
-Requirements:
-    pip install alpaca-py anthropic requests
-
 Environment variables (set in Render):
-    ALPACA_API_KEY
-    ALPACA_SECRET_KEY
+    ALPACA_API_KEY         (required)
+    ALPACA_SECRET_KEY      (required)
+    ANTHROPIC_API_KEY      (required)
     ALPACA_BASE_URL        (default: https://paper-api.alpaca.markets)
-    ANTHROPIC_API_KEY
-    CLOUDFLARE_WORKER      (your worker URL for technicals)
+    CLOUDFLARE_WORKER      (default: your worker URL)
     TECH_WEIGHT            (default: 60)
-    PROFIT_TARGET          (default: 0.05 = 5%)
     MIN_CONFIDENCE         (default: 80)
     MAX_TRADES_PER_DAY     (default: 10)
-    MAX_DRAWDOWN_PCT       (default: 0.15 = 15%)
-    PAUSED                 (set to "true" to pause — no restart needed)
-    SCAN_UNIVERSE          (comma-separated tickers)
+    MAX_DRAWDOWN_PCT       (default: 0.15)
+    PAUSED                 (set "true" to halt instantly)
+    TOP_ACTIVE             (default: 50 — most active by volume)
+    TOP_MOVERS             (default: 20 — top gainers and losers each)
+
+Risk thresholds (hardcoded):
+    PROFIT_TARGET = +5%   sell at full target
+    PEAK_TRIGGER  = +4%   activate trailing protection
+    TRAIL_SELL    = +2%   sell if falls back here after peak
+    STOP_LOSS     = -5%   cut losses
 """
 
 import os
@@ -36,11 +40,13 @@ import time
 import logging
 import requests
 import anthropic
-from datetime import datetime, timezone, date
+from datetime import datetime, timezone
 from collections import defaultdict
 from alpaca.trading.client import TradingClient
 from alpaca.trading.requests import MarketOrderRequest
 from alpaca.trading.enums import OrderSide, TimeInForce
+from alpaca.data.historical import StockHistoricalDataClient
+from alpaca.data.requests import StockLatestQuoteRequest
 
 # ── Logging ────────────────────────────────────────────────────
 logging.basicConfig(
@@ -50,35 +56,34 @@ logging.basicConfig(
 )
 log = logging.getLogger("signal-bot")
 
-# ── Config from environment ────────────────────────────────────
-ALPACA_KEY       = os.environ["ALPACA_API_KEY"]
-ALPACA_SECRET    = os.environ["ALPACA_SECRET_KEY"]
-ALPACA_BASE_URL  = os.environ.get("ALPACA_BASE_URL", "https://paper-api.alpaca.markets")
-ANTHROPIC_KEY    = os.environ["ANTHROPIC_API_KEY"]
-WORKER_URL       = os.environ.get("CLOUDFLARE_WORKER", "https://winter-cake-6aae.dimitridesplace-65f.workers.dev")
-TECH_WEIGHT      = int(os.environ.get("TECH_WEIGHT", "60"))
-FUND_WEIGHT      = 100 - TECH_WEIGHT
-# PROFIT_TARGET, STOP_LOSS, PEAK_TRIGGER, TRAIL_SELL defined in Runtime state below
-MIN_CONFIDENCE   = int(os.environ.get("MIN_CONFIDENCE", "80"))
-MAX_TRADES_DAY   = int(os.environ.get("MAX_TRADES_PER_DAY", "10"))
-MAX_DRAWDOWN     = float(os.environ.get("MAX_DRAWDOWN_PCT", "0.15"))
-SCAN_INTERVAL    = 60
-SCAN_UNIVERSE    = os.environ.get("SCAN_UNIVERSE",
-    "NVDA,AAPL,MSFT,AMZN,META,GOOG,TSLA,AMD,AVGO,QCOM,ARM,PANW,ASML,SMCI,MU,"
-    "ORCL,CRM,SNOW,PLTR,LLY,NVO,ABBV,UNH,JPM,GS,V,MA,XOM,CVX,NEE,ENPH,GE,CAT,UBER,SPOT"
-).split(",")
+# ── Config ─────────────────────────────────────────────────────
+ALPACA_KEY      = os.environ["ALPACA_API_KEY"]
+ALPACA_SECRET   = os.environ["ALPACA_SECRET_KEY"]
+ALPACA_BASE_URL = os.environ.get("ALPACA_BASE_URL", "https://paper-api.alpaca.markets")
+ANTHROPIC_KEY   = os.environ["ANTHROPIC_API_KEY"]
+WORKER_URL      = os.environ.get("CLOUDFLARE_WORKER", "https://winter-cake-6aae.dimitridesplace-65f.workers.dev")
+TECH_WEIGHT     = int(os.environ.get("TECH_WEIGHT", "60"))
+FUND_WEIGHT     = 100 - TECH_WEIGHT
+MIN_CONFIDENCE  = int(os.environ.get("MIN_CONFIDENCE", "80"))
+MAX_TRADES_DAY  = int(os.environ.get("MAX_TRADES_PER_DAY", "10"))
+MAX_DRAWDOWN    = float(os.environ.get("MAX_DRAWDOWN_PCT", "0.15"))
+TOP_ACTIVE      = int(os.environ.get("TOP_ACTIVE", "50"))
+TOP_MOVERS      = int(os.environ.get("TOP_MOVERS", "20"))
+SCAN_INTERVAL   = 60
+
+# ── Risk thresholds ────────────────────────────────────────────
+PROFIT_TARGET   =  0.05   # +5%  full profit target
+PEAK_TRIGGER    =  0.04   # +4%  activate trailing protection
+TRAIL_SELL      =  0.02   # +2%  sell if falls back here after peak
+STOP_LOSS       = -0.05   # -5%  cut losses
 
 # ── Runtime state ──────────────────────────────────────────────
-trades_today:      dict[str, int]   = defaultdict(int)   # date_str -> count
-circuit_breaker:   bool             = False               # trips on max drawdown
-starting_equity:   float | None     = None               # set on first run
-position_peaks:    dict[str, float] = {}                  # symbol -> highest P&L seen
-
-# ── Risk thresholds ─────────────────────────────────────────────
-STOP_LOSS        = -0.05   # -5%  — cut losses
-PEAK_TRIGGER     =  0.04   # +4%  — start trailing protection
-TRAIL_SELL       =  0.02   # +2%  — sell if falls back to here after peak
-PROFIT_TARGET    =  0.05   # +5%  — take full profit
+trades_today:    dict[str, int]   = defaultdict(int)
+circuit_breaker: bool             = False
+starting_equity: float | None     = None
+position_peaks:  dict[str, float] = {}
+dynamic_universe: list[str]       = []
+universe_date:   str              = ""   # date universe was last built
 
 # ── Clients ────────────────────────────────────────────────────
 trade_client = TradingClient(
@@ -87,17 +92,88 @@ trade_client = TradingClient(
     paper=True,
     url_override=ALPACA_BASE_URL,
 )
+data_client = StockHistoricalDataClient(
+    api_key=ALPACA_KEY,
+    secret_key=ALPACA_SECRET,
+)
 ai_client = anthropic.Anthropic(api_key=ANTHROPIC_KEY)
+
+# ══════════════════════════════════════════════════════════════
+# DYNAMIC UNIVERSE BUILDER
+# ══════════════════════════════════════════════════════════════
+
+def build_universe() -> list[str]:
+    """
+    Builds a fresh dynamic universe from Alpaca market data:
+    - Top N most active stocks by volume
+    - Top N gainers
+    - Top N losers
+    Deduplicates and filters to tradeable US equities only.
+    Called once per trading day at market open, and again on each reinvestment.
+    """
+    symbols = set()
+
+    try:
+        # Most active by volume
+        active = trade_client.get_most_active_stocks(top=TOP_ACTIVE)
+        active_symbols = [s.symbol for s in active]
+        symbols.update(active_symbols)
+        log.info(f"Most active ({len(active_symbols)}): {active_symbols[:10]}...")
+    except Exception as e:
+        log.warning(f"Most active fetch failed: {e}")
+
+    try:
+        # Top gainers and losers
+        movers = trade_client.get_market_movers(top=TOP_MOVERS)
+
+        if hasattr(movers, 'gainers') and movers.gainers:
+            gainer_symbols = [s.symbol for s in movers.gainers]
+            symbols.update(gainer_symbols)
+            log.info(f"Top gainers ({len(gainer_symbols)}): {gainer_symbols[:5]}...")
+
+        if hasattr(movers, 'losers') and movers.losers:
+            loser_symbols = [s.symbol for s in movers.losers]
+            symbols.update(loser_symbols)
+            log.info(f"Top losers ({len(loser_symbols)}): {loser_symbols[:5]}...")
+
+    except Exception as e:
+        log.warning(f"Market movers fetch failed: {e}")
+
+    # Filter out symbols with special characters (ETFs, preferred shares, warrants)
+    clean = [s for s in symbols if s.isalpha() and len(s) <= 5]
+
+    if not clean:
+        log.warning("Dynamic universe empty — falling back to default tickers")
+        clean = [
+            "NVDA","AAPL","MSFT","AMZN","META","GOOG","TSLA","AMD",
+            "AVGO","QCOM","ARM","PANW","LLY","JPM","V","XOM",
+        ]
+
+    log.info(f"Dynamic universe built: {len(clean)} unique tickers")
+    return clean
+
+
+def get_or_refresh_universe() -> list[str]:
+    """
+    Returns today's universe. Rebuilds if it's a new trading day.
+    """
+    global dynamic_universe, universe_date
+    from zoneinfo import ZoneInfo
+    today = datetime.now(ZoneInfo("America/New_York")).strftime("%Y-%m-%d")
+
+    if universe_date != today or not dynamic_universe:
+        log.info(f"Building fresh universe for {today}...")
+        dynamic_universe = build_universe()
+        universe_date    = today
+
+    return dynamic_universe
+
 
 # ══════════════════════════════════════════════════════════════
 # RISK CONTROLS
 # ══════════════════════════════════════════════════════════════
 
 def is_paused() -> bool:
-    """
-    Hot-reload pause: change PAUSED=true in Render env vars.
-    No restart needed — checked every scan cycle.
-    """
     val = os.environ.get("PAUSED", "false").strip().lower()
     return val in ("true", "1", "yes")
 
@@ -112,51 +188,32 @@ def increment_trades_today():
     trades_today[today_key()] = trades_today.get(today_key(), 0) + 1
 
 def check_drawdown(account) -> bool:
-    """
-    Returns True (safe) or False (circuit breaker triggered).
-    Compares current equity to starting equity.
-    """
     global circuit_breaker, starting_equity
-
     if circuit_breaker:
         return False
-
     equity = float(account.equity)
-
     if starting_equity is None:
         starting_equity = equity
         log.info(f"Starting equity set: ${starting_equity:,.2f}")
         return True
-
     drawdown = (starting_equity - equity) / starting_equity
     if drawdown >= MAX_DRAWDOWN:
         circuit_breaker = True
         log.critical(
             f"CIRCUIT BREAKER TRIGGERED — drawdown {drawdown*100:.1f}% "
-            f"exceeds limit {MAX_DRAWDOWN*100:.0f}%. All trading halted."
+            f"exceeds {MAX_DRAWDOWN*100:.0f}% limit. All trading halted."
         )
         return False
-
     return True
 
 def run_risk_checks(account) -> tuple[bool, str]:
-    """
-    Master risk gate. Returns (safe: bool, reason: str).
-    All checks must pass for trading to proceed.
-    """
-    # 1. Manual pause
     if is_paused():
-        return False, "PAUSED — manual pause active (set PAUSED=false in Render to resume)"
-
-    # 2. Circuit breaker
+        return False, "PAUSED — set PAUSED=false in Render to resume"
     if not check_drawdown(account):
-        return False, f"CIRCUIT BREAKER — drawdown exceeded {MAX_DRAWDOWN*100:.0f}% limit"
-
-    # 3. Max trades per day
+        return False, f"CIRCUIT BREAKER — drawdown exceeded {MAX_DRAWDOWN*100:.0f}%"
     count = trades_today_count()
     if count >= MAX_TRADES_DAY:
-        return False, f"MAX TRADES REACHED — {count}/{MAX_TRADES_DAY} trades today"
-
+        return False, f"MAX TRADES — {count}/{MAX_TRADES_DAY} today"
     return True, "OK"
 
 # ══════════════════════════════════════════════════════════════
@@ -280,19 +337,28 @@ def compute_signal(symbol: str) -> dict | None:
     }
 
 def find_candidates(exclude: list[str]) -> list[dict]:
-    """Scans universe and returns all qualifying BUY signals sorted by confidence desc."""
+    """
+    Builds a fresh dynamic universe then scans it for BUY signals.
+    Returns all qualifying candidates sorted by confidence descending.
+    """
+    universe  = get_or_refresh_universe()
+    targets   = [s for s in universe if s not in exclude]
     candidates = []
-    targets = [s for s in SCAN_UNIVERSE if s not in exclude]
-    log.info(f"Scanning {len(targets)} tickers...")
+
+    log.info(f"Scanning {len(targets)} tickers from dynamic universe...")
 
     for symbol in targets:
         result = compute_signal(symbol)
         if result and result["signal"] == "BUY" and result["confidence"] >= MIN_CONFIDENCE:
             candidates.append(result)
-            log.info(f"  {symbol}: composite={result['composite']:.2f}, confidence={result['confidence']}%")
-        time.sleep(8)
+            log.info(
+                f"  SIGNAL {symbol}: composite={result['composite']:.2f}, "
+                f"confidence={result['confidence']}%, thesis: {result['thesis']}"
+            )
+        time.sleep(8)  # respect Anthropic rate limits
 
     candidates.sort(key=lambda x: x["confidence"], reverse=True)
+    log.info(f"Scan complete — {len(candidates)} qualifying signals found")
     return candidates
 
 # ══════════════════════════════════════════════════════════════
@@ -302,9 +368,9 @@ def find_candidates(exclude: list[str]) -> list[dict]:
 def check_profit_targets(positions: dict) -> list[str]:
     """
     Three exit rules per position:
-    1. Profit target:      P&L >= +5%  → sell immediately
-    2. Trailing protection: P&L reached +4% then falls to +2% → sell to lock gain
-    3. Stop loss:          P&L <= -5%  → sell to cut losses
+    1. Profit target (+5%)        → sell immediately
+    2. Trailing protection        → peaked +4%, fell to +2% → sell, lock gain
+    3. Stop loss (-5%)            → cut losses
     """
     closed = []
 
@@ -324,22 +390,24 @@ def check_profit_targets(positions: dict) -> list[str]:
 
             # Rule 1: Full profit target
             if unrealized_pct >= PROFIT_TARGET:
-                reason = f"PROFIT TARGET hit ({unrealized_pct*100:+.2f}% >= +{PROFIT_TARGET*100:.0f}%)"
+                reason = f"PROFIT TARGET hit ({unrealized_pct*100:+.2f}%)"
 
             # Rule 2: Trailing peak protection
             elif current_peak >= PEAK_TRIGGER and unrealized_pct <= TRAIL_SELL:
-                reason = (f"TRAILING PROTECTION — peaked at {current_peak*100:+.2f}%, "
-                          f"fell back to {unrealized_pct*100:+.2f}% — locking in gain")
+                reason = (
+                    f"TRAILING PROTECTION — peaked {current_peak*100:+.2f}%, "
+                    f"fell to {unrealized_pct*100:+.2f}% — locking gain"
+                )
 
             # Rule 3: Stop loss
             elif unrealized_pct <= STOP_LOSS:
-                reason = f"STOP LOSS hit ({unrealized_pct*100:+.2f}% <= -{abs(STOP_LOSS)*100:.0f}%)"
+                reason = f"STOP LOSS hit ({unrealized_pct*100:+.2f}%)"
 
             if reason:
-                log.info(f"  [{symbol}] {reason} — closing position")
+                log.info(f"  [{symbol}] {reason} — closing")
                 if close_position(symbol):
                     closed.append(symbol)
-                    position_peaks.pop(symbol, None)  # clean up peak tracker
+                    position_peaks.pop(symbol, None)
             else:
                 peak_str = f" (peak: {current_peak*100:+.2f}%)" if current_peak >= PEAK_TRIGGER else ""
                 log.info(f"  {symbol}: {unrealized_pct*100:+.2f}% P&L{peak_str} — holding")
@@ -352,7 +420,7 @@ def check_profit_targets(positions: dict) -> list[str]:
 def reinvest(current_positions: dict, account):
     """
     Allocation rule:
-    - 1 qualifying signal  → 100% of cash into it
+    - 1 qualifying signal  → 100% of cash
     - 2+ qualifying signals → 50% into highest confidence, rest split equally
     """
     cash = float(account.cash)
@@ -360,33 +428,33 @@ def reinvest(current_positions: dict, account):
         log.info(f"Not enough cash to reinvest (${cash:.2f})")
         return
 
-    log.info(f"Reinvesting ${cash:,.2f}...")
+    log.info(f"Reinvesting ${cash:,.2f} — pulling fresh universe...")
     candidates = find_candidates(exclude=list(current_positions.keys()))
 
     if not candidates:
         log.info("No qualifying signals — cash stays idle")
         return
 
-    # Build allocation: {symbol: cash_amount}
+    # Build allocation
     allocations = {}
     if len(candidates) == 1:
         allocations[candidates[0]["symbol"]] = cash
-        log.info(f"Single signal — deploying 100% into {candidates[0]['symbol']}")
+        log.info(f"Single signal — 100% into {candidates[0]['symbol']}")
     else:
-        top    = candidates[0]
-        rest   = candidates[1:]
+        top       = candidates[0]
+        rest      = candidates[1:]
         top_cash  = cash * 0.50
         rest_cash = (cash * 0.50) / len(rest)
         allocations[top["symbol"]] = top_cash
         for c in rest:
             allocations[c["symbol"]] = rest_cash
-        log.info(f"Multi-signal split: {top['symbol']} gets 50% (${top_cash:,.0f}), "
-                 f"{[c['symbol'] for c in rest]} split remaining 50% (${rest_cash:,.0f} each)")
+        log.info(
+            f"Split: {top['symbol']} 50% (${top_cash:,.0f}) | "
+            f"{[c['symbol'] for c in rest]} share 50% (${rest_cash:,.0f} each)"
+        )
 
-    # Build price lookup
     price_map = {c["symbol"]: c["price"] for c in candidates}
 
-    # Place orders
     for symbol, alloc in allocations.items():
         price = price_map.get(symbol, 0)
         if price <= 0:
@@ -394,7 +462,7 @@ def reinvest(current_positions: dict, account):
             continue
         qty = int(alloc / price)
         if qty < 1:
-            log.info(f"Not enough allocation (${alloc:.0f}) to buy 1 share of {symbol} at ${price:.2f} — skipping")
+            log.info(f"Insufficient allocation (${alloc:.0f}) for 1 share of {symbol} at ${price:.2f}")
             continue
         log.info(f"  {symbol}: ${alloc:,.0f} → {qty} shares @ ~${price:.2f}")
         place_buy(symbol, qty)
@@ -406,23 +474,21 @@ def reinvest(current_positions: dict, account):
 def run():
     log.info("=" * 60)
     log.info("SIGNAL Trading Bot started")
+    log.info(f"  Universe:           DYNAMIC — top {TOP_ACTIVE} active + top/bottom {TOP_MOVERS} movers")
     log.info(f"  Profit target:      +{PROFIT_TARGET*100:.0f}%")
-    log.info(f"  Trailing protection: peak >={PEAK_TRIGGER*100:.0f}% then sell at +{TRAIL_SELL*100:.0f}%")
+    log.info(f"  Trailing:           peak >={PEAK_TRIGGER*100:.0f}% → sell at +{TRAIL_SELL*100:.0f}%")
     log.info(f"  Stop loss:          -{abs(STOP_LOSS)*100:.0f}%")
     log.info(f"  TA / Fund weight:   {TECH_WEIGHT}% / {FUND_WEIGHT}%")
     log.info(f"  Min confidence:     {MIN_CONFIDENCE}%")
     log.info(f"  Max trades/day:     {MAX_TRADES_DAY}")
     log.info(f"  Max drawdown:       {MAX_DRAWDOWN*100:.0f}%")
-    log.info(f"  Scan interval:      {SCAN_INTERVAL}s")
-    log.info(f"  Universe:           {len(SCAN_UNIVERSE)} tickers")
-    log.info(f"  Manual pause:       set PAUSED=true in Render to halt")
+    log.info(f"  Pause:              set PAUSED=true in Render")
     log.info("=" * 60)
 
     while True:
         try:
             now = datetime.now(timezone.utc)
 
-            # ── Market hours gate ──────────────────────────────
             if not is_market_open():
                 log.info(f"Market closed ({now.strftime('%H:%M UTC')}) — sleeping")
                 time.sleep(SCAN_INTERVAL)
@@ -431,29 +497,24 @@ def run():
             log.info(f"{'─'*50}")
             log.info(f"Scan at {now.strftime('%H:%M:%S UTC')}")
 
-            # ── Get account ────────────────────────────────────
             account = get_account()
             equity  = float(account.equity)
             cash    = float(account.cash)
             log.info(f"Equity: ${equity:,.2f}  Cash: ${cash:,.2f}  Trades today: {trades_today_count()}/{MAX_TRADES_DAY}")
 
-            # ── Risk gate ──────────────────────────────────────
             safe, reason = run_risk_checks(account)
             if not safe:
-                log.warning(f"RISK GATE BLOCKED: {reason}")
+                log.warning(f"RISK GATE: {reason}")
                 time.sleep(SCAN_INTERVAL)
                 continue
 
-            # ── Get positions ──────────────────────────────────
             positions = get_positions()
             log.info(f"Open positions: {list(positions.keys()) or 'none'}")
 
-            # ── Check profit targets ───────────────────────────
             closed = check_profit_targets(positions) if positions else []
 
-            # ── Reinvest or find new entry ─────────────────────
             if closed:
-                time.sleep(3)  # let fills settle
+                time.sleep(3)
                 positions = get_positions()
                 account   = get_account()
                 reinvest(positions, account)
@@ -461,7 +522,7 @@ def run():
                 reinvest({}, account)
 
         except KeyboardInterrupt:
-            log.info("Bot stopped by user.")
+            log.info("Bot stopped.")
             break
         except Exception as e:
             log.error(f"Unexpected error: {e}", exc_info=True)
