@@ -58,7 +58,7 @@ ANTHROPIC_KEY    = os.environ["ANTHROPIC_API_KEY"]
 WORKER_URL       = os.environ.get("CLOUDFLARE_WORKER", "https://winter-cake-6aae.dimitridesplace-65f.workers.dev")
 TECH_WEIGHT      = int(os.environ.get("TECH_WEIGHT", "60"))
 FUND_WEIGHT      = 100 - TECH_WEIGHT
-PROFIT_TARGET    = float(os.environ.get("PROFIT_TARGET", "0.05"))
+# PROFIT_TARGET, STOP_LOSS, PEAK_TRIGGER, TRAIL_SELL defined in Runtime state below
 MIN_CONFIDENCE   = int(os.environ.get("MIN_CONFIDENCE", "80"))
 MAX_TRADES_DAY   = int(os.environ.get("MAX_TRADES_PER_DAY", "10"))
 MAX_DRAWDOWN     = float(os.environ.get("MAX_DRAWDOWN_PCT", "0.15"))
@@ -69,9 +69,16 @@ SCAN_UNIVERSE    = os.environ.get("SCAN_UNIVERSE",
 ).split(",")
 
 # ── Runtime state ──────────────────────────────────────────────
-trades_today:      dict[str, int] = defaultdict(int)   # date_str -> count
-circuit_breaker:   bool           = False               # trips on max drawdown
-starting_equity:   float | None   = None               # set on first run
+trades_today:      dict[str, int]   = defaultdict(int)   # date_str -> count
+circuit_breaker:   bool             = False               # trips on max drawdown
+starting_equity:   float | None     = None               # set on first run
+position_peaks:    dict[str, float] = {}                  # symbol -> highest P&L seen
+
+# ── Risk thresholds ─────────────────────────────────────────────
+STOP_LOSS        = -0.05   # -5%  — cut losses
+PEAK_TRIGGER     =  0.04   # +4%  — start trailing protection
+TRAIL_SELL       =  0.02   # +2%  — sell if falls back to here after peak
+PROFIT_TARGET    =  0.05   # +5%  — take full profit
 
 # ── Clients ────────────────────────────────────────────────────
 trade_client = TradingClient(
@@ -293,17 +300,53 @@ def find_candidates(exclude: list[str]) -> list[dict]:
 # ══════════════════════════════════════════════════════════════
 
 def check_profit_targets(positions: dict) -> list[str]:
+    """
+    Three exit rules per position:
+    1. Profit target:      P&L >= +5%  → sell immediately
+    2. Trailing protection: P&L reached +4% then falls to +2% → sell to lock gain
+    3. Stop loss:          P&L <= -5%  → sell to cut losses
+    """
     closed = []
+
     for symbol, pos in positions.items():
         try:
             unrealized_pct = float(pos.unrealized_plpc)
-            log.info(f"  {symbol}: {unrealized_pct*100:+.2f}% P&L")
+
+            # Update peak tracker
+            prev_peak = position_peaks.get(symbol, 0.0)
+            if unrealized_pct > prev_peak:
+                position_peaks[symbol] = unrealized_pct
+                if unrealized_pct >= PEAK_TRIGGER:
+                    log.info(f"  {symbol}: new peak {unrealized_pct*100:+.2f}% — trailing protection active")
+
+            current_peak = position_peaks.get(symbol, 0.0)
+            reason = None
+
+            # Rule 1: Full profit target
             if unrealized_pct >= PROFIT_TARGET:
-                log.info(f"  {symbol} hit +{PROFIT_TARGET*100:.0f}% target — closing")
+                reason = f"PROFIT TARGET hit ({unrealized_pct*100:+.2f}% >= +{PROFIT_TARGET*100:.0f}%)"
+
+            # Rule 2: Trailing peak protection
+            elif current_peak >= PEAK_TRIGGER and unrealized_pct <= TRAIL_SELL:
+                reason = (f"TRAILING PROTECTION — peaked at {current_peak*100:+.2f}%, "
+                          f"fell back to {unrealized_pct*100:+.2f}% — locking in gain")
+
+            # Rule 3: Stop loss
+            elif unrealized_pct <= STOP_LOSS:
+                reason = f"STOP LOSS hit ({unrealized_pct*100:+.2f}% <= -{abs(STOP_LOSS)*100:.0f}%)"
+
+            if reason:
+                log.info(f"  [{symbol}] {reason} — closing position")
                 if close_position(symbol):
                     closed.append(symbol)
+                    position_peaks.pop(symbol, None)  # clean up peak tracker
+            else:
+                peak_str = f" (peak: {current_peak*100:+.2f}%)" if current_peak >= PEAK_TRIGGER else ""
+                log.info(f"  {symbol}: {unrealized_pct*100:+.2f}% P&L{peak_str} — holding")
+
         except Exception as e:
             log.warning(f"  Error checking {symbol}: {e}")
+
     return closed
 
 def reinvest(current_positions: dict, account):
@@ -364,6 +407,8 @@ def run():
     log.info("=" * 60)
     log.info("SIGNAL Trading Bot started")
     log.info(f"  Profit target:      +{PROFIT_TARGET*100:.0f}%")
+    log.info(f"  Trailing protection: peak >={PEAK_TRIGGER*100:.0f}% then sell at +{TRAIL_SELL*100:.0f}%")
+    log.info(f"  Stop loss:          -{abs(STOP_LOSS)*100:.0f}%")
     log.info(f"  TA / Fund weight:   {TECH_WEIGHT}% / {FUND_WEIGHT}%")
     log.info(f"  Min confidence:     {MIN_CONFIDENCE}%")
     log.info(f"  Max trades/day:     {MAX_TRADES_DAY}")
