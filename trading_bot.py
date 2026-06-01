@@ -273,24 +273,17 @@ def fetch_technicals(symbol: str) -> dict | None:
 
 def fetch_fundamental(symbol: str, ta: dict) -> dict | None:
     try:
-        prompt = f"""You are a senior equity analyst. Research {symbol} using web search — recent earnings, revenue, margins, analyst consensus, news.
-
-Technical context:
-Price: ${ta.get('price', 0):.2f}, RSI: {ta.get('rsi', 50):.1f}, MACD Hist: {ta.get('macdHist', 0):.3f}
-EMA20: ${ta.get('ema20', 0):.2f}, EMA50: ${ta.get('ema50', 0):.2f}, EMA200: ${ta.get('ema200', 0):.2f}
-TA Signal: {ta.get('taSignal', 'HOLD')} (score {ta.get('taScore', 0):.1f}/10)
-
-Return ONLY valid JSON (no markdown):
-{{
-  "fundSignal": "BUY or HOLD or SELL",
-  "fundScore": <number -10 to 10>,
-  "confidence": <number 0 to 100>,
-  "thesis": "1-2 sentence summary"
-}}"""
+        # Keep prompt short to stay under 30k tokens/min rate limit
+        prompt = (
+            f"Research {symbol} stock. TA: price=${ta.get('price',0):.0f}, "
+            f"RSI={ta.get('rsi',50):.0f}, signal={ta.get('taSignal','HOLD')}. "
+            f"Return ONLY JSON: {{"fundSignal":"BUY/HOLD/SELL","
+            f""fundScore":0,"confidence":0,"thesis":"brief"}}"
+        )
 
         response = ai_client.messages.create(
             model="claude-sonnet-4-5",
-            max_tokens=300,
+            max_tokens=150,
             tools=[{"type": "web_search_20250305", "name": "web_search"}],
             messages=[{"role": "user", "content": prompt}],
         )
@@ -347,7 +340,7 @@ def find_candidates(exclude: list[str]) -> list[dict]:
                 f"  SIGNAL {symbol}: composite={result['composite']:.2f}, "
                 f"confidence={result['confidence']}%, thesis: {result['thesis']}"
             )
-        time.sleep(8)  # respect Anthropic rate limits
+        time.sleep(12)  # 12s gap keeps calls well under 30k tokens/min limit
 
     candidates.sort(key=lambda x: x["confidence"], reverse=True)
     log.info(f"Scan complete — {len(candidates)} qualifying signals found")
