@@ -274,11 +274,14 @@ def fetch_technicals(symbol: str) -> dict | None:
 def fetch_fundamental(symbol: str, ta: dict) -> dict | None:
     try:
         # Keep prompt short to stay under 30k tokens/min rate limit
+        price  = ta.get("price", 0)
+        rsi    = ta.get("rsi", 50)
+        signal = ta.get("taSignal", "HOLD")
         prompt = (
-            f"Research {symbol} stock. TA: price=${ta.get('price',0):.0f}, "
-            f"RSI={ta.get('rsi',50):.0f}, signal={ta.get('taSignal','HOLD')}. "
-            f"Return ONLY JSON: {{"fundSignal":"BUY/HOLD/SELL","
-            f""fundScore":0,"confidence":0,"thesis":"brief"}}"
+            f"Research {symbol} stock fundamentals. "
+            f"Current price ${price:.0f}, RSI {rsi:.0f}, TA signal {signal}. "
+            "Return ONLY this JSON: "
+            '{"fundSignal":"BUY or HOLD or SELL","fundScore":0,"confidence":0,"thesis":"1 sentence"}'
         )
 
         response = ai_client.messages.create(
