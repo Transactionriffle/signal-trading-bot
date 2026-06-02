@@ -113,37 +113,31 @@ def build_universe() -> list[str]:
     symbols = set()
 
     try:
-        # Most active by volume — try new API first, fall back to older method
-        try:
-            active = trade_client.get_most_active_stocks(top=TOP_ACTIVE)
-        except AttributeError:
-            from alpaca.data.historical import StockHistoricalDataClient
-            from alpaca.data.requests import MostActiveStocksRequest
-            dc = StockHistoricalDataClient(api_key=ALPACA_KEY, secret_key=ALPACA_SECRET)
-            active = dc.get_most_active_stocks(MostActiveStocksRequest(top=TOP_ACTIVE))
-        active_symbols = [s.symbol for s in active]
+        # Most active by volume using StockHistoricalDataClient screener
+        from alpaca.data.historical import StockHistoricalDataClient
+        from alpaca.data.requests import MostActivesRequest
+        dc = StockHistoricalDataClient(api_key=ALPACA_KEY, secret_key=ALPACA_SECRET)
+        active_resp = dc.get_most_active_stocks(MostActivesRequest(top=TOP_ACTIVE))
+        active_symbols = [s.symbol for s in active_resp]
         symbols.update(active_symbols)
         log.info(f"Most active ({len(active_symbols)}): {active_symbols[:10]}...")
     except Exception as e:
         log.warning(f"Most active fetch failed: {e}")
 
     try:
-        # Top gainers — try new API first, fall back to screener endpoint
-        try:
-            movers = trade_client.get_market_movers(top=TOP_MOVERS)
-            if hasattr(movers, 'gainers') and movers.gainers:
-                gainer_symbols = [s.symbol for s in movers.gainers]
-                symbols.update(gainer_symbols)
-                log.info(f"Top gainers ({len(gainer_symbols)}): {gainer_symbols[:5]}...")
-        except AttributeError:
-            from alpaca.data.historical import StockHistoricalDataClient
-            from alpaca.data.requests import MarketMoversRequest
-            dc = StockHistoricalDataClient(api_key=ALPACA_KEY, secret_key=ALPACA_SECRET)
-            movers = dc.get_market_movers(MarketMoversRequest(top=TOP_MOVERS))
-            if hasattr(movers, 'gainers') and movers.gainers:
-                gainer_symbols = [s.symbol for s in movers.gainers]
-                symbols.update(gainer_symbols)
-                log.info(f"Top gainers ({len(gainer_symbols)}): {gainer_symbols[:5]}...")
+        # Top gainers using StockHistoricalDataClient screener
+        from alpaca.data.historical import StockHistoricalDataClient
+        from alpaca.data.requests import MarketMoversRequest
+        from alpaca.data.enums import MarketType
+        dc = StockHistoricalDataClient(api_key=ALPACA_KEY, secret_key=ALPACA_SECRET)
+        movers_resp = dc.get_market_movers(MarketMoversRequest(
+            top=TOP_MOVERS,
+            market_type=MarketType.STOCKS
+        ))
+        if hasattr(movers_resp, 'gainers') and movers_resp.gainers:
+            gainer_symbols = [s.symbol for s in movers_resp.gainers]
+            symbols.update(gainer_symbols)
+            log.info(f"Top gainers ({len(gainer_symbols)}): {gainer_symbols[:5]}...")
     except Exception as e:
         log.warning(f"Market movers fetch failed: {e}")
 
