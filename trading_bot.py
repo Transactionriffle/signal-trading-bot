@@ -161,7 +161,7 @@ def build_universe() -> list[str]:
         r = requests.get(
             f"{DATA_URL}/screener/stocks/movers",
             headers=headers,
-            params={"top": TOP_MOVERS * 3},
+            params={"top": min(TOP_MOVERS * 3, 50)},  # capped at 50 per API limit
             timeout=10
         )
         r.raise_for_status()
