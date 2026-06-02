@@ -113,8 +113,14 @@ def build_universe() -> list[str]:
     symbols = set()
 
     try:
-        # Most active by volume
-        active = trade_client.get_most_active_stocks(top=TOP_ACTIVE)
+        # Most active by volume — try new API first, fall back to older method
+        try:
+            active = trade_client.get_most_active_stocks(top=TOP_ACTIVE)
+        except AttributeError:
+            from alpaca.data.historical import StockHistoricalDataClient
+            from alpaca.data.requests import MostActiveStocksRequest
+            dc = StockHistoricalDataClient(api_key=ALPACA_KEY, secret_key=ALPACA_SECRET)
+            active = dc.get_most_active_stocks(MostActiveStocksRequest(top=TOP_ACTIVE))
         active_symbols = [s.symbol for s in active]
         symbols.update(active_symbols)
         log.info(f"Most active ({len(active_symbols)}): {active_symbols[:10]}...")
@@ -122,12 +128,22 @@ def build_universe() -> list[str]:
         log.warning(f"Most active fetch failed: {e}")
 
     try:
-        # Top gainers only — momentum aligned with strategy
-        movers = trade_client.get_market_movers(top=TOP_MOVERS)
-        if hasattr(movers, 'gainers') and movers.gainers:
-            gainer_symbols = [s.symbol for s in movers.gainers]
-            symbols.update(gainer_symbols)
-            log.info(f"Top gainers ({len(gainer_symbols)}): {gainer_symbols[:5]}...")
+        # Top gainers — try new API first, fall back to screener endpoint
+        try:
+            movers = trade_client.get_market_movers(top=TOP_MOVERS)
+            if hasattr(movers, 'gainers') and movers.gainers:
+                gainer_symbols = [s.symbol for s in movers.gainers]
+                symbols.update(gainer_symbols)
+                log.info(f"Top gainers ({len(gainer_symbols)}): {gainer_symbols[:5]}...")
+        except AttributeError:
+            from alpaca.data.historical import StockHistoricalDataClient
+            from alpaca.data.requests import MarketMoversRequest
+            dc = StockHistoricalDataClient(api_key=ALPACA_KEY, secret_key=ALPACA_SECRET)
+            movers = dc.get_market_movers(MarketMoversRequest(top=TOP_MOVERS))
+            if hasattr(movers, 'gainers') and movers.gainers:
+                gainer_symbols = [s.symbol for s in movers.gainers]
+                symbols.update(gainer_symbols)
+                log.info(f"Top gainers ({len(gainer_symbols)}): {gainer_symbols[:5]}...")
     except Exception as e:
         log.warning(f"Market movers fetch failed: {e}")
 
@@ -231,6 +247,17 @@ def get_positions() -> dict:
 
 def close_position(symbol: str) -> bool:
     try:
+        # Cancel any open orders on this symbol first
+        open_orders = trade_client.get_orders()
+        for order in open_orders:
+            if order.symbol == symbol:
+                try:
+                    trade_client.cancel_order_by_id(order.id)
+                    log.info(f"  Cancelled open order on {symbol} (id: {order.id})")
+                    time.sleep(0.5)
+                except Exception as ce:
+                    log.warning(f"  Could not cancel order {order.id}: {ce}")
+        # Now close the position
         trade_client.close_position(symbol)
         log.info(f"[SELL] Closed {symbol}")
         return True
@@ -278,10 +305,10 @@ def fetch_fundamental(symbol: str, ta: dict) -> dict | None:
         rsi    = ta.get("rsi", 50)
         signal = ta.get("taSignal", "HOLD")
         prompt = (
-            f"Research {symbol} stock fundamentals. "
-            f"Current price ${price:.0f}, RSI {rsi:.0f}, TA signal {signal}. "
-            "Return ONLY this JSON: "
-            '{"fundSignal":"BUY or HOLD or SELL","fundScore":0,"confidence":0,"thesis":"1 sentence"}'
+            f"Research {symbol} stock. Price ${price:.0f}, RSI {rsi:.0f}, TA {signal}. "
+            "Rate fundamentals. Return ONLY this JSON with NO other text: "
+            '{"fundSignal":"BUY","fundScore":7,"confidence":82,"thesis":"one sentence"} '
+            "fundScore MUST be between -10 and +10. confidence MUST be 0-100."
         )
 
         response = ai_client.messages.create(
@@ -294,7 +321,11 @@ def fetch_fundamental(symbol: str, ta: dict) -> dict | None:
         si, ei = text.find("{"), text.rfind("}")
         if si == -1:
             return None
-        return json.loads(text[si:ei+1])
+        result = json.loads(text[si:ei+1])
+        # Clamp scores to expected ranges regardless of what Claude returns
+        result["fundScore"]  = max(-10, min(10, float(result.get("fundScore", 0))))
+        result["confidence"] = max(0,   min(100, float(result.get("confidence", 50))))
+        return result
     except Exception as e:
         log.warning(f"Fundamental fetch failed for {symbol}: {e}")
         return None
