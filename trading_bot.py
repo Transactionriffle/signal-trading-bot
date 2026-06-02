@@ -55,7 +55,6 @@ logging.basicConfig(
     datefmt="%Y-%m-%d %H:%M:%S",
 )
 log = logging.getLogger("signal-bot")
-logging.getLogger("httpx").setLevel(logging.WARNING)
 
 # ── Config ─────────────────────────────────────────────────────
 ALPACA_KEY      = os.environ["ALPACA_API_KEY"]
@@ -540,6 +539,8 @@ def run():
 
             if not is_market_open():
                 log.info(f"Market closed ({now.strftime('%H:%M UTC')}) — sleeping")
+                # Reset universe date so it rebuilds fresh at next market open
+                universe_date = ""
                 time.sleep(SCAN_INTERVAL)
                 continue
 
@@ -568,7 +569,13 @@ def run():
                 account   = get_account()
                 reinvest(positions, account)
             elif not positions:
-                reinvest({}, account)
+                # Only scan and reinvest during market hours
+                # (orders placed outside hours would be GTC — wasteful Claude calls)
+                clock = trade_client.get_clock()
+                if clock.is_open:
+                    reinvest({}, account)
+                else:
+                    log.info("No positions and market closed — waiting for market open to reinvest")
 
         except KeyboardInterrupt:
             log.info("Bot stopped.")
