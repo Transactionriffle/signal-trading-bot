@@ -55,6 +55,7 @@ logging.basicConfig(
     datefmt="%Y-%m-%d %H:%M:%S",
 )
 log = logging.getLogger("signal-bot")
+logging.getLogger("httpx").setLevel(logging.WARNING)
 
 # ── Config ─────────────────────────────────────────────────────
 ALPACA_KEY      = os.environ["ALPACA_API_KEY"]
