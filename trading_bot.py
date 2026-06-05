@@ -32,6 +32,13 @@ Risk thresholds (hardcoded):
     PEAK_TRIGGER  = +4%   activate trailing protection
     TRAIL_SELL    = +2%   sell if falls back here after peak
     STOP_LOSS     = -5%   cut losses
+
+Market state (Phase 1 macro layer):
+    BULL mode    SPY >= -1%   → normal trading
+    CAUTION mode SPY -1% to -2% → no new buys, tighter trailing
+    BEAR mode    SPY <= -2%   → no new buys, tighten stop loss to -2%
+    VIXY proxy   VIXY > +5%  → reduce position sizes by 50%
+    Sector check Avoid buying into sectors down > 1.5% today
 """
 
 import os
@@ -75,7 +82,25 @@ SCAN_INTERVAL   = 60
 PROFIT_TARGET   =  0.05   # +5%  full profit target
 PEAK_TRIGGER    =  0.04   # +4%  activate trailing protection
 TRAIL_SELL      =  0.02   # +2%  sell if falls back here after peak
-STOP_LOSS       = -0.05   # -5%  cut losses
+STOP_LOSS       = -0.05   # -5%  cut losses (tightens to -2% in bear mode)
+
+# ── Market state thresholds ────────────────────────────────────
+SPY_CAUTION     = -0.01   # SPY down 1% → caution mode
+SPY_BEAR        = -0.02   # SPY down 2% → bear mode
+VIXY_FEAR       =  0.05   # VIXY up 5%  → fear active, halve position sizes
+SECTOR_WEAK     = -0.015  # Sector ETF down 1.5% → avoid that sector
+
+# Sector ETF map: sector name → ETF ticker
+SECTOR_ETFS = {
+    "tech":        "XLK",
+    "healthcare":  "XLV",
+    "financials":  "XLF",
+    "energy":      "XLE",
+    "utilities":   "XLU",
+    "consumer":    "XLY",
+    "industrials": "XLI",
+    "materials":   "XLB",
+}
 
 # ── Runtime state ──────────────────────────────────────────────
 trades_today:    dict[str, int]   = defaultdict(int)
@@ -84,6 +109,9 @@ starting_equity: float | None     = None
 position_peaks:  dict[str, float] = {}
 dynamic_universe: list[str]       = []
 universe_date:   str              = ""   # date universe was last built
+market_state:    str              = "BULL"   # BULL | CAUTION | BEAR
+fear_active:     bool             = False    # VIXY spiking
+weak_sectors:    set              = set()    # sectors to avoid today
 
 # ── Clients ────────────────────────────────────────────────────
 trade_client = TradingClient(
@@ -97,6 +125,103 @@ data_client = StockHistoricalDataClient(
     secret_key=ALPACA_SECRET,
 )
 ai_client = anthropic.Anthropic(api_key=ANTHROPIC_KEY)
+
+# ══════════════════════════════════════════════════════════════
+# PHASE 1 MACRO LAYER
+# ══════════════════════════════════════════════════════════════
+
+def get_quote_change(symbol: str) -> float | None:
+    """Returns today's % change for a symbol using Alpaca latest quote."""
+    try:
+        DATA_URL = "https://data.alpaca.markets/v2"
+        headers  = {"APCA-API-KEY-ID": ALPACA_KEY, "APCA-API-SECRET-KEY": ALPACA_SECRET}
+        r = requests.get(
+            f"{DATA_URL}/stocks/{symbol}/snapshot",
+            headers=headers,
+            timeout=8
+        )
+        r.raise_for_status()
+        data = r.json()
+        snap = data.get("snapshot") or data.get(symbol, {})
+        daily = snap.get("dailyBar", {})
+        prev  = snap.get("prevDailyBar", {})
+        if daily and prev and prev.get("c", 0) > 0:
+            return (daily.get("c", 0) - prev.get("c", 0)) / prev.get("c", 0)
+        return None
+    except Exception as e:
+        log.warning(f"Quote fetch failed for {symbol}: {e}")
+        return None
+
+def assess_market_state():
+    """
+    Checks SPY, VIXY, and sector ETFs to determine market mode.
+    Updates global market_state, fear_active, weak_sectors.
+    Called once per scan cycle.
+    """
+    global market_state, fear_active, weak_sectors
+
+    # ── SPY: overall market direction ─────────────────────────
+    spy_chg = get_quote_change("SPY")
+    if spy_chg is not None:
+        if spy_chg <= SPY_BEAR:
+            market_state = "BEAR"
+            log.warning(f"BEAR MODE — SPY {spy_chg*100:.2f}% today. No new buys. Tightening stops to -2%.")
+        elif spy_chg <= SPY_CAUTION:
+            market_state = "CAUTION"
+            log.warning(f"CAUTION MODE — SPY {spy_chg*100:.2f}% today. No new buys. Trailing protection tightened.")
+        else:
+            market_state = "BULL"
+            log.info(f"BULL MODE — SPY {spy_chg*100:.2f}% today. Normal trading.")
+    else:
+        log.warning("Could not fetch SPY — defaulting to CAUTION")
+        market_state = "CAUTION"
+
+    # ── VIXY: fear gauge ──────────────────────────────────────
+    vixy_chg = get_quote_change("VIXY")
+    if vixy_chg is not None:
+        fear_active = vixy_chg >= VIXY_FEAR
+        if fear_active:
+            log.warning(f"FEAR ACTIVE — VIXY +{vixy_chg*100:.1f}% today. Position sizes halved.")
+        else:
+            log.info(f"Fear gauge normal — VIXY {vixy_chg*100:.1f}%")
+    else:
+        fear_active = False
+
+    # ── Sector ETFs: rotation check ───────────────────────────
+    weak_sectors = set()
+    for sector, etf in SECTOR_ETFS.items():
+        chg = get_quote_change(etf)
+        if chg is not None and chg <= SECTOR_WEAK:
+            weak_sectors.add(sector)
+            log.info(f"  Weak sector: {sector.upper()} ({etf} {chg*100:.2f}%) — avoiding")
+
+    log.info(f"Market state: {market_state} | Fear: {fear_active} | Weak sectors: {weak_sectors or 'none'}")
+
+def get_stop_loss() -> float:
+    """Returns the active stop loss level based on market state."""
+    if market_state == "BEAR":
+        return -0.02  # tighten to -2% in bear market
+    return STOP_LOSS  # normal -5%
+
+def get_trail_sell() -> float:
+    """Returns the trailing sell level based on market state."""
+    if market_state in ("BEAR", "CAUTION"):
+        return 0.01  # tighten to +1% in caution/bear
+    return TRAIL_SELL  # normal +2%
+
+def get_peak_trigger() -> float:
+    """Returns the peak trigger level based on market state."""
+    if market_state in ("BEAR", "CAUTION"):
+        return 0.02  # activate trailing at +2% in caution/bear
+    return PEAK_TRIGGER  # normal +4%
+
+def adjust_qty_for_fear(qty: int, price: float, cash: float) -> int:
+    """Halves position size when fear is active."""
+    if fear_active and qty > 1:
+        adjusted = int((cash * 0.5) / price)
+        log.info(f"  Fear active — position size halved: {qty} → {adjusted} shares")
+        return max(1, adjusted)
+    return qty
 
 # ══════════════════════════════════════════════════════════════
 # DYNAMIC UNIVERSE BUILDER
@@ -440,16 +565,19 @@ def check_profit_targets(positions: dict) -> list[str]:
             if unrealized_pct >= PROFIT_TARGET:
                 reason = f"PROFIT TARGET hit ({unrealized_pct*100:+.2f}%)"
 
-            # Rule 2: Trailing peak protection
-            elif current_peak >= PEAK_TRIGGER and unrealized_pct <= TRAIL_SELL:
+            # Rule 2: Trailing peak protection (tightens in caution/bear)
+            active_peak  = get_peak_trigger()
+            active_trail = get_trail_sell()
+            if current_peak >= active_peak and unrealized_pct <= active_trail:
                 reason = (
                     f"TRAILING PROTECTION — peaked {current_peak*100:+.2f}%, "
-                    f"fell to {unrealized_pct*100:+.2f}% — locking gain"
+                    f"fell to {unrealized_pct*100:+.2f}% — locking gain [{market_state} mode]"
                 )
 
-            # Rule 3: Stop loss
-            elif unrealized_pct <= STOP_LOSS:
-                reason = f"STOP LOSS hit ({unrealized_pct*100:+.2f}%)"
+            # Rule 3: Stop loss (tightens to -2% in bear mode)
+            active_stop = get_stop_loss()
+            if unrealized_pct <= active_stop:
+                reason = f"STOP LOSS hit ({unrealized_pct*100:+.2f}% <= {active_stop*100:.0f}%)"
 
             if reason:
                 log.info(f"  [{symbol}] {reason} — closing")
@@ -512,6 +640,7 @@ def reinvest(current_positions: dict, account):
         if qty < 1:
             log.info(f"Insufficient allocation (${alloc:.0f}) for 1 share of {symbol} at ${price:.2f}")
             continue
+        qty = adjust_qty_for_fear(qty, price, alloc)
         log.info(f"  {symbol}: ${alloc:,.0f} → {qty} shares @ ~${price:.2f}")
         place_buy(symbol, qty)
 
@@ -531,6 +660,10 @@ def run():
     log.info(f"  Max trades/day:     {MAX_TRADES_DAY}")
     log.info(f"  Max drawdown:       {MAX_DRAWDOWN*100:.0f}%")
     log.info(f"  Pause:              set PAUSED=true in Render")
+    log.info(f"  Macro layer:        SPY circuit breaker | VIXY fear gauge | Sector rotation")
+    log.info(f"  Bull mode:          SPY > -1%  → normal trading")
+    log.info(f"  Caution mode:       SPY -1% to -2% → no new buys, tighter trailing")
+    log.info(f"  Bear mode:          SPY < -2%  → no new buys, stop loss tightens to -2%")
     log.info("=" * 60)
 
     while True:
@@ -552,6 +685,9 @@ def run():
             cash    = float(account.cash)
             log.info(f"Equity: ${equity:,.2f}  Cash: ${cash:,.2f}  Trades today: {trades_today_count()}/{MAX_TRADES_DAY}")
 
+            # ── Assess market state every cycle ───────────────
+            assess_market_state()
+
             safe, reason = run_risk_checks(account)
             if not safe:
                 log.warning(f"RISK GATE: {reason}")
@@ -567,13 +703,16 @@ def run():
                 time.sleep(3)
                 positions = get_positions()
                 account   = get_account()
-                reinvest(positions, account)
+                if market_state == "BULL":
+                    reinvest(positions, account)
+                else:
+                    log.warning(f"  {market_state} MODE — skipping reinvestment. Cash preserved until market recovers.")
             elif not positions:
-                # Only scan and reinvest during market hours
-                # (orders placed outside hours would be GTC — wasteful Claude calls)
                 clock = trade_client.get_clock()
-                if clock.is_open:
+                if clock.is_open and market_state == "BULL":
                     reinvest({}, account)
+                elif clock.is_open and market_state != "BULL":
+                    log.warning(f"  {market_state} MODE — no new buys. Waiting for SPY to recover above -{abs(SPY_CAUTION)*100:.0f}%.")
                 else:
                     log.info("No positions and market closed — waiting for market open to reinvest")
 
