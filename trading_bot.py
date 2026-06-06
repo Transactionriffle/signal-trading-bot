@@ -269,16 +269,7 @@ def build_universe() -> list[str]:
             symbols.update(active_symbols)
             log.info(f"Most active ({len(active_symbols)}): {active_symbols[:10]}...")
         else:
-            # Screener returns empty outside market hours — use curated liquid stocks
-            log.info("Screener empty (market closed) — using curated liquid universe")
-            curated = [
-                "NVDA","AAPL","MSFT","AMZN","META","GOOG","TSLA","AMD",
-                "AVGO","QCOM","ARM","PANW","ASML","MU","ORCL","CRM",
-                "SNOW","PLTR","LLY","NVO","ABBV","UNH","JPM","GS",
-                "V","MA","BLK","XOM","CVX","NEE","ENPH","GE","CAT",
-                "UBER","SPOT","NFLX","CRWD","NET","DDOG","NOW",
-            ]
-            symbols.update(curated)
+            log.info("Screener returned empty — market may be closed. No fallback used.")
     except Exception as e:
         log.warning(f"Most active fetch failed: {e}")
 
