@@ -113,6 +113,40 @@ market_state:    str              = "BULL"   # BULL | CAUTION | BEAR
 fear_active:     bool             = False    # VIXY spiking
 weak_sectors:    set              = set()    # sectors to avoid today
 
+# ── Peak persistence ────────────────────────────────────────────
+PEAKS_FILE = "/tmp/position_peaks.json"
+
+def save_peaks():
+    """Persist position peaks to disk so they survive bot restarts."""
+    try:
+        with open(PEAKS_FILE, "w") as f:
+            json.dump(position_peaks, f)
+    except Exception as e:
+        log.warning(f"Failed to save peaks: {e}")
+
+def load_peaks():
+    """Load position peaks from disk on startup."""
+    global position_peaks
+    try:
+        with open(PEAKS_FILE) as f:
+            position_peaks = json.load(f)
+        if position_peaks:
+            log.info(f"Loaded position peaks from disk: {position_peaks}")
+    except FileNotFoundError:
+        position_peaks = {}
+    except Exception as e:
+        log.warning(f"Failed to load peaks: {e}")
+        position_peaks = {}
+
+def prune_peaks(active_symbols: list):
+    """Remove peaks for positions that no longer exist."""
+    stale = [s for s in position_peaks if s not in active_symbols]
+    for s in stale:
+        del position_peaks[s]
+        log.info(f"  Pruned stale peak for {s}")
+    if stale:
+        save_peaks()
+
 # ── Clients ────────────────────────────────────────────────────
 trade_client = TradingClient(
     api_key=ALPACA_KEY,
@@ -546,6 +580,7 @@ def check_profit_targets(positions: dict) -> list[str]:
             prev_peak = position_peaks.get(symbol, 0.0)
             if unrealized_pct > prev_peak:
                 position_peaks[symbol] = unrealized_pct
+                save_peaks()
                 if unrealized_pct >= PEAK_TRIGGER:
                     log.info(f"  {symbol}: new peak {unrealized_pct*100:+.2f}% — trailing protection active")
 
@@ -575,6 +610,7 @@ def check_profit_targets(positions: dict) -> list[str]:
                 if close_position(symbol):
                     closed.append(symbol)
                     position_peaks.pop(symbol, None)
+                    save_peaks()
             else:
                 peak_str = f" (peak: {current_peak*100:+.2f}%)" if current_peak >= PEAK_TRIGGER else ""
                 log.info(f"  {symbol}: {unrealized_pct*100:+.2f}% P&L{peak_str} — holding")
@@ -640,6 +676,7 @@ def reinvest(current_positions: dict, account):
 # ══════════════════════════════════════════════════════════════
 
 def run():
+    load_peaks()
     log.info("=" * 60)
     log.info("SIGNAL Trading Bot started")
     log.info(f"  Universe:           DYNAMIC — top {TOP_ACTIVE} most active + top {TOP_MOVERS} gainers")
@@ -687,6 +724,7 @@ def run():
 
             positions = get_positions()
             log.info(f"Open positions: {list(positions.keys()) or 'none'}")
+            prune_peaks(list(positions.keys()))
 
             closed = check_profit_targets(positions) if positions else []
 
