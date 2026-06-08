@@ -186,6 +186,37 @@ def get_quote_change(symbol: str) -> float | None:
         log.warning(f"Quote fetch failed for {symbol}: {e}")
         return None
 
+def get_vix_level() -> float | None:
+    """
+    Fetches the current VIX level via Cloudflare Worker -> Yahoo Finance.
+    VIX is an index (^VIX), not an equity — not available on Alpaca.
+    Returns the current VIX value (e.g. 17.5, 35.0).
+    Interpretation:
+        < 15  = very calm / complacent
+        15-20 = normal market conditions
+        20-25 = elevated uncertainty
+        25-35 = fear / volatility
+        > 35  = panic / crisis
+    """
+    try:
+        now  = int(time.time())
+        from_ts = now - 86400 * 5  # last 5 days to ensure we get latest
+        url = f"{WORKER_URL}/yahoofinance/chart/%5EVIX?interval=1d&period1={from_ts}&period2={now}"
+        r = requests.get(url, timeout=10)
+        r.raise_for_status()
+        data  = r.json()
+        chart = data.get("chart", {}).get("result", [{}])[0]
+        closes = chart.get("indicators", {}).get("quote", [{}])[0].get("close", [])
+        closes = [c for c in closes if c is not None]
+        if closes:
+            vix = closes[-1]
+            log.info(f"VIX level: {vix:.1f}")
+            return vix
+        return None
+    except Exception as e:
+        log.warning(f"VIX fetch failed: {e}")
+        return None
+
 def assess_market_state():
     """
     Checks SPY, VIXY, and sector ETFs to determine market mode.
@@ -210,16 +241,43 @@ def assess_market_state():
         log.warning("Could not fetch SPY — defaulting to CAUTION")
         market_state = "CAUTION"
 
-    # ── VIXY: fear gauge ──────────────────────────────────────
-    vixy_chg = get_quote_change("VIXY")
-    if vixy_chg is not None:
+    # ── VIX: real fear index via Yahoo Finance ────────────────
+    vix_level = get_vix_level()
+    vixy_chg  = get_quote_change("VIXY")
+
+    if vix_level is not None:
+        if vix_level >= 35:
+            fear_active = True
+            log.warning(f"FEAR ACTIVE — VIX {vix_level:.1f} (PANIC/CRISIS). Position sizes halved.")
+        elif vix_level >= 25:
+            fear_active = True
+            log.warning(f"FEAR ACTIVE — VIX {vix_level:.1f} (elevated fear). Position sizes halved.")
+        elif vix_level >= 20:
+            fear_active = False
+            log.info(f"VIX {vix_level:.1f} — uncertainty but not fear. Normal sizing.")
+        else:
+            fear_active = False
+            log.info(f"VIX {vix_level:.1f} — calm market. Normal sizing.")
+
+        # Also use VIX to refine SPY signal:
+        # SPY down 2% + VIX < 20 = institutional rotation, not fear → stay BULL
+        if market_state == "BEAR" and vix_level < 20:
+            market_state = "BULL"
+            log.info(f"SPY bear but VIX {vix_level:.1f} < 20 — likely rotation not fear. Staying BULL.")
+        elif market_state == "CAUTION" and vix_level < 15:
+            market_state = "BULL"
+            log.info(f"SPY caution but VIX {vix_level:.1f} < 15 — very calm market. Staying BULL.")
+
+    elif vixy_chg is not None:
+        # Fallback to VIXY if VIX unavailable
         fear_active = vixy_chg >= VIXY_FEAR
         if fear_active:
-            log.warning(f"FEAR ACTIVE — VIXY +{vixy_chg*100:.1f}% today. Position sizes halved.")
+            log.warning(f"FEAR ACTIVE (VIXY proxy) — VIXY +{vixy_chg*100:.1f}% today.")
         else:
-            log.info(f"Fear gauge normal — VIXY {vixy_chg*100:.1f}%")
+            log.info(f"Fear gauge normal (VIXY proxy) — {vixy_chg*100:.1f}%")
     else:
         fear_active = False
+        log.warning("Could not fetch VIX or VIXY — assuming no fear")
 
     # ── Sector ETFs: rotation check ───────────────────────────
     weak_sectors = set()
@@ -688,10 +746,12 @@ def run():
     log.info(f"  Max trades/day:     {MAX_TRADES_DAY}")
     log.info(f"  Max drawdown:       {MAX_DRAWDOWN*100:.0f}%")
     log.info(f"  Pause:              set PAUSED=true in Render")
-    log.info(f"  Macro layer:        SPY circuit breaker | VIXY fear gauge | Sector rotation")
-    log.info(f"  Bull mode:          SPY > -1%  → normal trading")
-    log.info(f"  Caution mode:       SPY -1% to -2% → no new buys, tighter trailing")
-    log.info(f"  Bear mode:          SPY < -2%  → no new buys, stop loss tightens to -2%")
+    log.info(f"  Macro layer:        SPY + VIX circuit breaker | Sector rotation")
+    log.info(f"  Bull mode:          SPY > -1% or VIX < 20 despite SPY drop")
+    log.info(f"  Caution mode:       SPY -1% to -2% + VIX 20-25")
+    log.info(f"  Bear mode:          SPY < -2% AND VIX > 25 (genuine fear)")
+    log.info(f"  Fear sizing:        VIX > 25 -> position sizes halved")
+    log.info(f"  Rotation mode:      SPY down but VIX < 20 -> stay BULL (IPO rotation etc)")
     log.info("=" * 60)
 
     while True:
