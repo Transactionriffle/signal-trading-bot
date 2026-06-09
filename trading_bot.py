@@ -243,63 +243,54 @@ def assess_market_state():
     """
     global market_state, fear_active, weak_sectors
 
-    # ── SPY: store for relative strength calculation ─────────
+    # ── Step 1: Fetch VIX first — needed for BEAR mode decision ─
     global spy_change
-    spy_chg = get_quote_change("SPY")
-    if spy_chg is not None:
-        spy_change = spy_chg
-        # Only use SPY as a hard gate for extreme fear (BEAR) or genuine panic
-        # Normal down days → stay BULL, let relative strength decide per stock
-        if spy_chg <= SPY_BEAR:
-            market_state = "BEAR"
-            log.warning(f"BEAR MODE — SPY {spy_chg*100:.2f}% today. Stops tightened to -2%.")
-        else:
-            market_state = "BULL"
-            if spy_chg <= SPY_CAUTION:
-                log.info(f"BULL MODE (mild weakness) — SPY {spy_chg*100:.2f}%. Relative strength scoring active.")
-            else:
-                log.info(f"BULL MODE — SPY {spy_chg*100:.2f}% today. Normal trading.")
-    else:
-        log.warning("Could not fetch SPY — market state unchanged")
-        # Don't default to CAUTION — use last known state
-
-    # ── VIX: real fear index via Yahoo Finance ────────────────
-    vix_level = get_vix_level()
+    vix_now   = get_vix_level()
     vixy_chg  = get_quote_change("VIXY")
 
-    if vix_level is not None:
-        if vix_level >= 35:
+    # Set fear_active from VIX
+    if vix_now is not None:
+        if vix_now >= 25:
             fear_active = True
-            log.warning(f"FEAR ACTIVE — VIX {vix_level:.1f} (PANIC/CRISIS). Position sizes halved.")
-        elif vix_level >= 25:
-            fear_active = True
-            log.warning(f"FEAR ACTIVE — VIX {vix_level:.1f} (elevated fear). Position sizes halved.")
-        elif vix_level >= 20:
+            log.warning(f"FEAR ACTIVE — VIX {vix_now:.1f}. Position sizes halved.")
+        elif vix_now >= 20:
             fear_active = False
-            log.info(f"VIX {vix_level:.1f} — uncertainty but not fear. Normal sizing.")
+            log.info(f"VIX {vix_now:.1f} — uncertainty but not fear. Normal sizing.")
         else:
             fear_active = False
-            log.info(f"VIX {vix_level:.1f} — calm market. Normal sizing.")
-
-        # Also use VIX to refine SPY signal:
-        # SPY down 2% + VIX < 20 = institutional rotation, not fear → stay BULL
-        if market_state == "BEAR" and vix_level < 20:
-            market_state = "BULL"
-            log.info(f"SPY bear but VIX {vix_level:.1f} < 20 — likely rotation not fear. Staying BULL.")
-        elif market_state == "CAUTION" and vix_level < 15:
-            market_state = "BULL"
-            log.info(f"SPY caution but VIX {vix_level:.1f} < 15 — very calm market. Staying BULL.")
-
+            log.info(f"VIX {vix_now:.1f} — calm market. Normal sizing.")
     elif vixy_chg is not None:
-        # Fallback to VIXY if VIX unavailable
         fear_active = vixy_chg >= VIXY_FEAR
         if fear_active:
             log.warning(f"FEAR ACTIVE (VIXY proxy) — VIXY +{vixy_chg*100:.1f}% today.")
         else:
             log.info(f"Fear gauge normal (VIXY proxy) — {vixy_chg*100:.1f}%")
+        vix_now = None
     else:
         fear_active = False
-        log.warning("Could not fetch VIX or VIXY — assuming no fear")
+        vix_now = None
+
+    # ── Step 2: SPY + VIX combined decision ───────────────────
+    # BEAR = SPY < -2% AND VIX >= 25 (genuine panic)
+    # BULL = everything else (including SPY < -2% with low VIX = rotation)
+    spy_chg = get_quote_change("SPY")
+    if spy_chg is not None:
+        spy_change = spy_chg
+        if spy_chg <= SPY_BEAR and vix_now is not None and vix_now >= 25:
+            market_state = "BEAR"
+            log.warning(f"BEAR MODE — SPY {spy_chg*100:.2f}% + VIX {vix_now:.1f}. Genuine fear. Cash preserved.")
+        elif spy_chg <= SPY_BEAR:
+            market_state = "BULL"
+            vix_str = f"VIX {vix_now:.1f}" if vix_now else "VIX unknown"
+            log.info(f"BULL MODE (rotation) — SPY {spy_chg*100:.2f}% but {vix_str} < 25. Rotation not fear. RS scoring active.")
+        elif spy_chg <= SPY_CAUTION:
+            market_state = "BULL"
+            log.info(f"BULL MODE (mild weakness) — SPY {spy_chg*100:.2f}%. RS scoring active.")
+        else:
+            market_state = "BULL"
+            log.info(f"BULL MODE — SPY {spy_chg*100:.2f}% today. Normal trading.")
+    else:
+        log.warning("Could not fetch SPY — market state unchanged")
 
     # ── Sector ETFs: rotation check ───────────────────────────
     weak_sectors = set()
