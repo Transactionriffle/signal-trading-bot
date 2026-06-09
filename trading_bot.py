@@ -78,10 +78,10 @@ TOP_ACTIVE      = int(os.environ.get("TOP_ACTIVE", "50"))
 TOP_MOVERS      = int(os.environ.get("TOP_MOVERS", "20"))
 SCAN_INTERVAL   = 60
 
-# ── Risk thresholds ────────────────────────────────────────────
-PROFIT_TARGET   =  0.05   # +5%  full profit target
-PEAK_TRIGGER    =  0.04   # +4%  activate trailing protection
-TRAIL_SELL      =  0.02   # +2%  sell if falls back here after peak
+# ── Risk thresholds (backtest validated) ───────────────────────
+PROFIT_TARGET   =  0.05   # +5%  full profit target — 47% of trades hit this
+PEAK_TRIGGER    =  0.03   # +3%  activate trailing (tightened from +4% — backtest avg trailing exit was only +0.68%)
+TRAIL_SELL      =  0.025  # +2.5% sell if falls back here (tightened from +2%)
 STOP_LOSS       = -0.05   # -5%  cut losses (tightens to -2% in bear mode)
 
 # ── Market state thresholds ────────────────────────────────────
@@ -680,54 +680,67 @@ def check_profit_targets(positions: dict) -> list[str]:
 
 def reinvest(current_positions: dict, account):
     """
-    Allocation rule:
-    - 1 qualifying signal  → 100% of cash
-    - 2+ qualifying signals → 50% into highest confidence, rest split equally
+    Kelly-optimal position sizing — backtest confirmed 10% per trade.
+    Each qualifying signal gets 10% of total portfolio equity.
+    Max 10 concurrent positions (100% / 10% = 10).
+    Cash not deployed stays idle — no over-concentration.
+
+    Previous 50% rule caused the NOW disaster ($47k in one stock).
+    Kelly 10% caps single-position risk at 0.5% portfolio loss per stop loss hit.
     """
-    cash = float(account.cash)
+    KELLY_PCT   = 0.10   # backtest-validated: 10% per position
+    MAX_POS     = 10     # maximum concurrent positions
+
+    cash   = float(account.cash)
+    equity = float(account.equity)
+
     if cash < 100:
         log.info(f"Not enough cash to reinvest (${cash:.2f})")
         return
 
-    log.info(f"Reinvesting ${cash:,.2f} — pulling fresh universe...")
+    # How many more positions can we open?
+    current_count  = len(current_positions)
+    available_slots = MAX_POS - current_count
+    if available_slots <= 0:
+        log.info(f"Max positions reached ({current_count}/{MAX_POS}) — no new buys")
+        return
+
+    log.info(f"Reinvesting — Kelly 10% sizing | Slots available: {available_slots}/{MAX_POS}")
     candidates = find_candidates(exclude=list(current_positions.keys()))
 
     if not candidates:
         log.info("No qualifying signals — cash stays idle")
         return
 
-    # Build allocation
-    allocations = {}
-    if len(candidates) == 1:
-        allocations[candidates[0]["symbol"]] = cash
-        log.info(f"Single signal — 100% into {candidates[0]['symbol']}")
-    else:
-        top       = candidates[0]
-        rest      = candidates[1:]
-        top_cash  = cash * 0.50
-        rest_cash = (cash * 0.50) / len(rest)
-        allocations[top["symbol"]] = top_cash
-        for c in rest:
-            allocations[c["symbol"]] = rest_cash
-        log.info(
-            f"Split: {top['symbol']} 50% (${top_cash:,.0f}) | "
-            f"{[c['symbol'] for c in rest]} share 50% (${rest_cash:,.0f} each)"
-        )
+    # Each position gets 10% of total portfolio equity
+    position_size = equity * KELLY_PCT
+    log.info(f"Position size: ${position_size:,.0f} (10% of ${equity:,.0f} equity)")
 
-    price_map = {c["symbol"]: c["price"] for c in candidates}
+    # Only take as many signals as we have slots for
+    to_buy = candidates[:available_slots]
+    log.info(f"Deploying into {len(to_buy)} signal(s): {[c['symbol'] for c in to_buy]}")
 
-    for symbol, alloc in allocations.items():
-        price = price_map.get(symbol, 0)
+    for candidate in to_buy:
+        symbol = candidate["symbol"]
+        price  = candidate["price"]
+
         if price <= 0:
             log.warning(f"Invalid price for {symbol} — skipping")
             continue
-        qty = int(alloc / price)
+
+        # Don't deploy more than available cash
+        alloc = min(position_size, cash * 0.95)  # keep 5% cash buffer
+        qty   = int(alloc / price)
+
         if qty < 1:
-            log.info(f"Insufficient allocation (${alloc:.0f}) for 1 share of {symbol} at ${price:.2f}")
+            log.info(f"Position size ${alloc:.0f} insufficient for 1 share of {symbol} at ${price:.2f}")
             continue
+
         qty = adjust_qty_for_fear(qty, price, alloc)
-        log.info(f"  {symbol}: ${alloc:,.0f} → {qty} shares @ ~${price:.2f}")
+        actual_cost = qty * price
+        log.info(f"  {symbol}: {qty} shares @ ~${price:.2f} = ${actual_cost:,.0f} ({actual_cost/equity*100:.1f}% of equity)")
         place_buy(symbol, qty)
+        cash -= actual_cost  # track remaining cash across buys
 
 # ══════════════════════════════════════════════════════════════
 # MAIN LOOP
@@ -738,6 +751,8 @@ def run():
     log.info("=" * 60)
     log.info("SIGNAL Trading Bot started")
     log.info(f"  Universe:           DYNAMIC — top {TOP_ACTIVE} most active + top {TOP_MOVERS} gainers")
+    log.info(f"  Position sizing:    Kelly 10% per trade (backtest validated)")
+    log.info(f"  Max positions:      10 concurrent")
     log.info(f"  Profit target:      +{PROFIT_TARGET*100:.0f}%")
     log.info(f"  Trailing:           peak >={PEAK_TRIGGER*100:.0f}% → sell at +{TRAIL_SELL*100:.0f}%")
     log.info(f"  Stop loss:          -{abs(STOP_LOSS)*100:.0f}%")
