@@ -173,7 +173,7 @@ def get_quote_change(symbol: str) -> float | None:
         # Try IEX feed first, fall back to SIP feed on failure
         headers = {"APCA-API-KEY-ID": ALPACA_KEY, "APCA-API-SECRET-KEY": ALPACA_SECRET}
         r = None
-        for feed in ["iex", "sip"]:
+        for feed in ["sip", "sip"]:
             try:
                 r = requests.get(
                     f"https://data.alpaca.markets/v2/stocks/snapshots",
