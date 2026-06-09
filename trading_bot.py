@@ -33,12 +33,13 @@ Risk thresholds (hardcoded):
     TRAIL_SELL    = +2%   sell if falls back here after peak
     STOP_LOSS     = -5%   cut losses
 
-Market state (Phase 1 macro layer):
-    BULL mode    SPY >= -1%   → normal trading
-    CAUTION mode SPY -1% to -2% → no new buys, tighter trailing
-    BEAR mode    SPY <= -2%   → no new buys, tighten stop loss to -2%
-    VIXY proxy   VIXY > +5%  → reduce position sizes by 50%
+Market state + Relative Strength (Phase 1 macro layer):
+    BULL mode    SPY >= -2%  → normal trading, relative strength active
+    BEAR mode    SPY <= -2% AND VIX > 25 → no new buys, stops tighten to -2%
+    Relative RS  stock pct - SPY pct → boosts/penalises composite score per stock
+    VIXY/VIX     VIX > 25   → reduce position sizes by 50%
     Sector check Avoid buying into sectors down > 1.5% today
+    Alpha focus  Stocks outperforming SPY get RS boost — genuine alpha signal
 """
 
 import os
@@ -112,6 +113,7 @@ universe_date:   str              = ""   # date universe was last built
 market_state:    str              = "BULL"   # BULL | CAUTION | BEAR
 fear_active:     bool             = False    # VIXY spiking
 weak_sectors:    set              = set()    # sectors to avoid today
+spy_change:      float            = 0.0      # SPY daily % change, used for relative strength
 
 # ── Peak persistence ────────────────────────────────────────────
 PEAKS_FILE = "/tmp/position_peaks.json"
@@ -218,7 +220,7 @@ def get_vix_level() -> float | None:
         now  = int(time.time())
         from_ts = now - 86400 * 5  # last 5 days to ensure we get latest
         url = f"{WORKER_URL}/yahoofinance/chart/%5EVIX?interval=1d&period1={from_ts}&period2={now}"
-        r = requests.get(url, timeout=10)
+        r = requests.get(url, timeout=20)
         r.raise_for_status()
         data  = r.json()
         chart = data.get("chart", {}).get("result", [{}])[0]
@@ -241,21 +243,25 @@ def assess_market_state():
     """
     global market_state, fear_active, weak_sectors
 
-    # ── SPY: overall market direction ─────────────────────────
+    # ── SPY: store for relative strength calculation ─────────
+    global spy_change
     spy_chg = get_quote_change("SPY")
     if spy_chg is not None:
+        spy_change = spy_chg
+        # Only use SPY as a hard gate for extreme fear (BEAR) or genuine panic
+        # Normal down days → stay BULL, let relative strength decide per stock
         if spy_chg <= SPY_BEAR:
             market_state = "BEAR"
-            log.warning(f"BEAR MODE — SPY {spy_chg*100:.2f}% today. No new buys. Tightening stops to -2%.")
-        elif spy_chg <= SPY_CAUTION:
-            market_state = "CAUTION"
-            log.warning(f"CAUTION MODE — SPY {spy_chg*100:.2f}% today. No new buys. Trailing protection tightened.")
+            log.warning(f"BEAR MODE — SPY {spy_chg*100:.2f}% today. Stops tightened to -2%.")
         else:
             market_state = "BULL"
-            log.info(f"BULL MODE — SPY {spy_chg*100:.2f}% today. Normal trading.")
+            if spy_chg <= SPY_CAUTION:
+                log.info(f"BULL MODE (mild weakness) — SPY {spy_chg*100:.2f}%. Relative strength scoring active.")
+            else:
+                log.info(f"BULL MODE — SPY {spy_chg*100:.2f}% today. Normal trading.")
     else:
-        log.warning("Could not fetch SPY — defaulting to CAUTION")
-        market_state = "CAUTION"
+        log.warning("Could not fetch SPY — market state unchanged")
+        # Don't default to CAUTION — use last known state
 
     # ── VIX: real fear index via Yahoo Finance ────────────────
     vix_level = get_vix_level()
@@ -595,17 +601,51 @@ def compute_signal(symbol: str) -> dict | None:
     fund_score = fund.get("fundScore", 0)
     composite  = ta_score * (TECH_WEIGHT / 100) + fund_score * (FUND_WEIGHT / 100)
 
+    # ── Relative strength adjustment ──────────────────────────
+    # Measures how this stock is performing vs the S&P 500 today.
+    # A stock up +2% when SPY is down -1% = +3% relative strength → alpha signal
+    # A stock down -1% when SPY is down -1% = 0% relative strength → no edge
+    stock_pct  = ta.get("pct1d", 0) / 100  # convert from % to decimal
+    rel_str    = stock_pct - spy_change      # relative to SPY today
+
+    if rel_str >= 0.02:        # outperforming SPY by 2%+
+        rs_boost = 1.5
+        rs_label = f"STRONG RS +{rel_str*100:.1f}% vs SPY"
+    elif rel_str >= 0.01:      # outperforming SPY by 1-2%
+        rs_boost = 0.75
+        rs_label = f"GOOD RS +{rel_str*100:.1f}% vs SPY"
+    elif rel_str >= 0.0:       # in line with or slightly beating SPY
+        rs_boost = 0.0
+        rs_label = f"NEUTRAL RS {rel_str*100:.1f}% vs SPY"
+    elif rel_str >= -0.01:     # slightly underperforming SPY
+        rs_boost = -0.5
+        rs_label = f"WEAK RS {rel_str*100:.1f}% vs SPY"
+    else:                      # significantly underperforming SPY
+        rs_boost = -1.5
+        rs_label = f"POOR RS {rel_str*100:.1f}% vs SPY — penalised"
+
+    # Apply relative strength boost to composite score
+    composite_adj = composite + rs_boost
+
+    signal = "BUY" if composite_adj >= 2 else "SELL" if composite_adj <= -2 else "HOLD"
+
+    if rs_boost != 0:
+        log.info(f"  {symbol} RS: {rs_label} → composite {composite:.2f} → {composite_adj:.2f}")
+
     return {
-        "symbol":     symbol,
-        "price":      ta.get("price", 0),
-        "taScore":    ta_score,
-        "taSignal":   ta.get("taSignal"),
-        "fundScore":  fund_score,
-        "fundSignal": fund.get("fundSignal"),
-        "composite":  composite,
-        "signal":     "BUY" if composite >= 2 else "SELL" if composite <= -2 else "HOLD",
-        "confidence": fund.get("confidence", 50),
-        "thesis":     fund.get("thesis", ""),
+        "symbol":        symbol,
+        "price":         ta.get("price", 0),
+        "taScore":       ta_score,
+        "taSignal":      ta.get("taSignal"),
+        "fundScore":     fund_score,
+        "fundSignal":    fund.get("fundSignal"),
+        "composite":     composite_adj,
+        "compositeRaw":  composite,
+        "relStrength":   rel_str,
+        "rsBoost":       rs_boost,
+        "signal":        signal,
+        "confidence":    fund.get("confidence", 50),
+        "thesis":        fund.get("thesis", ""),
     }
 
 def find_candidates(exclude: list[str]) -> list[dict]:
@@ -823,18 +863,18 @@ def run():
                 time.sleep(3)
                 positions = get_positions()
                 account   = get_account()
-                if market_state == "BULL":
+                if market_state != "BEAR":
                     reinvest(positions, account)
                 else:
-                    log.warning(f"  {market_state} MODE — skipping reinvestment. Cash preserved until market recovers.")
+                    log.warning(f"BEAR MODE — skipping reinvestment. SPY down >{abs(SPY_BEAR)*100:.0f}% + VIX elevated.")
             elif not positions:
                 clock = trade_client.get_clock()
-                if clock.is_open and market_state == "BULL":
+                if clock.is_open and market_state != "BEAR":
                     reinvest({}, account)
-                elif clock.is_open and market_state != "BULL":
-                    log.warning(f"  {market_state} MODE — no new buys. Waiting for SPY to recover above -{abs(SPY_CAUTION)*100:.0f}%.")
+                elif clock.is_open and market_state == "BEAR":
+                    log.warning(f"BEAR MODE — preserving cash. Genuine fear detected.")
                 else:
-                    log.info("No positions and market closed — waiting for market open to reinvest")
+                    log.info("Market closed — waiting for open to reinvest")
 
         except KeyboardInterrupt:
             log.info("Bot stopped.")
