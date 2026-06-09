@@ -392,7 +392,8 @@ def build_universe() -> list[str]:
         return (
             symbol.isalpha()              # no warrants (AAPL.WS), preferred (AAPL-A)
             and len(symbol) <= 5          # no exotic tickers
-            and price >= MIN_PRICE        # no micro-caps / penny stocks
+            # Price check only when price is provided — most-actives endpoint omits it
+            and (price == 0 or price >= MIN_PRICE)
             and trade_count >= MIN_TRADES # real institutional trade count
         )
 
@@ -642,8 +643,19 @@ def fetch_fundamental(symbol: str, ta: dict) -> dict | None:
 
 def compute_signal(symbol: str) -> dict | None:
     ta = fetch_technicals(symbol)
+
+    # IPO handling — no price history yet but fundamentals can still score it
+    ipo_mode = False
     if not ta:
-        return None
+        # Try fundamental-only signal (taScore = 0, neutral)
+        log.info(f"  {symbol}: no technicals (possible IPO/new listing) — trying fundamental-only")
+        ta = {
+            "price": 0, "taScore": 0, "taSignal": "HOLD",
+            "rsi": 50, "macdHist": 0, "ema20": 0, "ema50": 0, "ema200": 0,
+            "pct1d": 0, "pct5d": 0, "volRatio": 1,
+        }
+        ipo_mode = True
+
     fund = fetch_fundamental(symbol, ta)
     if not fund:
         return None
@@ -697,6 +709,7 @@ def compute_signal(symbol: str) -> dict | None:
         "signal":        signal,
         "confidence":    fund.get("confidence", 50),
         "thesis":        fund.get("thesis", ""),
+        "ipo_mode":      ipo_mode,
     }
 
 def find_candidates(exclude: list[str]) -> list[dict]:
