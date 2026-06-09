@@ -346,15 +346,14 @@ def build_universe() -> list[str]:
     headers  = {"APCA-API-KEY-ID": ALPACA_KEY, "APCA-API-SECRET-KEY": ALPACA_SECRET}
 
     # Minimum quality filters — eliminates penny stocks, ETFs, warrants
-    MIN_PRICE       = 10.0    # at least $10
-    MIN_TRADE_COUNT = 50000   # at least 50k trades = real liquidity
+    MIN_PRICE = 5.0    # at least $5 — loose filter, TA/fundamental scoring handles quality
 
     def is_quality(symbol: str, price: float = 0, trade_count: int = 0) -> bool:
         return (
-            symbol.isalpha()          # no warrants (AAPL.WS), no preferred (AAPL-A)
-            and len(symbol) <= 5      # no exotic tickers
-            and price >= MIN_PRICE    # no penny stocks
-            and trade_count >= MIN_TRADE_COUNT  # liquid enough
+            symbol.isalpha()      # no warrants (AAPL.WS), no preferred (AAPL-A)
+            and len(symbol) <= 5  # no exotic tickers
+            and price >= MIN_PRICE  # no penny stocks
+            # trade_count check removed — field name varies by API tier
         )
 
     try:
