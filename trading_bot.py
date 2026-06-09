@@ -168,12 +168,23 @@ def get_quote_change(symbol: str) -> float | None:
     """Returns today's % change for a symbol using Alpaca latest quote."""
     try:
         # Use multi-snapshot endpoint which is more reliable
-        r = requests.get(
-            f"https://data.alpaca.markets/v2/stocks/snapshots",
-            headers={"APCA-API-KEY-ID": ALPACA_KEY, "APCA-API-SECRET-KEY": ALPACA_SECRET},
-            params={"symbols": symbol, "feed": "iex"},
-            timeout=10
-        )
+        # Try IEX feed first, fall back to SIP feed on failure
+        headers = {"APCA-API-KEY-ID": ALPACA_KEY, "APCA-API-SECRET-KEY": ALPACA_SECRET}
+        r = None
+        for feed in ["iex", "sip"]:
+            try:
+                r = requests.get(
+                    f"https://data.alpaca.markets/v2/stocks/snapshots",
+                    headers=headers,
+                    params={"symbols": symbol, "feed": feed},
+                    timeout=15
+                )
+                if r.ok:
+                    break
+            except Exception:
+                continue
+        if r is None or not r.ok:
+            return None
         r.raise_for_status()
         data  = r.json()
         snap  = data.get(symbol, {})
