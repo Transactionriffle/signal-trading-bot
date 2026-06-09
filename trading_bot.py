@@ -334,26 +334,66 @@ def adjust_qty_for_fear(qty: int, price: float, cash: float) -> int:
 
 def build_universe() -> list[str]:
     """
-    Builds a fresh dynamic universe from Alpaca market data:
-    - Top N most active stocks by volume  → momentum confirmation
-    - Top N gainers                       → breakout candidates
-    Deduplicates and filters to tradeable US equities only.
-    Called once per trading day at market open, and again on each reinvestment.
+    Builds universe from two sources merged together:
+
+    1. CURATED base list — quality compounders that generated alpha:
+       ASML, LLY, UNH, MA, V, AVGO, GOOG, JPM, GS, PANW, SPOT, NFLX etc.
+       Always scanned regardless of daily volume ranking.
+       Override via SCAN_UNIVERSE env var in Render.
+
+    2. DYNAMIC screener — top most-active + top gainers from Alpaca.
+       Catches momentum plays and breakouts not in the curated list.
+
+    Combined and deduplicated every scan cycle.
     """
-    symbols = set()
+    # ── Curated base universe — always included ────────────────
+    # These generated your alpha: ASML (+5%), LLY (+5% x3), UNH (+5% x2),
+    # MA, V, AVGO, GOOG, JPM, GS, BLK, SPOT, NFLX, PANW, ARM, QCOM
+    _CURATED = os.environ.get("SCAN_UNIVERSE", ",".join([
+        # AI / Semiconductors
+        "NVDA","AMD","AVGO","QCOM","ARM","ASML","MU","SMCI","INTC","MRVL",
+        # Mega-cap Tech
+        "AAPL","MSFT","GOOG","GOOGL","META","AMZN","TSLA","ORCL",
+        # Software / Cloud / Cybersecurity
+        "CRM","SNOW","PLTR","PANW","CRWD","ZS","NET","DDOG","NOW","MDB",
+        # Healthcare — LLY and UNH generated multiple +5% exits
+        "LLY","NVO","ABBV","UNH","JNJ","MRK","AMGN",
+        # Financials — JPM, GS, MA, V, BLK all strong performers
+        "JPM","GS","MS","BAC","V","MA","BLK","SCHW",
+        # Consumer / Media — SPOT, NFLX, UBER generated alpha
+        "SPOT","NFLX","UBER","DIS","ABNB",
+        # Industrials
+        "GE","CAT","HON","DE",
+        # Energy / Clean Energy
+        "XOM","CVX","NEE","ENPH",
+    ])).split(",")
+    symbols = set(s.strip() for s in _CURATED if s.strip())
+    log.info(f"Curated base: {len(symbols)} tickers — adding dynamic screener...")
 
     DATA_URL = "https://data.alpaca.markets/v1beta1"
     headers  = {"APCA-API-KEY-ID": ALPACA_KEY, "APCA-API-SECRET-KEY": ALPACA_SECRET}
 
-    # Minimum quality filters — eliminates penny stocks, ETFs, warrants
-    MIN_PRICE = 5.0    # at least $5 — loose filter, TA/fundamental scoring handles quality
+    # Quality filters — eliminates ETFs, leveraged products, micro-caps, pumped tickers
+    MIN_PRICE  = 15.0    # at least $15
+    MIN_TRADES = 100000  # at least 100k trades/day — real institutional activity
 
-    def is_quality(symbol: str, price: float = 0, trade_count: int = 0) -> bool:
+    # Explicit ETF/leveraged product exclusions
+    ETF_EXCLUSIONS = {
+        "SPY","QQQ","IWM","EEM","GLD","SLV","TLT","HYG","LQD",
+        "XLF","XLK","XLE","XLV","XLU","XLY","XLI","XLB","XLC","XLRE",
+        "SOXS","SOXL","TQQQ","SQQQ","UVIX","UVXY","VIXY","SPDN","TZA",
+        "IBIT","BITO","MSTU","TSLL","DRIP","QID","NVD","TSLS","NVDL",
+        "NVDS","LABU","LABD","TECL","TECS","FAS","FAZ","UPRO","SPXU",
+    }
+
+    def is_quality(symbol: str, price: float = 0, trade_count: int = 0, volume: int = 0) -> bool:
+        if symbol in ETF_EXCLUSIONS:
+            return False
         return (
-            symbol.isalpha()      # no warrants (AAPL.WS), no preferred (AAPL-A)
-            and len(symbol) <= 5  # no exotic tickers
-            and price >= MIN_PRICE  # no penny stocks
-            # trade_count check removed — field name varies by API tier
+            symbol.isalpha()              # no warrants (AAPL.WS), preferred (AAPL-A)
+            and len(symbol) <= 5          # no exotic tickers
+            and price >= MIN_PRICE        # no micro-caps / penny stocks
+            and trade_count >= MIN_TRADES # real institutional trade count
         )
 
     try:
@@ -364,10 +404,24 @@ def build_universe() -> list[str]:
             timeout=10
         )
         r.raise_for_status()
-        actives = r.json().get("most_actives", [])
+        resp_json = r.json()
+        # Log raw keys to debug response structure
+        actives = resp_json.get("most_actives", resp_json.get("actives", []))
+        if not actives:
+            log.info(f"Most-actives response keys: {list(resp_json.keys())} — trying all keys")
+            # Try first list value in response
+            for v in resp_json.values():
+                if isinstance(v, list) and len(v) > 0:
+                    actives = v
+                    break
         active_symbols = [
             s["symbol"] for s in actives
-            if is_quality(s["symbol"], s.get("price", 0), s.get("trade_count", 0))
+            if is_quality(
+                s["symbol"],
+                s.get("price", 0),
+                s.get("trade_count", 0),
+                s.get("volume", 0)
+            )
         ]
         if active_symbols:
             symbols.update(active_symbols)
@@ -390,7 +444,12 @@ def build_universe() -> list[str]:
             if gainers:
                 gainer_symbols = [
                     s["symbol"] for s in gainers
-                    if is_quality(s["symbol"], s.get("price", 0), s.get("trade_count", 0))
+                    if is_quality(
+                        s["symbol"],
+                        s.get("price", 0),
+                        s.get("trade_count", 0),
+                        s.get("volume", 0)
+                    )
                 ][:TOP_MOVERS]
                 symbols.update(gainer_symbols)
                 log.info(f"Top gainers ({len(gainer_symbols)}): {gainer_symbols[:5]}...")
