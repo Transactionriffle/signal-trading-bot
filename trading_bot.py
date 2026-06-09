@@ -391,30 +391,32 @@ def build_universe() -> list[str]:
         r = requests.get(
             f"{DATA_URL}/screener/stocks/movers",
             headers=headers,
-            params={"top": min(TOP_MOVERS * 3, 50)},  # capped at 50 per API limit
+            params={"top": min(TOP_MOVERS * 3, 50)},
             timeout=10
         )
-        r.raise_for_status()
-        data = r.json()
-        gainers = data.get("gainers", [])
-        gainer_symbols = [
-            s["symbol"] for s in gainers
-            if is_quality(s["symbol"], s.get("price", 0), s.get("trade_count", 0))
-        ][:TOP_MOVERS]
-        symbols.update(gainer_symbols)
-        log.info(f"Top gainers ({len(gainer_symbols)}): {gainer_symbols[:5]}...")
+        if r.ok:
+            data    = r.json()
+            gainers = data.get("gainers", [])
+            if gainers:
+                gainer_symbols = [
+                    s["symbol"] for s in gainers
+                    if is_quality(s["symbol"], s.get("price", 0), s.get("trade_count", 0))
+                ][:TOP_MOVERS]
+                symbols.update(gainer_symbols)
+                log.info(f"Top gainers ({len(gainer_symbols)}): {gainer_symbols[:5]}...")
+            else:
+                log.info("Movers endpoint returned empty — using most-actives universe only")
+        else:
+            log.info(f"Movers endpoint {r.status_code} — using most-actives universe only")
     except Exception as e:
-        log.warning(f"Market movers fetch failed: {e}")
+        log.info(f"Movers unavailable ({e}) — using most-actives universe only")
 
     # Filter out ETFs, preferred shares, warrants (contain numbers or special chars)
     clean = [s for s in symbols if s.isalpha() and len(s) <= 5]
 
     if not clean:
-        log.warning("Dynamic universe empty — falling back to default tickers")
-        clean = [
-            "NVDA","AAPL","MSFT","AMZN","META","GOOG","TSLA","AMD",
-            "AVGO","QCOM","ARM","PANW","LLY","JPM","V","XOM",
-        ]
+        log.info("Dynamic universe empty — market closed or screener unavailable. No scan this cycle.")
+        return []
 
     log.info(f"Dynamic universe built: {len(clean)} unique tickers (most active + gainers)")
     return clean
