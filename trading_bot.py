@@ -167,20 +167,25 @@ ai_client = anthropic.Anthropic(api_key=ANTHROPIC_KEY)
 def get_quote_change(symbol: str) -> float | None:
     """Returns today's % change for a symbol using Alpaca latest quote."""
     try:
-        DATA_URL = "https://data.alpaca.markets/v2"
-        headers  = {"APCA-API-KEY-ID": ALPACA_KEY, "APCA-API-SECRET-KEY": ALPACA_SECRET}
+        # Use multi-snapshot endpoint which is more reliable
         r = requests.get(
-            f"{DATA_URL}/stocks/{symbol}/snapshot",
-            headers=headers,
-            timeout=8
+            f"https://data.alpaca.markets/v2/stocks/snapshots",
+            headers={"APCA-API-KEY-ID": ALPACA_KEY, "APCA-API-SECRET-KEY": ALPACA_SECRET},
+            params={"symbols": symbol, "feed": "iex"},
+            timeout=10
         )
         r.raise_for_status()
-        data = r.json()
-        snap = data.get("snapshot") or data.get(symbol, {})
+        data  = r.json()
+        snap  = data.get(symbol, {})
         daily = snap.get("dailyBar", {})
         prev  = snap.get("prevDailyBar", {})
         if daily and prev and prev.get("c", 0) > 0:
-            return (daily.get("c", 0) - prev.get("c", 0)) / prev.get("c", 0)
+            chg = (daily.get("c", 0) - prev.get("c", 0)) / prev.get("c", 0)
+            return chg
+        # Fallback: use latestTrade vs prevDailyBar close
+        latest = snap.get("latestTrade", {})
+        if latest and prev and prev.get("c", 0) > 0:
+            return (latest.get("p", 0) - prev.get("c", 0)) / prev.get("c", 0)
         return None
     except Exception as e:
         log.warning(f"Quote fetch failed for {symbol}: {e}")
