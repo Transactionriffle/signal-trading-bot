@@ -357,7 +357,7 @@ def build_universe() -> list[str]:
         # Software / Cloud / Cybersecurity
         "CRM","SNOW","PLTR","PANW","CRWD","ZS","NET","DDOG","NOW","MDB",
         # Healthcare — LLY and UNH generated multiple +5% exits
-        "LLY","NVO","ABBV","UNH","JNJ","MRK","AMGN",
+        "LLY","NVO","ABBV","UNH","JNJ","MRK","AMGN","NUVL","REGN","VRTX","MRNA","BIIB",
         # Financials — JPM, GS, MA, V, BLK all strong performers
         "JPM","GS","MS","BAC","V","MA","BLK","SCHW",
         # Consumer / Media — SPOT, NFLX, UBER generated alpha
@@ -931,6 +931,15 @@ def run():
                     reinvest(positions, account)
                 else:
                     log.warning(f"BEAR MODE — skipping reinvestment. SPY down >{abs(SPY_BEAR)*100:.0f}% + VIX elevated.")
+
+            # Always check if we have open slots to fill — Kelly 10% means up to 10 positions
+            positions = get_positions()
+            open_slots = 10 - len(positions)
+            cash       = float(account.cash)
+
+            if open_slots > 0 and cash >= float(account.equity) * 0.10 and market_state != "BEAR":
+                log.info(f"  {open_slots} slot(s) available with ${cash:,.0f} cash — scanning for new signals")
+                reinvest(positions, account)
             elif not positions:
                 clock = trade_client.get_clock()
                 if clock.is_open and market_state != "BEAR":
