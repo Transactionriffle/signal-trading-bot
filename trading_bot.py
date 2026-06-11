@@ -379,11 +379,17 @@ def build_universe() -> list[str]:
 
     # Explicit ETF/leveraged product exclusions
     ETF_EXCLUSIONS = {
-        "SPY","QQQ","IWM","EEM","GLD","SLV","TLT","HYG","LQD",
+        # Index ETFs
+        "SPY","QQQ","IWM","EEM","VOO","VTI","VEA","VWO","IVV","DIA",
+        # Sector ETFs
         "XLF","XLK","XLE","XLV","XLU","XLY","XLI","XLB","XLC","XLRE",
+        # Bond ETFs
+        "GLD","SLV","TLT","HYG","LQD","AGG","BND",
+        # Leveraged/inverse ETFs
         "SOXS","SOXL","TQQQ","SQQQ","UVIX","UVXY","VIXY","SPDN","TZA",
         "IBIT","BITO","MSTU","TSLL","DRIP","QID","NVD","TSLS","NVDL",
         "NVDS","LABU","LABD","TECL","TECS","FAS","FAZ","UPRO","SPXU",
+        "UDOW","SDOW","BOIL","KOLD","UGAZ","DGAZ",
     }
 
     def is_quality(symbol: str, price: float = 0, trade_count: int = 0, volume: int = 0) -> bool:
@@ -723,7 +729,19 @@ def find_candidates(exclude: list[str]) -> list[dict]:
 
     log.info(f"Scanning {len(targets)} tickers from dynamic universe...")
 
-    for symbol in targets:
+    for i, symbol in enumerate(targets):
+        # ── Check positions every 5 tickers during long scan ──
+        # Scan takes 25+ min — without this, profit targets get missed
+        # MU hit +5.5% and wasn't sold for 25 minutes — this fixes that
+        if i > 0 and i % 5 == 0:
+            mid_positions = get_positions()
+            if mid_positions:
+                mid_closed = check_profit_targets(mid_positions)
+                if mid_closed:
+                    log.info(f"  Mid-scan exit: {mid_closed} — continuing scan")
+                    # Refresh exclude list so we don't re-buy just-closed symbols
+                    exclude = list(get_positions().keys())
+
         result = compute_signal(symbol)
         if result and result["signal"] == "BUY" and result["confidence"] >= MIN_CONFIDENCE:
             candidates.append(result)
