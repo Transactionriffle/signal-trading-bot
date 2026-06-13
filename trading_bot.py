@@ -53,6 +53,8 @@ import time
 import logging
 import requests
 import anthropic
+import threading
+import websocket
 from datetime import datetime, timezone, timedelta
 from zoneinfo import ZoneInfo
 from collections import defaultdict
@@ -144,10 +146,217 @@ signal_cache_time:  float            = 0.0       # when cache was built
 signal_cache_date:  str              = ""        # date of last scan
 last_rescan_time:   float            = 0.0       # last emergency rescan
 
+# ── News WebSocket state ───────────────────────────────────────
+news_triggered:     dict[str, float] = {}        # {symbol: timestamp} — news-triggered tickers
+news_queue:         list             = []         # pending news signals to process
+NEWS_COOLDOWN       = 3600                        # 1 hour before same ticker triggers again
+
+# High-value news keywords that warrant immediate signal scoring
+NEWS_BULLISH_KEYWORDS = [
+    "acqui", "merger", "buyout", "takeover",       # M&A
+    "beats", "beat", "exceeded", "surpassed",      # earnings beats
+    "raises guidance", "raised guidance",           # guidance upgrade
+    "fda approved", "fda approval",                # FDA
+    "partnership", "contract", "deal",             # business wins
+    "buyback", "repurchase",                       # shareholder returns
+    "upgrade", "outperform", "overweight",         # analyst upgrades
+]
+NEWS_BEARISH_KEYWORDS = [
+    "miss", "missed", "below expectations",        # earnings miss
+    "lowered guidance", "cuts guidance",           # guidance cut
+    "investigation", "lawsuit", "sec charges",     # legal issues
+    "recall", "safety concern",                    # product issues
+    "downgrade", "underperform", "sell rating",   # analyst downgrades
+]
+
 PEAKS_FILE   = "/tmp/position_peaks.json"
 JOURNAL_FILE = "/tmp/trade_journal.json"
 
-# ── Trade journal for 90-day audit ────────────────────────────
+# ══════════════════════════════════════════════════════════════
+# NEWS WEBSOCKET LAYER
+# ══════════════════════════════════════════════════════════════
+
+def classify_news(headline: str, summary: str) -> str:
+    """
+    Classifies news as BULLISH, BEARISH, or NEUTRAL.
+    Returns classification string.
+    """
+    text = (headline + " " + summary).lower()
+    for kw in NEWS_BULLISH_KEYWORDS:
+        if kw in text:
+            return "BULLISH"
+    for kw in NEWS_BEARISH_KEYWORDS:
+        if kw in text:
+            return "BEARISH"
+    return "NEUTRAL"
+
+def extract_tickers(symbols: list, headline: str) -> list:
+    """
+    Returns tickers from the news article that are in our universe.
+    Filters to curated tickers + news-triggered universe.
+    """
+    universe = set(CURATED_TICKERS) | set(news_triggered.keys())
+    matched  = [s for s in symbols if s in universe and s not in ETF_EXCLUSIONS]
+    return matched
+
+def on_news_message(ws, message):
+    """
+    Handles incoming news from Alpaca WebSocket stream.
+    Filters for high-value events on universe tickers.
+    Adds to news_queue for main thread to process.
+    """
+    global news_triggered, news_queue
+    try:
+        data = json.loads(message)
+        if not isinstance(data, list):
+            data = [data]
+
+        for article in data:
+            if article.get("T") != "n":  # only news type messages
+                continue
+
+            headline = article.get("headline", "")
+            summary  = article.get("summary", "")
+            symbols  = article.get("symbols", [])
+
+            # Filter to universe tickers
+            matched = extract_tickers(symbols, headline)
+            if not matched:
+                continue
+
+            # Classify sentiment
+            sentiment = classify_news(headline, summary)
+            if sentiment == "NEUTRAL":
+                continue
+
+            # Check cooldown — don't re-trigger same ticker within 1 hour
+            now = time.time()
+            for symbol in matched:
+                last_trigger = news_triggered.get(symbol, 0)
+                if now - last_trigger < NEWS_COOLDOWN:
+                    continue
+
+                news_triggered[symbol] = now
+                news_queue.append({
+                    "symbol":    symbol,
+                    "headline":  headline,
+                    "sentiment": sentiment,
+                    "timestamp": now,
+                })
+                log.info(
+                    f"📰 NEWS TRIGGER [{sentiment}] {symbol}: {headline[:80]}..."
+                )
+
+    except Exception as e:
+        log.warning(f"News message error: {e}")
+
+def on_news_open(ws):
+    log.info("📰 News WebSocket connected — subscribing to all news")
+    ws.send(json.dumps({
+        "action":  "auth",
+        "key":     ALPACA_KEY,
+        "secret":  ALPACA_SECRET,
+    }))
+    ws.send(json.dumps({
+        "action": "subscribe",
+        "news":   ["*"],  # subscribe to all news
+    }))
+
+def on_news_error(ws, error):
+    log.warning(f"News WebSocket error: {error}")
+
+def on_news_close(ws, close_status_code, close_msg):
+    log.warning(f"News WebSocket closed: {close_status_code} {close_msg}")
+
+def start_news_stream():
+    """
+    Starts news WebSocket in a background daemon thread.
+    Automatically reconnects on disconnect.
+    """
+    def run():
+        while True:
+            try:
+                log.info("📰 Starting news WebSocket stream...")
+                ws = websocket.WebSocketApp(
+                    "wss://stream.data.alpaca.markets/v1beta1/news",
+                    on_open    = on_news_open,
+                    on_message = on_news_message,
+                    on_error   = on_news_error,
+                    on_close   = on_news_close,
+                )
+                ws.run_forever(ping_interval=30, ping_timeout=10)
+            except Exception as e:
+                log.warning(f"News stream crashed: {e} — reconnecting in 30s")
+            time.sleep(30)  # reconnect delay
+
+    thread = threading.Thread(target=run, daemon=True)
+    thread.start()
+    log.info("📰 News WebSocket thread started")
+
+def process_news_queue(positions: dict, account) -> bool:
+    """
+    Processes pending news signals from the queue.
+    Called from main loop every cycle.
+    Returns True if any news-triggered trade was placed.
+    """
+    global news_queue, signal_cache
+
+    if not news_queue:
+        return False
+
+    traded = False
+    to_process = news_queue.copy()
+    news_queue.clear()
+
+    for item in to_process:
+        symbol    = item["symbol"]
+        headline  = item["headline"]
+        sentiment = item["sentiment"]
+
+        # Skip if already in a position
+        if symbol in positions:
+            log.info(f"📰 {symbol} already held — skipping news trigger")
+            continue
+
+        # Skip if market is not open
+        if not is_market_open():
+            log.info(f"📰 {symbol} news trigger queued — market closed")
+            news_queue.append(item)  # requeue for when market opens
+            continue
+
+        if market_state == "BEAR":
+            log.info(f"📰 {symbol} news trigger skipped — BEAR mode")
+            continue
+
+        log.info(f"📰 Processing news trigger for {symbol}: {headline[:60]}...")
+
+        # Score the ticker immediately
+        spy_chg = spy_change or 0.0
+
+        # Invalidate fund cache for this ticker — news changes the score
+        if symbol in fund_cache:
+            del fund_cache[symbol]
+
+        result = compute_signal(symbol, spy_chg)
+
+        if result and result["signal"] == "BUY" and result["confidence"] >= MIN_CONFIDENCE:
+            log.info(
+                f"📰 NEWS BUY [{sentiment}] {symbol}: "
+                f"composite={result['composite']:.2f}, confidence={result['confidence']}% "
+                f"— {result['thesis']}"
+            )
+            # Insert at top of signal cache — highest priority
+            signal_cache.insert(0, result)
+            traded = True
+        elif sentiment == "BULLISH" and result:
+            log.info(
+                f"📰 {symbol} news bullish but below threshold "
+                f"(composite={result['composite']:.2f}, confidence={result['confidence']}%)"
+            )
+        else:
+            log.info(f"📰 {symbol} news scored HOLD/SELL — no action")
+
+    return traded
 def load_journal() -> dict:
     try:
         with open(JOURNAL_FILE) as f:
@@ -804,6 +1013,7 @@ def deploy_from_cache(positions: dict, account):
 
 def run():
     load_peaks()
+    start_news_stream()  # Start news WebSocket in background thread
 
     log.info("=" * 60)
     log.info("SIGNAL Trading Bot started")
@@ -877,6 +1087,13 @@ def run():
             closed = check_profit_targets(positions) if positions else []
 
             if closed:
+                time.sleep(3)
+                positions = get_positions()
+                account   = get_account()
+
+            # ── Process news triggers (real-time events) ───────
+            news_traded = process_news_queue(positions, account)
+            if news_traded:
                 time.sleep(3)
                 positions = get_positions()
                 account   = get_account()
