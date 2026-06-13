@@ -2,3 +2,4 @@ alpaca-py>=0.40.0
 anthropic>=0.49.0
 requests>=2.31.0
 schedule>=1.2.0
+websocket-client>=1.6.0
