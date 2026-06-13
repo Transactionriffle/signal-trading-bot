@@ -100,24 +100,71 @@ SECTOR_ETFS     = {
     "industrials": "XLI", "materials": "XLB",
 }
 
-# ── Curated universe (35 tickers — proven performers) ─────────
-# Validated by: actual +5% exits, backtest top performers, 90-day audit criteria
-# Last audited: June 2026
+# ── Curated universe (35 tickers — sector diversified) ────────
+# Rebuilt June 2026 with proper sector diversification and mid-cap exposure
 # Audit criteria: Volume/liquidity, TA alignment, personal win rate
+# Max 6 tickers per sector — no single sector dominates
+# Mix of large-cap stability + mid-cap growth ($15B-$80B)
 CURATED_TICKERS = [
-    # AI / Semiconductors — multiple +5% exits confirmed
-    "NVDA", "AMD", "AVGO", "ASML", "MU", "TSM", "QCOM", "ARM", "MRVL",
-    # Mega-cap Tech — consistent signals
-    "AAPL", "MSFT", "GOOG", "META", "AMZN", "TSLA", "ORCL",  # GOOGL removed — duplicate of GOOG
-    # Software / Cybersecurity
-    "PLTR", "PANW", "CRWD", "NET", "CRM", "SNOW",
-    # Financials — JPM, GS, MA, V, BLK all strong performers
-    "JPM", "MS", "BAC", "V", "MA", "BLK",
-    # Healthcare — LLY, UNH multiple +5% exits
-    "LLY", "UNH", "NUVL",
-    # Consumer / Media — SPOT, NFLX, UBER generated alpha
-    "SPOT", "NFLX", "UBER",
-]  # 35 tickers
+    # ── AI / Semiconductors (5) — core AI infrastructure ─────
+    # Large-cap anchors with proven +5% exits
+    "NVDA",   # $5.2T — AI GPU monopoly, multiple exits
+    "AVGO",   # $1.9T — networking chips, AI custom silicon
+    "TSM",    # $2.2T — manufactures everything, 88% confidence score
+    "MU",     # $1.1T — HBM memory, multiple +5% exits
+    "AMD",    # $806B — data center CPU/GPU, strong momentum
+
+    # ── Mega-cap Tech (4) — liquid, consistent signals ────────
+    "GOOG",   # $4.4T — Cloud +63%, AI search dominance
+    "META",   # $1.5T — 33% revenue growth, PE 21 below average
+    "MSFT",   # $2.9T — Azure +40%, enterprise AI
+    "AMZN",   # $2.6T — AWS reaccelerating, retail margins expanding
+
+    # ── Financials (4) — rate sensitive, macro diversifier ───
+    "JPM",    # $876B — consistent 85% confidence scores
+    "V",      # $617B — payment rails, recession resistant, multiple +5% exits
+    "MA",     # $510B — same, multiple +5% exits
+    "GS",     # $210B — trading revenue, M&A advisory cycle
+    "BAC",    # $350B — rate sensitive, improving ROE
+
+    # ── Healthcare (4) — defensive + biotech catalyst ────────
+    "LLY",    # $1.04T — GLP-1 monopoly, multiple +5% exits
+    "UNH",    # $440B — managed care, raised guidance
+    "ABBV",   # $370B — Skyrizi/Rinvoq growth replacing Humira
+    "ISRG",   # $200B — surgical robotics, recurring revenue
+
+    # ── Energy (4) — best performing sector 2026 YTD +19.9% ─
+    "XOM",    # $613B — Iran war premium, strong FCF
+    "CVX",    # $270B — integrated major, dividend growth
+    "COP",    # $110B — pure upstream E&P, leveraged to oil price
+    "SLB",    # $55B — oilfield services, AI drilling tech (mid-cap)
+
+    # ── Industrials (4) — AI infrastructure buildout play ────
+    "GEV",    # $90B — GE Vernova, gas turbines + nuclear (mid-cap)
+    "CAT",    # $185B — construction equipment, data center buildout
+    "RTX",    # $190B — defense/aerospace, Iran war spending
+    "HON",    # $130B — industrial automation, building tech
+
+    # ── Consumer / Distribution (4) — FMCG + logistics ──────
+    "COST",   # $440B — membership model, recession proof
+    "WMT",    # $780B — supply chain dominance, grocery
+    "MCD",    # $210B — global franchise, pricing power
+    "FDX",    # $65B — logistics, e-commerce backbone (mid-cap)
+
+    # ── Mid-cap Growth (6) — less efficient, more alpha ──────
+    "PLTR",   # $450B — AI software, government + enterprise
+    "CRWD",   # $120B — cybersecurity market leader
+    "SPOT",   # $80B — profitability inflection, subscriber growth
+    "NFLX",   # $410B — ad-supported tier, margin expansion
+    "NUVL",   # $10B  — acquisition target, biotech catalyst
+    "DECK",   # $22B  — UGG/HOKA, consistent earnings beats (mid-cap)
+]  # 36 tickers
+
+# Sector breakdown:
+# Semis: 5 (14%) | Tech: 4 (11%) | Financials: 5 (14%)
+# Healthcare: 4 (11%) | Energy: 4 (11%) | Industrials: 4 (11%)
+# Consumer/Distribution: 4 (11%) | Mid-cap Growth: 6 (17%)
+# Large-cap (>$100B): 26 | Mid-cap ($15B-$100B): 10
 
 # ── ETF exclusions — never trade these ────────────────────────
 ETF_EXCLUSIONS = {
