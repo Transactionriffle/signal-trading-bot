@@ -85,10 +85,12 @@ SCAN_INTERVAL   = 60
 ET              = ZoneInfo("America/New_York")
 
 # ── Risk thresholds ────────────────────────────────────────────
-PROFIT_TARGET   =  0.05
-PEAK_TRIGGER    =  0.03
-TRAIL_SELL      =  0.025
-STOP_LOSS       = -0.05
+PROFIT_TARGET   =  0.05    # +5%   sell immediately
+PEAK_TRIGGER    =  0.03    # +3%   activate trailing protection
+TRAIL_SELL      =  0.025   # +2.5% sell if falls back here after peak
+STOP_LOSS       = -0.05    # -5%   hard stop (before breakeven activates)
+BREAKEVEN_TRIGGER = 0.01   # +1%   once hit, stop shifts to +0.5%
+BREAKEVEN_STOP    = 0.005  # +0.5% minimum locked-in gain after breakeven
 
 # ── Macro thresholds ───────────────────────────────────────────
 SPY_BEAR        = -0.02
@@ -955,15 +957,30 @@ def check_profit_targets(positions: dict) -> list[str]:
                 save_peaks()
                 if pnl_pct >= PEAK_TRIGGER:
                     log.info(f"  {symbol}: new peak {pnl_pct*100:+.2f}% — trailing active")
+                elif pnl_pct >= BREAKEVEN_TRIGGER:
+                    log.info(f"  {symbol}: new peak {pnl_pct*100:+.2f}% — breakeven stop active (+0.5%)")
 
             current_peak = position_peaks.get(symbol, 0.0)
             reason       = None
+
+            # Determine effective stop loss based on peak reached
+            if current_peak >= PEAK_TRIGGER:
+                # Trailing protection active
+                effective_stop = TRAIL_SELL
+            elif current_peak >= BREAKEVEN_TRIGGER:
+                # Breakeven stop — locked in +0.5% minimum
+                effective_stop = BREAKEVEN_STOP
+            else:
+                # Standard stop loss
+                effective_stop = active_stop
 
             if pnl_pct >= PROFIT_TARGET:
                 reason = "PROFIT_TARGET"
             elif current_peak >= PEAK_TRIGGER and pnl_pct <= TRAIL_SELL:
                 reason = f"TRAILING (peaked {current_peak*100:+.2f}%)"
-            elif pnl_pct <= active_stop:
+            elif current_peak >= BREAKEVEN_TRIGGER and pnl_pct <= BREAKEVEN_STOP:
+                reason = f"BREAKEVEN_STOP (peaked {current_peak*100:+.2f}%, locked +0.5%)"
+            elif current_peak < BREAKEVEN_TRIGGER and pnl_pct <= active_stop:
                 reason = f"STOP_LOSS ({active_stop*100:.0f}%)"
 
             if reason:
