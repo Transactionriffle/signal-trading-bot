@@ -78,7 +78,7 @@ ANTHROPIC_KEY   = os.environ["ANTHROPIC_API_KEY"]
 WORKER_URL      = os.environ.get("CLOUDFLARE_WORKER", "https://winter-cake-6aae.dimitridesplace-65f.workers.dev")
 TECH_WEIGHT     = int(os.environ.get("TECH_WEIGHT", "40"))
 FUND_WEIGHT     = 100 - TECH_WEIGHT
-MIN_CONFIDENCE  = int(os.environ.get("MIN_CONFIDENCE", "80"))
+MIN_CONFIDENCE  = int(os.environ.get("MIN_CONFIDENCE", "85"))  # raised from 80% — filters weak signals like NFLX (82%)
 MAX_TRADES_DAY  = int(os.environ.get("MAX_TRADES_PER_DAY", "10"))
 MAX_DRAWDOWN    = float(os.environ.get("MAX_DRAWDOWN_PCT", "0.15"))
 SCAN_INTERVAL   = 60
@@ -157,7 +157,7 @@ CURATED_TICKERS = [
     "PLTR",   # $450B — AI software, government + enterprise
     "CRWD",   # $120B — cybersecurity market leader
     "SPOT",   # $80B — profitability inflection, subscriber growth
-    "NFLX",   # $410B — ad-supported tier, margin expansion
+    # NFLX removed — Jun 15 trade hit -4%, weak signal (composite 2.50, min threshold)
     "NUVL",   # $10B  — acquisition target, biotech catalyst
     "DECK",   # $22B  — UGG/HOKA, consistent earnings beats (mid-cap)
 ]  # 36 tickers
@@ -388,7 +388,7 @@ def process_news_queue(positions: dict, account) -> bool:
 
         result = compute_signal(symbol, spy_chg)
 
-        if result and result["signal"] == "BUY" and result["confidence"] >= MIN_CONFIDENCE:
+        if result and result["signal"] == "BUY" and result["confidence"] >= MIN_CONFIDENCE and result["composite"] >= 3.0:
             log.info(
                 f"📰 NEWS BUY [{sentiment}] {symbol}: "
                 f"composite={result['composite']:.2f}, confidence={result['confidence']}% "
@@ -797,7 +797,7 @@ def run_premarket_scan():
 
     for i, symbol in enumerate(universe):
         result = compute_signal(symbol, spy_chg)
-        if result and result["signal"] == "BUY" and result["confidence"] >= MIN_CONFIDENCE:
+        if result and result["signal"] == "BUY" and result["confidence"] >= MIN_CONFIDENCE and result["composite"] >= 3.0:
             candidates.append(result)
             ipo_tag = " [IPO]" if result.get("ipo_mode") else ""
             log.info(
@@ -1045,7 +1045,7 @@ def deploy_from_cache(positions: dict, account):
                 if symbol in positions:
                     continue
                 result = compute_signal(symbol, spy_chg)
-                if result and result["signal"] == "BUY" and result["confidence"] >= MIN_CONFIDENCE:
+                if result and result["signal"] == "BUY" and result["confidence"] >= MIN_CONFIDENCE and result["composite"] >= 3.0:
                     new_signals.append(result)
                 time.sleep(20)
             signal_cache = sorted(new_signals, key=lambda x: x["confidence"], reverse=True)
