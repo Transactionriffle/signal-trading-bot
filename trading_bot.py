@@ -960,34 +960,48 @@ def run_premarket_scan():
 
 def should_run_premarket_scan() -> bool:
     """
-    Returns True if pre-market scan should run.
-    Triggers:
-    - Sunday 8pm ET → Monday preparation
-    - Monday-Friday 6am-7am ET → morning prep
-    - Signal cache is empty or stale (>30 minutes old during market hours)
+    Returns True ONLY in designated pre-market windows.
+    TIME IS THE PRIMARY GATE — cache state is secondary.
+
+    Scan windows:
+    - Sunday 8pm-10pm ET  → Monday preparation
+    - Mon-Fri 6am-9:29am ET → morning preparation
+
+    NEVER scans:
+    - During market hours (9:30am-4pm ET) — cache only
+    - After 4pm ET — wait for 6am next morning
+    - Weekends outside Sunday 8-10pm
+    - On bot restart mid-session (even with empty cache)
     """
     now_et = datetime.now(ET)
     today  = now_et.strftime("%Y-%m-%d")
     hour   = now_et.hour
+    minute = now_et.minute
     day    = now_et.weekday()  # 0=Mon, 6=Sun
 
-    # Cache already built today
+    # ── Step 1: Time gate — must be in allowed window ──────────
+    in_window = False
+
+    # Sunday 8pm-10pm ET
+    if day == 6 and 20 <= hour < 22:
+        in_window = True
+
+    # Weekday 6am-9:29am ET only
+    elif 0 <= day <= 4 and 6 <= hour <= 9:
+        market_open = hour == 9 and minute >= 30
+        if not market_open:
+            in_window = True
+
+    # Not in any allowed window — never scan
+    if not in_window:
+        return False
+
+    # ── Step 2: Already scanned today — don't repeat ───────────
     if signal_cache_date == today and signal_cache:
         return False
 
-    # Sunday 8pm-10pm
-    if day == 6 and 20 <= hour < 22:
-        return True
-
-    # Weekday 6am-7am
-    if 0 <= day <= 4 and hour == 6:
-        return True
-
-    # Cache stale during market hours (emergency rescan)
-    if not signal_cache and signal_cache_date != today:
-        return True
-
-    return False
+    # In window + cache stale → scan
+    return True
 
 # ══════════════════════════════════════════════════════════════
 # ALPACA HELPERS
@@ -1352,7 +1366,14 @@ def run():
             # Deploy from cache (no Claude calls during market hours)
             open_slots = 10 - len(positions)
             if open_slots > 0 and float(account.cash) >= equity * 0.10:
-                deploy_from_cache(positions, account)
+                if not signal_cache:
+                    log.info(
+                        f"  {open_slots} slot(s) available but signal cache is empty — "
+                        f"waiting for tomorrow's 6am ET pre-market scan. "
+                        f"News WebSocket will trigger immediate re-score on breaking events."
+                    )
+                else:
+                    deploy_from_cache(positions, account)
 
         except KeyboardInterrupt:
             log.info("Bot stopped.")
