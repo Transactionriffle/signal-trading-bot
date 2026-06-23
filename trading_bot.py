@@ -168,6 +168,34 @@ CURATED_TICKERS = [
 # Consumer/Distribution: 4 (11%) | Mid-cap Growth: 6 (17%)
 # Large-cap (>$100B): 26 | Mid-cap ($15B-$100B): 10
 
+# ── Sector map — used for weak sector filtering ────────────────
+SECTOR_MAP: dict[str, str] = {
+    # Semis
+    "NVDA":"tech","AVGO":"tech","TSM":"tech","MU":"tech","AMD":"tech",
+    # Mega-cap Tech
+    "GOOG":"tech","META":"tech","MSFT":"tech","AMZN":"tech",
+    "AAPL":"tech","TSLA":"tech","ORCL":"tech",
+    # Software / Cyber
+    "PLTR":"tech","CRWD":"tech","PANW":"tech","NET":"tech",
+    "CRM":"tech","SNOW":"tech",
+    # Financials
+    "JPM":"financials","V":"financials","MA":"financials",
+    "GS":"financials","BAC":"financials","MS":"financials","BLK":"financials",
+    # Healthcare
+    "LLY":"healthcare","UNH":"healthcare","ABBV":"healthcare",
+    "ISRG":"healthcare","NUVL":"healthcare",
+    # Energy
+    "XOM":"energy","CVX":"energy","COP":"energy","SLB":"energy",
+    # Industrials
+    "GEV":"industrials","CAT":"industrials","RTX":"industrials","HON":"industrials",
+    # Consumer / Distribution
+    "COST":"consumer","WMT":"consumer","MCD":"consumer","FDX":"consumer",
+    # Mid-cap
+    "SPOT":"consumer","NFLX":"consumer","UBER":"consumer",
+    "DECK":"consumer","ARM":"tech","MRVL":"tech","QCOM":"tech",
+    "ASML":"tech","ADBE":"tech","INTC":"tech",
+}
+
 # ── ETF exclusions — never trade these ────────────────────────
 ETF_EXCLUSIONS = {
     "SPY","QQQ","IWM","EEM","VOO","VTI","VEA","VWO","IVV","DIA",
@@ -1073,7 +1101,18 @@ def run_risk_checks(account) -> tuple[bool, str]:
 # ══════════════════════════════════════════════════════════════
 
 def check_profit_targets(positions: dict) -> list[str]:
-    """Three exit rules — no Claude calls needed."""
+    """
+    Exit rules — no Claude calls needed.
+    Four exit conditions:
+      1. Profit target +5%
+      2. Trailing protection: peak ≥ +3% → sell if falls to +2.5%
+      3. Breakeven stop: peak ≥ +1% → stop shifts to +0.5%
+      4. Hard stop loss: -5% (tightens to -2% in BEAR mode)
+    Plus:
+      5. Weak sector mid-day exit: if sector turns weak AND position
+         is at breakeven (+0.5%) or better → exit to protect gains.
+         If position is negative → hold (don't crystallise a loss).
+    """
     closed      = []
     active_stop = get_stop_loss()
 
@@ -1094,17 +1133,7 @@ def check_profit_targets(positions: dict) -> list[str]:
             current_peak = position_peaks.get(symbol, 0.0)
             reason       = None
 
-            # Determine effective stop loss based on peak reached
-            if current_peak >= PEAK_TRIGGER:
-                # Trailing protection active
-                effective_stop = TRAIL_SELL
-            elif current_peak >= BREAKEVEN_TRIGGER:
-                # Breakeven stop — locked in +0.5% minimum
-                effective_stop = BREAKEVEN_STOP
-            else:
-                # Standard stop loss
-                effective_stop = active_stop
-
+            # ── Standard exit rules ────────────────────────────
             if pnl_pct >= PROFIT_TARGET:
                 reason = "PROFIT_TARGET"
             elif current_peak >= PEAK_TRIGGER and pnl_pct <= TRAIL_SELL:
@@ -1113,6 +1142,23 @@ def check_profit_targets(positions: dict) -> list[str]:
                 reason = f"BREAKEVEN_STOP (peaked {current_peak*100:+.2f}%, locked +0.5%)"
             elif current_peak < BREAKEVEN_TRIGGER and pnl_pct <= active_stop:
                 reason = f"STOP_LOSS ({active_stop*100:.0f}%)"
+
+            # ── Weak sector mid-day exit ───────────────────────
+            # Only exit if position is at breakeven (+0.5%) or better
+            # Never crystallise a loss due to sector rotation
+            if not reason and weak_sectors:
+                sector = SECTOR_MAP.get(symbol)
+                if sector and sector in weak_sectors:
+                    if pnl_pct >= BREAKEVEN_STOP:
+                        reason = (
+                            f"WEAK_SECTOR ({sector.upper()} weak, "
+                            f"P&L {pnl_pct*100:+.2f}% ≥ +0.5% — exiting)"
+                        )
+                    else:
+                        log.info(
+                            f"  {symbol}: sector '{sector}' weak but "
+                            f"P&L {pnl_pct*100:+.2f}% below breakeven — holding"
+                        )
 
             if reason:
                 if close_position(symbol, pnl_pct, reason):
@@ -1193,6 +1239,16 @@ def deploy_from_cache(positions: dict, account):
         price  = candidate["price"]
         if price <= 0:
             continue
+
+        # ── Sector filter — block new buys in weak sectors ─────
+        sector = SECTOR_MAP.get(symbol)
+        if sector and sector in weak_sectors:
+            log.info(
+                f"  {symbol}: sector '{sector}' is weak today — "
+                f"skipping new buy (cache signal preserved for tomorrow)"
+            )
+            continue
+
         alloc  = min(equity * KELLY_PCT, cash * 0.95)
         qty    = int(alloc / price)
         if qty < 1:
