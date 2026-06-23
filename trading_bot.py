@@ -178,7 +178,41 @@ ETF_EXCLUSIONS = {
     "NVDS","LABU","LABD","TECL","TECS","FAS","FAZ","UPRO","SPXU",
     "UDOW","SDOW","BOIL","KOLD","UGAZ","DGAZ",
     "DRAM","SMH","SOXX","XSD","PSI","FTXL","SOXQ",
+    # Tradr 2X leveraged ETFs — new series, not recognisable by ticker name
+    "CRDU","NVDU","AAPU","AMZU","MSFU","GOGU","METAU","TSLU",
+    "AMZD","NVDD","AAPD","MSFD","GOGD","METAD","CRDL",
 }
+
+# Suffixes that identify leveraged/inverse ETFs not in the exclusion list
+# Used as a fallback check in is_likely_etf()
+ETF_NAME_KEYWORDS = [
+    "2x long", "2x short", "3x long", "3x short",
+    "leveraged", "inverse", "ultra", "bear", "bull etf",
+    "daily etf", "proshares", "direxion", "tradr",
+]
+
+def is_likely_etf(symbol: str) -> bool:
+    """
+    Secondary ETF check using Alpaca asset data.
+    Catches new leveraged ETFs not yet in ETF_EXCLUSIONS.
+    Called once per ticker, result cached in fund_cache.
+    """
+    cache_key = f"etf_check_{symbol}"
+    if cache_key in fund_cache:
+        _, result = fund_cache[cache_key]
+        return result
+
+    try:
+        asset = trade_client.get_asset(symbol)
+        name  = (asset.name or "").lower()
+        is_etf = any(kw in name for kw in ETF_NAME_KEYWORDS)
+        if is_etf:
+            log.warning(f"  {symbol}: identified as ETF/leveraged product ('{asset.name}') — blocking")
+        fund_cache[cache_key] = (time.time(), is_etf)
+        return is_etf
+    except Exception:
+        fund_cache[cache_key] = (time.time(), False)
+        return False
 
 # ── Runtime state ──────────────────────────────────────────────
 trades_today:       dict[str, int]   = defaultdict(int)
@@ -698,9 +732,54 @@ def fetch_fundamental(symbol: str, ta: dict) -> dict | None:
         log.warning(f"Fundamental fetch failed for {symbol}: {e}")
         return None
 
+def check_earnings_proximity(symbol: str, today: str) -> tuple[bool, str]:
+    """
+    Checks if a ticker has earnings within 3 days using Claude web search.
+    Returns (has_earnings_soon, earnings_date_or_empty).
+    Uses a separate lightweight cache to avoid repeated checks.
+    """
+    # Lightweight earnings cache — 24 hours
+    cache_key = f"earnings_{symbol}"
+    if cache_key in fund_cache:
+        cached_time, cached_result = fund_cache[cache_key]
+        if time.time() - cached_time < 86400:
+            return cached_result
+
+    try:
+        prompt = (
+            f"Does {symbol} have earnings announcement within the next 3 days from {today}? "
+            "Return ONLY this JSON with NO other text: "
+            '{"earnings_within_3_days":false,"earnings_date":null} '
+            "Set earnings_within_3_days to true only if earnings are confirmed within 3 calendar days."
+        )
+        response = ai_client.messages.create(
+            model="claude-sonnet-4-5",
+            max_tokens=60,
+            tools=[{"type": "web_search_20250305", "name": "web_search"}],
+            messages=[{"role": "user", "content": prompt}],
+        )
+        text = next((b.text for b in response.content if hasattr(b, "text")), "")
+        si, ei = text.find("{"), text.rfind("}")
+        if si == -1:
+            fund_cache[cache_key] = (time.time(), (False, ""))
+            return False, ""
+        result = json.loads(text[si:ei+1])
+        has_earnings = bool(result.get("earnings_within_3_days", False))
+        earnings_date = result.get("earnings_date") or ""
+        fund_cache[cache_key] = (time.time(), (has_earnings, earnings_date))
+        return has_earnings, earnings_date
+    except Exception as e:
+        log.warning(f"Earnings check failed for {symbol}: {e}")
+        return False, ""
+
 def compute_signal(symbol: str, spy_chg: float = 0.0) -> dict | None:
     # Skip known ETFs
     if symbol in ETF_EXCLUSIONS:
+        return None
+
+    # Secondary ETF check — catches new leveraged ETFs not in exclusion list (e.g. CRDU)
+    if is_likely_etf(symbol):
+        ETF_EXCLUSIONS.add(symbol)  # add to exclusion list for this session
         return None
 
     ta = fetch_technicals(symbol)
@@ -714,6 +793,16 @@ def compute_signal(symbol: str, spy_chg: float = 0.0) -> dict | None:
               "macdHist":0,"ema20":0,"ema50":0,"ema200":0,
               "pct1d":0,"pct5d":0,"volRatio":1}
         ipo_mode = True
+
+    # ── Earnings proximity check — applies to ALL tickers (curated + dynamic) ──
+    today_str = datetime.now(ET).strftime("%Y-%m-%d")
+    has_earnings, earnings_date = check_earnings_proximity(symbol, today_str)
+    if has_earnings:
+        log.warning(
+            f"  {symbol}: earnings within 3 days ({earnings_date}) — "
+            f"skipping to avoid pre-earnings selloff risk"
+        )
+        return None
 
     fund = fetch_fundamental(symbol, ta)
     if not fund:
