@@ -518,6 +518,30 @@ def prune_peaks(active_symbols: list):
     if stale:
         save_peaks()
 
+# ── Time-based exit for dragging positions ─────────────────────
+MAX_HOLD_DAYS_LOSS = 3      # exit at breakeven if still losing after 3 days
+MAX_HOLD_DAYS_FLAT = 5      # exit if flat (+/-0.5%) after 5 days — redeploy capital
+DRAG_THRESHOLD     = -0.02  # -2% after 3 days = dragging, cut it
+
+# ── Sector concentration cap ───────────────────────────────────
+MAX_SECTOR_POSITIONS = 3
+SECTOR_MAP = {
+    "NVDA":"semis","AMD":"semis","AVGO":"semis","ASML":"semis","MU":"semis",
+    "TSM":"semis","QCOM":"semis","ARM":"semis","MRVL":"semis",
+    "AAPL":"tech","MSFT":"tech","GOOG":"tech","META":"tech",
+    "AMZN":"tech","TSLA":"tech","ORCL":"tech",
+    "PLTR":"software","PANW":"cyber","CRWD":"cyber","NET":"cyber",
+    "CRM":"software","SNOW":"software",
+    "JPM":"financials","V":"financials","MA":"financials",
+    "GS":"financials","BAC":"financials","BLK":"financials",
+    "LLY":"healthcare","UNH":"healthcare","ABBV":"healthcare",
+    "ISRG":"healthcare","NUVL":"healthcare",
+    "XOM":"energy","CVX":"energy","COP":"energy","SLB":"energy",
+    "GEV":"industrials","CAT":"industrials","RTX":"industrials","HON":"industrials",
+    "COST":"consumer","WMT":"consumer","MCD":"consumer","FDX":"consumer",
+    "DECK":"consumer","SPOT":"media","NFLX":"media","UBER":"consumer",
+}
+
 # ── Alpaca client ──────────────────────────────────────────────
 trade_client = TradingClient(
     api_key=ALPACA_KEY, secret_key=ALPACA_SECRET,
@@ -889,6 +913,24 @@ def close_position(symbol: str, pnl_pct: float = 0.0, exit_reason: str = "") -> 
 
 def place_buy(symbol: str, qty: int) -> bool:
     try:
+        # ── Layer 1: Duplicate position guard ─────────────────
+        # Prevents buying a ticker already held (NVDA ×3 bug Jun 23)
+        existing = get_positions()
+        if symbol in existing:
+            log.warning(f"[SKIP] {symbol} already held — duplicate position blocked")
+            return False
+
+        # ── Layer 2: Open orders guard ────────────────────────
+        # Prevents buying if a pending buy order already exists for same ticker
+        try:
+            open_orders = trade_client.get_orders()
+            for o in open_orders:
+                if o.symbol == symbol and o.side.value == "buy":
+                    log.warning(f"[SKIP] {symbol} has pending buy order — duplicate order blocked")
+                    return False
+        except Exception:
+            pass  # if check fails, proceed cautiously
+
         order = MarketOrderRequest(
             symbol=symbol, qty=qty,
             side=OrderSide.BUY, time_in_force=TimeInForce.GTC,
