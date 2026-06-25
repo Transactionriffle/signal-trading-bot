@@ -257,6 +257,17 @@ signal_cache_time:  float            = 0.0       # when cache was built
 signal_cache_date:  str              = ""        # date of last scan
 last_rescan_time:   float            = 0.0       # last emergency rescan
 
+# ── Re-entry cooldown tracking ─────────────────────────────────
+# Option 1: Post-profit cooldown — 4hr block after +5% exit
+# Option 3: Re-entry price gate — only re-enter if price pulled back 2%
+# Option 5: Stop loss cooldown — 24hr block after -5% stop exit
+reentry_cooldown:   dict[str, dict]  = {}
+# {symbol: {"type": "profit"|"stop", "time": timestamp, "exit_price": float}}
+
+PROFIT_COOLDOWN_SECS = 14400   # 4 hours after profit target exit
+STOP_COOLDOWN_SECS   = 86400   # 24 hours after stop loss exit
+PRICE_GATE_PCT       = 0.02    # must pull back 2% from exit price to re-enter
+
 # ── News WebSocket state ───────────────────────────────────────
 news_triggered:     dict[str, float] = {}        # {symbol: timestamp} — news-triggered tickers
 news_queue:         list             = []         # pending news signals to process
@@ -1023,6 +1034,84 @@ def get_positions() -> dict:
         log.error(f"Failed to get positions: {e}")
         return {}
 
+def register_reentry_cooldown(symbol: str, exit_reason: str, exit_price: float):
+    """
+    Registers a re-entry cooldown after a position closes.
+    Option 1: PROFIT_TARGET exit → 4hr cooldown
+    Option 5: STOP_LOSS exit    → 24hr cooldown
+    Option 3: Price gate stored for all exits (2% pullback required)
+    """
+    global reentry_cooldown
+    now = time.time()
+
+    if "PROFIT_TARGET" in exit_reason:
+        reentry_cooldown[symbol] = {
+            "type":       "profit",
+            "time":       now,
+            "exit_price": exit_price,
+            "expires":    now + PROFIT_COOLDOWN_SECS,
+        }
+        log.info(
+            f"  ⏳ {symbol}: profit cooldown active — "
+            f"no re-entry for 4hrs, price gate ${exit_price*(1-PRICE_GATE_PCT):.2f} "
+            f"(2% below exit ${exit_price:.2f})"
+        )
+    elif "STOP_LOSS" in exit_reason:
+        reentry_cooldown[symbol] = {
+            "type":       "stop",
+            "time":       now,
+            "exit_price": exit_price,
+            "expires":    now + STOP_COOLDOWN_SECS,
+        }
+        log.info(
+            f"  ⏳ {symbol}: stop loss cooldown active — "
+            f"no re-entry for 24hrs (thesis failed)"
+        )
+    else:
+        # Trailing/breakeven exits — only price gate applies, no time cooldown
+        reentry_cooldown[symbol] = {
+            "type":       "trailing",
+            "time":       now,
+            "exit_price": exit_price,
+            "expires":    0,  # no time cooldown
+        }
+
+def check_reentry_allowed(symbol: str, current_price: float) -> tuple[bool, str]:
+    """
+    Checks Options 1, 3, 5 before allowing re-entry.
+    Returns (allowed, reason_if_blocked).
+    """
+    if symbol not in reentry_cooldown:
+        return True, ""
+
+    cd      = reentry_cooldown[symbol]
+    now     = time.time()
+    cdtype  = cd["type"]
+    expires = cd["expires"]
+    exit_px = cd["exit_price"]
+
+    # Option 1 — profit cooldown (4hr)
+    if cdtype == "profit" and expires > 0 and now < expires:
+        remaining = (expires - now) / 3600
+        return False, f"profit cooldown ({remaining:.1f}hrs remaining after +5% exit)"
+
+    # Option 5 — stop loss cooldown (24hr)
+    if cdtype == "stop" and expires > 0 and now < expires:
+        remaining = (expires - now) / 3600
+        return False, f"stop loss cooldown ({remaining:.1f}hrs remaining — thesis failed)"
+
+    # Option 3 — price gate (all exits: must pull back 2% from exit price)
+    gate_price = exit_px * (1 - PRICE_GATE_PCT)
+    if current_price > gate_price:
+        return False, (
+            f"price gate: current ${current_price:.2f} > gate ${gate_price:.2f} "
+            f"(need 2% pullback from exit ${exit_px:.2f})"
+        )
+
+    # All checks passed — clear the cooldown
+    del reentry_cooldown[symbol]
+    return True, ""
+
 def close_position(symbol: str, pnl_pct: float = 0.0, exit_reason: str = "") -> bool:
     try:
         # Cancel open orders first
@@ -1034,9 +1123,20 @@ def close_position(symbol: str, pnl_pct: float = 0.0, exit_reason: str = "") -> 
                     time.sleep(0.5)
                 except Exception:
                     pass
+
+        # Get current price before closing for cooldown registration
+        try:
+            pos = trade_client.get_open_position(symbol)
+            current_price = float(pos.current_price)
+        except Exception:
+            current_price = 0.0
+
         trade_client.close_position(symbol)
         log.info(f"[SELL] Closed {symbol} — {exit_reason} ({pnl_pct*100:+.2f}%)")
         record_trade(symbol, pnl_pct, exit_reason)
+
+        # Register re-entry cooldown based on exit type
+        register_reentry_cooldown(symbol, exit_reason, current_price)
         return True
     except Exception as e:
         log.error(f"Failed to close {symbol}: {e}")
@@ -1254,7 +1354,7 @@ def deploy_from_cache(positions: dict, account):
         if price <= 0:
             continue
 
-        # ── Sector filter — block new buys in weak sectors ─────
+        # ── Sector filter — block new buys in weak sectors ────
         sector = SECTOR_MAP.get(symbol)
         if sector and sector in weak_sectors:
             log.info(
@@ -1263,14 +1363,27 @@ def deploy_from_cache(positions: dict, account):
             )
             continue
 
+        # ── Re-entry cooldown checks (Options 1, 3, 5) ────────
+        # Fetch current live price for Option 3 price gate
+        try:
+            snap  = trade_client.get_stock_latest_bar(symbol)
+            live_price = float(snap[symbol].c) if snap and symbol in snap else price
+        except Exception:
+            live_price = price
+
+        allowed, block_reason = check_reentry_allowed(symbol, live_price)
+        if not allowed:
+            log.info(f"  {symbol}: re-entry BLOCKED — {block_reason}")
+            continue
+
         alloc  = min(equity * KELLY_PCT, cash * 0.95)
-        qty    = int(alloc / price)
+        qty    = int(alloc / live_price)
         if qty < 1:
             continue
-        qty = adjust_qty_for_fear(qty, price, alloc)
-        log.info(f"  {symbol}: {qty} shares @ ~${price:.2f} = ${qty*price:,.0f} (10% Kelly)")
+        qty = adjust_qty_for_fear(qty, live_price, alloc)
+        log.info(f"  {symbol}: {qty} shares @ ~${live_price:.2f} = ${qty*live_price:,.0f} (10% Kelly)")
         place_buy(symbol, qty)
-        cash -= qty * price
+        cash -= qty * live_price
 
 # ══════════════════════════════════════════════════════════════
 # MAIN LOOP
@@ -1282,9 +1395,11 @@ def run():
 
     log.info("=" * 60)
     log.info("SIGNAL Trading Bot started")
-    log.info(f"  Universe:       35 curated + 15 dynamic = 50 max")
+    log.info(f"  Universe:       36 curated + 15 dynamic = 51 max")
     log.info(f"  Scan timing:    Pre-market (Sun 8pm / Mon-Fri 6am ET)")
     log.info(f"  Position size:  Kelly 10% per trade")
+    log.info(f"  Re-entry rules: +5% exit → 4hr cooldown + 2% price gate")
+    log.info(f"                  -5% stop → 24hr cooldown + 2% price gate")
     log.info(f"  Max positions:  10 concurrent")
     log.info(f"  Profit target:  +{PROFIT_TARGET*100:.0f}%")
     log.info(f"  Trailing:       peak >={PEAK_TRIGGER*100:.0f}% → sell at +{TRAIL_SELL*100:.0f}%")
