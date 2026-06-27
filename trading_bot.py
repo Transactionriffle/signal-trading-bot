@@ -467,7 +467,12 @@ def process_news_queue(positions: dict, account) -> bool:
                 f"composite={result['composite']:.2f}, confidence={result['confidence']}% "
                 f"— {result['thesis']}"
             )
-            # Insert at top of signal cache — highest priority
+            # Insert at top of signal cache — but check for existing entry first
+            already_cached = any(s["symbol"] == symbol for s in signal_cache)
+            if already_cached:
+                # Update existing entry with fresh score rather than duplicating
+                signal_cache[:] = [s for s in signal_cache if s["symbol"] != symbol]
+                log.info(f"📰 {symbol}: updated existing cache entry with fresh news score")
             signal_cache.insert(0, result)
             traded = True
         elif sentiment == "BULLISH" and result:
@@ -946,8 +951,13 @@ def run_premarket_scan():
 
     universe   = build_universe()
     candidates = []
+    seen_symbols = set()  # deduplicate — LLY can appear in both curated and dynamic
 
     for i, symbol in enumerate(universe):
+        if symbol in seen_symbols:
+            log.info(f"  {symbol}: already scanned — skipping duplicate")
+            continue
+        seen_symbols.add(symbol)
         result = compute_signal(symbol, spy_chg)
         if result and result["signal"] == "BUY" and result["confidence"] >= MIN_CONFIDENCE and result["composite"] >= 3.0:
             candidates.append(result)
@@ -1320,8 +1330,13 @@ def deploy_from_cache(positions: dict, account):
         log.warning("BEAR MODE — no new positions")
         return
 
-    # Use cached signals — no Claude calls
-    available = [s for s in signal_cache if s["symbol"] not in positions]
+    # Use cached signals — deduplicated by symbol, no Claude calls
+    seen = set()
+    available = []
+    for s in signal_cache:
+        if s["symbol"] not in positions and s["symbol"] not in seen:
+            seen.add(s["symbol"])
+            available.append(s)
 
     if not available:
         # Cache exhausted — emergency rescan max once per hour
