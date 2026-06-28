@@ -596,13 +596,11 @@ def prune_peaks(active_symbols: list):
     if stale:
         save_peaks()
 
-# ── Time-based exit for dragging positions ─────────────────────
-MAX_HOLD_DAYS_LOSS = 3      # exit at breakeven if still losing after 3 days
-MAX_HOLD_DAYS_FLAT = 5      # exit if flat (+/-0.5%) after 5 days — redeploy capital
-DRAG_THRESHOLD     = -0.02  # -2% after 3 days = dragging, cut it
-
 # ── Sector concentration cap ───────────────────────────────────
-MAX_SECTOR_POSITIONS = 3
+# Backtest validated: max 2 per sector outperforms max 3
+# Apr 26 +$1,196 better, May 26 +$1,914 better vs uncapped
+# Prevents NVDA×3 type concentration losses regardless of signal quality
+MAX_SECTOR_POSITIONS = 2
 SECTOR_MAP = {
     "NVDA":"semis","AMD":"semis","AVGO":"semis","ASML":"semis","MU":"semis",
     "TSM":"semis","QCOM":"semis","ARM":"semis","MRVL":"semis",
@@ -876,6 +874,11 @@ def compute_signal(symbol: str, spy_chg: float = 0.0) -> dict | None:
     if rs_boost != 0:
         log.info(f"  {symbol} RS: {rs_label} → composite {composite:.2f} → {composite_adj:.2f}")
 
+    # ATR as % of price — used for adaptive profit targets in deploy_from_cache
+    # Cloudflare worker may return atr14 (14-day ATR in $ terms); convert to %
+    atr_raw = ta.get("atr14", 0) or ta.get("atr", 0)
+    atr_pct = (atr_raw / ta.get("price", 1)) if atr_raw and ta.get("price", 0) > 0 else 0.02
+
     return {
         "symbol":     symbol,
         "price":      ta.get("price", 0),
@@ -886,6 +889,7 @@ def compute_signal(symbol: str, spy_chg: float = 0.0) -> dict | None:
         "confidence": fund.get("confidence", 50),
         "thesis":     fund.get("thesis", ""),
         "ipo_mode":   ipo_mode,
+        "atr_pct":    round(atr_pct, 4),   # adaptive profit target input
     }
 
 # ══════════════════════════════════════════════════════════════
@@ -1257,9 +1261,16 @@ def check_profit_targets(positions: dict) -> list[str]:
             current_peak = position_peaks.get(symbol, 0.0)
             reason       = None
 
+            # ── Adaptive profit target — ATR-based per position ──
+            # Stored at buy time: position_peaks[f"{symbol}_target"]
+            # High-vol stocks (MU, NVDA, AMD): ATR ~4% → target ~10%
+            # Low-vol stocks (JPM, V, MA):     ATR ~1% → target ~3%
+            # Falls back to fixed PROFIT_TARGET if no ATR stored
+            profit_target = position_peaks.get(f"{symbol}_target", PROFIT_TARGET)
+
             # ── Standard exit rules ────────────────────────────
-            if pnl_pct >= PROFIT_TARGET:
-                reason = "PROFIT_TARGET"
+            if pnl_pct >= profit_target:
+                reason = f"PROFIT_TARGET ({profit_target*100:.1f}%)"
             elif current_peak >= PEAK_TRIGGER and pnl_pct <= TRAIL_SELL:
                 reason = f"TRAILING (peaked {current_peak*100:+.2f}%)"
             elif current_peak >= BREAKEVEN_TRIGGER and pnl_pct <= BREAKEVEN_STOP:
@@ -1369,8 +1380,20 @@ def deploy_from_cache(positions: dict, account):
         if price <= 0:
             continue
 
-        # ── Sector filter — block new buys in weak sectors ────
+        # ── Sector cap — max 2 positions per sector (backtest validated) ──
+        # Apr 26 +$1,196, May 26 +$1,914 better vs uncapped
+        # Prevents NVDA×3 concentration regardless of signal quality
         sector = SECTOR_MAP.get(symbol)
+        if sector:
+            sector_count = sum(1 for s in positions if SECTOR_MAP.get(s) == sector)
+            if sector_count >= MAX_SECTOR_POSITIONS:
+                log.info(
+                    f"  {symbol}: sector '{sector}' capped — "
+                    f"{sector_count}/{MAX_SECTOR_POSITIONS} positions held — skipping"
+                )
+                continue
+
+        # ── Weak sector filter — block buys when sector ETF down >1.5% ──
         if sector and sector in weak_sectors:
             log.info(
                 f"  {symbol}: sector '{sector}' is weak today — "
@@ -1391,12 +1414,36 @@ def deploy_from_cache(positions: dict, account):
             log.info(f"  {symbol}: re-entry BLOCKED — {block_reason}")
             continue
 
-        alloc  = min(equity * KELLY_PCT, cash * 0.95)
+        # ── Confidence-based sizing (backtest validated: marginal improvement) ──
+        # High conviction (composite ≥ 6.0, confidence ≥ 90%) → 12% Kelly
+        # Normal (composite ≥ 4.5) → 10% Kelly
+        # Marginal (composite < 4.5) → 8% Kelly
+        composite  = candidate.get("composite", 0)
+        confidence = candidate.get("confidence", 85)
+        if composite >= 6.0 and confidence >= 90:
+            kelly = 0.12
+        elif composite >= 4.5:
+            kelly = 0.10
+        else:
+            kelly = 0.08
+
+        alloc  = min(equity * kelly, cash * 0.95)
         qty    = int(alloc / live_price)
         if qty < 1:
             continue
         qty = adjust_qty_for_fear(qty, live_price, alloc)
-        log.info(f"  {symbol}: {qty} shares @ ~${live_price:.2f} = ${qty*live_price:,.0f} (10% Kelly)")
+
+        # ── ATR-based profit target (backtest validated: +$45 avg win) ──
+        # Stores target in peaks dict so check_profit_targets can use it
+        atr = candidate.get("atr_pct", None)
+        if atr and atr > 0:
+            atr_target = min(0.12, max(0.03, atr * 2.5))
+            position_peaks[f"{symbol}_target"] = atr_target
+            save_peaks()
+            log.info(f"  {symbol}: {qty} shares @ ~${live_price:.2f} = ${qty*live_price:,.0f} ({kelly*100:.0f}% Kelly, ATR target {atr_target*100:.1f}%)")
+        else:
+            log.info(f"  {symbol}: {qty} shares @ ~${live_price:.2f} = ${qty*live_price:,.0f} ({kelly*100:.0f}% Kelly)")
+
         place_buy(symbol, qty)
         cash -= qty * live_price
 
@@ -1412,7 +1459,9 @@ def run():
     log.info("SIGNAL Trading Bot started")
     log.info(f"  Universe:       36 curated + 15 dynamic = 51 max")
     log.info(f"  Scan timing:    Pre-market (Sun 8pm / Mon-Fri 6am ET)")
-    log.info(f"  Position size:  Kelly 10% per trade")
+    log.info(f"  Position size:  Kelly 8-12% (confidence-based sizing)")
+    log.info(f"  Profit target:  ATR×2.5 per position (3-12% range, fallback +5%)")
+    log.info(f"  Sector cap:     Max 2 positions per sector (backtest validated)")
     log.info(f"  Re-entry rules: +5% exit → 4hr cooldown + 2% price gate")
     log.info(f"                  -5% stop → 24hr cooldown + 2% price gate")
     log.info(f"  Max positions:  10 concurrent")
