@@ -819,7 +819,7 @@ def check_earnings_proximity(symbol: str, today: str) -> tuple[bool, str]:
         log.warning(f"Earnings check failed for {symbol}: {e}")
         return False, ""
 
-def compute_signal(symbol: str, spy_chg: float = 0.0) -> dict | None:
+def compute_signal(symbol: str, spy_chg: float = 0.0, prefetched_ta: dict | None = None) -> dict | None:
     # Skip known ETFs
     if symbol in ETF_EXCLUSIONS:
         return None
@@ -829,7 +829,8 @@ def compute_signal(symbol: str, spy_chg: float = 0.0) -> dict | None:
         ETF_EXCLUSIONS.add(symbol)  # add to exclusion list for this session
         return None
 
-    ta = fetch_technicals(symbol)
+    # Use prefetched TA if provided (avoids double-fetching during pre-market scan)
+    ta = prefetched_ta if prefetched_ta is not None else fetch_technicals(symbol)
 
     ipo_mode = False
     if not ta:
@@ -1093,7 +1094,21 @@ def run_premarket_scan():
             log.info(f"  {symbol}: already scanned — skipping duplicate")
             continue
         seen_symbols.add(symbol)
-        result = compute_signal(symbol, spy_chg)
+
+        # ── TA pre-filter — skip Claude if TA is clearly bearish ──
+        # Saves ~12 minutes by avoiding Claude calls on obvious non-signals
+        # Fetch technicals first (fast — Cloudflare Worker, <1s)
+        ta = fetch_technicals(symbol)
+        if ta:
+            ta_score = ta.get("taScore", 0)
+            # Skip Claude if TA score is weak (below all MAs, bearish MACD)
+            # Threshold 1.5 means: some positive technical signal required
+            # At 82% live win rate this filter should be additive not subtractive
+            if ta_score < 1.5:
+                log.info(f"  {symbol}: taScore={ta_score:.1f} — TA too weak, skipping Claude")
+                continue  # no sleep needed — skipping Claude call
+
+        result = compute_signal(symbol, spy_chg, prefetched_ta=ta)
         if result:
             all_scored.append(result)
             if result["signal"] == "BUY" and result["confidence"] >= MIN_CONFIDENCE and result["composite"] >= 3.0:
@@ -1103,7 +1118,7 @@ def run_premarket_scan():
                     f"  ✅ {symbol}: composite={result['composite']:.2f}, "
                     f"confidence={result['confidence']}%{ipo_tag} — {result['thesis']}"
                 )
-        time.sleep(20)  # ~3 calls/min, well under rate limit
+        time.sleep(3)   # Tier 1 = 50 RPM (1 req/1.2s min). sleep(3) = 4x safety margin. Was 20s.
 
     # ── Sector diversity enforcement ──────────────────────────
     # If cache is all-tech, force add the best non-tech signal
@@ -1147,11 +1162,17 @@ def should_run_premarket_scan() -> bool:
 
     Scan windows:
     - Sunday 8pm-10pm ET  → Monday preparation
-    - Mon-Fri 6am-9:29am ET → morning preparation
+    - Mon-Fri: dynamic start = 9:30am minus scan duration minus buffer
+      Scan duration estimate: ~8 min (TA pre-filter + sleep 3s on 55 tickers)
+      Buffer: 10 min safety margin
+      → Scan starts at ~9:12am ET, finishes just before market open
+
+    This ensures signals are as fresh as possible at 9:30am open.
+    Old approach (6am scan) left cache stale for 3+ hours.
 
     NEVER scans:
     - During market hours (9:30am-4pm ET) — cache only
-    - After 4pm ET — wait for 6am next morning
+    - After 4pm ET — wait for next morning
     - Weekends outside Sunday 8-10pm
     - On bot restart mid-session (even with empty cache)
     """
@@ -1161,28 +1182,41 @@ def should_run_premarket_scan() -> bool:
     minute = now_et.minute
     day    = now_et.weekday()  # 0=Mon, 6=Sun
 
-    # ── Step 1: Time gate — must be in allowed window ──────────
+    # ── Scan duration config ───────────────────────────────────
+    ESTIMATED_SCAN_MINUTES = 8    # with TA pre-filter + sleep(3s) on ~55 tickers
+    BUFFER_MINUTES         = 10   # safety margin before open
+    TOTAL_LEAD_MINUTES     = ESTIMATED_SCAN_MINUTES + BUFFER_MINUTES  # 18 min
+
+    # Market open = 9:30am ET
+    # Scan should start at: 9:30 - 18 min = 9:12am ET
+    market_open_minutes   = 9 * 60 + 30          # 570
+    scan_start_minutes    = market_open_minutes - TOTAL_LEAD_MINUTES  # 552 = 9:12am
+    now_minutes           = hour * 60 + minute
+
+    # ── Step 1: Time gate ──────────────────────────────────────
     in_window = False
 
-    # Sunday 8pm-10pm ET
+    # Sunday 8pm-10pm ET — prepare for Monday
     if day == 6 and 20 <= hour < 22:
         in_window = True
 
-    # Weekday 6am-9:29am ET only
-    elif 0 <= day <= 4 and 6 <= hour <= 9:
-        market_open = hour == 9 and minute >= 30
-        if not market_open:
+    # Weekday: dynamic window from scan_start_minutes to 9:29am
+    elif 0 <= day <= 4:
+        market_open = (hour == 9 and minute >= 30) or hour >= 10
+        if not market_open and now_minutes >= scan_start_minutes:
             in_window = True
 
-    # Not in any allowed window — never scan
     if not in_window:
         return False
 
-    # ── Step 2: Already scanned today — don't repeat ───────────
+    # ── Step 2: Already scanned today — don't repeat ──────────
     if signal_cache_date == today and signal_cache:
         return False
 
     # In window + cache stale → scan
+    scan_start_str = f"{scan_start_minutes // 60}:{scan_start_minutes % 60:02d}am ET"
+    log.info(f"Pre-market scan window active (start={scan_start_str}, "
+             f"est. duration={ESTIMATED_SCAN_MINUTES}min, buffer={BUFFER_MINUTES}min)")
     return True
 
 # ══════════════════════════════════════════════════════════════
