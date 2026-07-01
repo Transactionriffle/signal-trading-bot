@@ -160,7 +160,11 @@ CURATED_TICKERS = [
     # NFLX removed — Jun 15 trade hit -4%, weak signal (composite 2.50, min threshold)
     "NUVL",   # $10B  — acquisition target, biotech catalyst
     "DECK",   # $22B  — UGG/HOKA, consistent earnings beats (mid-cap)
-]  # 36 tickers
+    "IOT",    # $19B  — Samsara, Connected Operations platform, 30% ARR growth,
+              #          3rd consecutive GAAP profitable quarter, composite 7.90 Jul 1
+              #          Physical switching costs + AI monetisation upside
+              #          Next earnings: Sep 3, 2026
+]  # 37 tickers
 
 # Sector breakdown:
 # Semis: 5 (14%) | Tech: 4 (11%) | Financials: 5 (14%)
@@ -188,6 +192,7 @@ SECTOR_MAP: dict[str, str] = {
     "XOM":"energy","CVX":"energy","COP":"energy","SLB":"energy",
     # Industrials
     "GEV":"industrials","CAT":"industrials","RTX":"industrials","HON":"industrials",
+    "IOT":"industrials",  # Samsara — Connected Operations, fleet/physical asset management
     # Consumer / Distribution
     "COST":"consumer","WMT":"consumer","MCD":"consumer","FDX":"consumer",
     # Mid-cap
@@ -897,13 +902,31 @@ def compute_signal(symbol: str, spy_chg: float = 0.0) -> dict | None:
 # ══════════════════════════════════════════════════════════════
 
 def build_universe() -> list[str]:
-    """35 curated + up to 15 dynamic gainers = max 50 tickers."""
+    """
+    Curated tickers + dynamic universe from 3 sources:
+
+    Source 1 — Top gainers (movers): catches post-earnings spikes,
+               news catalysts. Already used. Filtered to price ≥ $15
+               and min gain ≥ 3% to exclude penny stock noise.
+
+    Source 2 — Most active by TRADE COUNT (not volume): trade count
+               is a better proxy for institutional interest than raw
+               volume. High trade count = many separate orders =
+               institutional accumulation. Filters out leveraged ETFs
+               and penny stocks. This is where IOT-type stocks appear.
+
+    Source 3 — 5-day momentum scan: stocks up 5-15% over 5 days
+               with consistent daily gains. Captures steady institutional
+               buying like IOT's post-earnings drift. Uses curated-adjacent
+               tickers from a broader watchlist of $5B+ market cap stocks.
+    """
     symbols = set(CURATED_TICKERS)
+    added   = 0
+    headers = {"APCA-API-KEY-ID": ALPACA_KEY, "APCA-API-SECRET-KEY": ALPACA_SECRET}
+    DATA_URL = "https://data.alpaca.markets/v1beta1"
 
+    # ── Source 1: Top gainers (movers) ─────────────────────────
     try:
-        DATA_URL = "https://data.alpaca.markets/v1beta1"
-        headers  = {"APCA-API-KEY-ID": ALPACA_KEY, "APCA-API-SECRET-KEY": ALPACA_SECRET}
-
         r = requests.get(
             f"{DATA_URL}/screener/stocks/movers",
             headers=headers,
@@ -912,23 +935,130 @@ def build_universe() -> list[str]:
         )
         if r.ok:
             gainers = r.json().get("gainers", [])
-            added   = 0
             for g in gainers:
                 sym = g.get("symbol", "")
+                pct = g.get("percent_change", 0)
+                px  = g.get("price", 0)
                 if (sym.isalpha() and len(sym) <= 5
                         and sym not in ETF_EXCLUSIONS
                         and sym not in symbols
-                        and g.get("price", 0) >= 15
-                        and added < 15):
+                        and px >= 15           # no penny stocks
+                        and pct >= 3.0         # min 3% gain — filters penny stock noise
+                        and added < 8):
                     symbols.add(sym)
                     added += 1
-            log.info(f"Dynamic gainers added: {added}")
+            log.info(f"  Source 1 (movers): {added} tickers added")
     except Exception as e:
         log.warning(f"Movers fetch failed: {e}")
 
+    # ── Source 2: Most active by TRADE COUNT ───────────────────
+    # Trade count = institutional interest proxy (many orders = algos/funds)
+    # Much better than volume for quality screening
+    s2_added = 0
+    try:
+        r = requests.get(
+            f"{DATA_URL}/screener/stocks/most-actives",
+            headers=headers,
+            params={"by": "trades", "top": 50},
+            timeout=10
+        )
+        if r.ok:
+            actives = r.json().get("most_actives", [])
+            for a in actives:
+                sym   = a.get("symbol", "")
+                count = a.get("trade_count", 0)
+                if (sym.isalpha() and len(sym) <= 5
+                        and sym not in ETF_EXCLUSIONS
+                        and sym not in symbols
+                        and count >= 50000     # min 50k trades = real institutional interest
+                        and s2_added < 8):
+                    # Quick price check — skip penny stocks
+                    try:
+                        snap = requests.get(
+                            f"{DATA_URL}/stocks/{sym}/snapshot",
+                            headers=headers, timeout=5
+                        )
+                        if snap.ok:
+                            px = snap.json().get("latestTrade", {}).get("p", 0)
+                            if px >= 15:
+                                symbols.add(sym)
+                                s2_added += 1
+                    except Exception:
+                        pass
+            log.info(f"  Source 2 (trade-count): {s2_added} tickers added")
+    except Exception as e:
+        log.warning(f"Most-actives fetch failed: {e}")
+
+    # ── Source 3: 5-day momentum — quality mid-cap watchlist ───
+    # These are $5B-$50B companies in growth sectors that don't
+    # always make the top movers but have steady institutional buying.
+    # IOT, SNOW, NET, DDOG, SHOP, ZS, PANW, HUBS, MSTR, ARM etc.
+    # Claude scores these well when they're moving — they just need
+    # to enter the universe first.
+    MOMENTUM_WATCHLIST = [
+        # Enterprise SaaS / Cybersecurity
+        "IOT","SNOW","NET","DDOG","ZS","PANW","HUBS","GTLB","BILL","MDB",
+        # Fintech
+        "SQ","AFRM","COIN","HOOD",
+        # Semiconductors (mid-cap)
+        "ARM","MRVL","QCOM","ON","SMCI",
+        # Healthcare / Biotech
+        "MRNA","BNTX","INCY","ACAD","RARE",
+        # Energy (mid-cap)
+        "DVN","HAL","MPC","VLO",
+        # Consumer / Retail
+        "SHOP","ABNB","UBER","LYFT","DASH",
+        # Industrials / Defence
+        "HEI","AXON","TDG","LDOS",
+    ]
+    s3_added = 0
+    try:
+        # Fetch 5-day bars for watchlist in one call
+        watch_syms = [s for s in MOMENTUM_WATCHLIST if s not in symbols and s not in ETF_EXCLUSIONS]
+        if watch_syms:
+            r = requests.get(
+                f"{DATA_URL}/stocks/bars",
+                headers=headers,
+                params={
+                    "symbols": ",".join(watch_syms[:40]),
+                    "timeframe": "1Day",
+                    "limit": 5 * len(watch_syms[:40]),
+                    "start": (datetime.now(ET) - timedelta(days=8)).strftime("%Y-%m-%d"),
+                },
+                timeout=15
+            )
+            if r.ok:
+                bars = r.json().get("bars", {})
+                for sym, sym_bars in bars.items():
+                    if len(sym_bars) < 3:
+                        continue
+                    # 5-day return
+                    first_close = sym_bars[0].get("c", 0)
+                    last_close  = sym_bars[-1].get("c", 0)
+                    if first_close <= 0 or last_close < 10:
+                        continue
+                    ret_5d = (last_close - first_close) / first_close
+                    # Volume check — above-average volume in last 2 days
+                    recent_vols = [b.get("v", 0) for b in sym_bars[-2:]]
+                    avg_vol     = sum(b.get("v", 0) for b in sym_bars) / len(sym_bars)
+                    vol_surge   = avg_vol > 0 and (sum(recent_vols)/len(recent_vols)) > avg_vol * 0.8
+                    # Add if up 3%+ over 5 days with decent volume
+                    if ret_5d >= 0.03 and vol_surge and sym not in symbols and s3_added < 8:
+                        symbols.add(sym)
+                        s3_added += 1
+                        log.info(f"  Source 3 (momentum): {sym} +{ret_5d*100:.1f}% 5d → added")
+        log.info(f"  Source 3 (5-day momentum): {s3_added} tickers added")
+    except Exception as e:
+        log.warning(f"Momentum scan failed: {e}")
+
+    total_dynamic = len(symbols) - len(CURATED_TICKERS)
     clean = [s for s in symbols if s.isalpha() and len(s) <= 5 and s not in ETF_EXCLUSIONS]
-    log.info(f"Universe: {len(clean)} tickers ({len(CURATED_TICKERS)} curated + {len(clean)-len(CURATED_TICKERS)} dynamic)")
-    return clean[:50]
+    log.info(
+        f"Universe: {len(clean)} tickers "
+        f"({len(CURATED_TICKERS)} curated + {total_dynamic} dynamic "
+        f"[{added} movers, {s2_added} trade-active, {s3_added} momentum])"
+    )
+    return clean[:55]  # max 55 — allow headroom for all 3 sources
 
 def run_premarket_scan():
     """
@@ -956,6 +1086,7 @@ def run_premarket_scan():
     universe   = build_universe()
     candidates = []
     seen_symbols = set()  # deduplicate — LLY can appear in both curated and dynamic
+    all_scored   = []     # track all scored results for diversity fallback
 
     for i, symbol in enumerate(universe):
         if symbol in seen_symbols:
@@ -963,14 +1094,40 @@ def run_premarket_scan():
             continue
         seen_symbols.add(symbol)
         result = compute_signal(symbol, spy_chg)
-        if result and result["signal"] == "BUY" and result["confidence"] >= MIN_CONFIDENCE and result["composite"] >= 3.0:
-            candidates.append(result)
-            ipo_tag = " [IPO]" if result.get("ipo_mode") else ""
-            log.info(
-                f"  ✅ {symbol}: composite={result['composite']:.2f}, "
-                f"confidence={result['confidence']}%{ipo_tag} — {result['thesis']}"
-            )
+        if result:
+            all_scored.append(result)
+            if result["signal"] == "BUY" and result["confidence"] >= MIN_CONFIDENCE and result["composite"] >= 3.0:
+                candidates.append(result)
+                ipo_tag = " [IPO]" if result.get("ipo_mode") else ""
+                log.info(
+                    f"  ✅ {symbol}: composite={result['composite']:.2f}, "
+                    f"confidence={result['confidence']}%{ipo_tag} — {result['thesis']}"
+                )
         time.sleep(20)  # ~3 calls/min, well under rate limit
+
+    # ── Sector diversity enforcement ──────────────────────────
+    # If cache is all-tech, force add the best non-tech signal
+    # even if it's below threshold — prevents $85k idle cash on tech weakness days
+    DIVERSITY_SECTORS = ["financials", "healthcare", "energy", "industrials", "consumer"]
+    cached_sectors = {SECTOR_MAP.get(c["symbol"]) for c in candidates}
+
+    for sector in DIVERSITY_SECTORS:
+        if sector not in cached_sectors:
+            # Find best scoring signal in this sector from all_scored
+            sector_best = sorted(
+                [r for r in all_scored if SECTOR_MAP.get(r["symbol"]) == sector
+                 and r["signal"] != "SELL"],
+                key=lambda x: x["composite"], reverse=True
+            )
+            if sector_best:
+                best = sector_best[0]
+                # Only add if composite >= 1.5 (some positive signal, not just random)
+                if best["composite"] >= 1.5:
+                    candidates.append(best)
+                    log.info(
+                        f"  📊 DIVERSITY {best['symbol']} ({sector}): "
+                        f"composite={best['composite']:.2f} — added for sector diversity"
+                    )
 
     candidates.sort(key=lambda x: x["confidence"], reverse=True)
     signal_cache      = candidates
@@ -1094,6 +1251,10 @@ def check_reentry_allowed(symbol: str, current_price: float) -> tuple[bool, str]
     """
     Checks Options 1, 3, 5 before allowing re-entry.
     Returns (allowed, reason_if_blocked).
+
+    Price gate expiry: 2 trading days (48 hours).
+    Prevents stale cooldowns from permanently blocking stocks
+    that have genuinely moved on (e.g. AMD $526 → $581 weeks later).
     """
     if symbol not in reentry_cooldown:
         return True, ""
@@ -1114,13 +1275,21 @@ def check_reentry_allowed(symbol: str, current_price: float) -> tuple[bool, str]
         remaining = (expires - now) / 3600
         return False, f"stop loss cooldown ({remaining:.1f}hrs remaining — thesis failed)"
 
-    # Option 3 — price gate (all exits: must pull back 2% from exit price)
-    gate_price = exit_px * (1 - PRICE_GATE_PCT)
-    if current_price > gate_price:
-        return False, (
-            f"price gate: current ${current_price:.2f} > gate ${gate_price:.2f} "
-            f"(need 2% pullback from exit ${exit_px:.2f})"
-        )
+    # Option 3 — price gate (2% pullback required)
+    # Expires after 48 hours — prevents stale gates blocking re-entry indefinitely
+    PRICE_GATE_EXPIRY_SECS = 48 * 3600
+    gate_set_time = cd.get("time", 0)
+    gate_expired  = (now - gate_set_time) > PRICE_GATE_EXPIRY_SECS
+
+    if not gate_expired:
+        gate_price = exit_px * (1 - PRICE_GATE_PCT)
+        if current_price > gate_price:
+            hours_remaining = max(0, PRICE_GATE_EXPIRY_SECS - (now - gate_set_time)) / 3600
+            return False, (
+                f"price gate: current ${current_price:.2f} > gate ${gate_price:.2f} "
+                f"(need 2% pullback from exit ${exit_px:.2f}, "
+                f"or gate expires in {hours_remaining:.1f}hrs)"
+            )
 
     # All checks passed — clear the cooldown
     del reentry_cooldown[symbol]
