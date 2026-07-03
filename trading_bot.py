@@ -1183,14 +1183,14 @@ def should_run_premarket_scan() -> bool:
     day    = now_et.weekday()  # 0=Mon, 6=Sun
 
     # ── Scan duration config ───────────────────────────────────
-    ESTIMATED_SCAN_MINUTES = 8    # with TA pre-filter + sleep(3s) on ~55 tickers
-    BUFFER_MINUTES         = 10   # safety margin before open
-    TOTAL_LEAD_MINUTES     = ESTIMATED_SCAN_MINUTES + BUFFER_MINUTES  # 18 min
+    ESTIMATED_SCAN_MINUTES = 4    # measured Jul 2 — TA pre-filter + sleep(3s) = ~4min actual
+    BUFFER_MINUTES         = 6    # safety margin before open
+    TOTAL_LEAD_MINUTES     = ESTIMATED_SCAN_MINUTES + BUFFER_MINUTES  # 10 min
 
     # Market open = 9:30am ET
-    # Scan should start at: 9:30 - 18 min = 9:12am ET
+    # Scan should start at: 9:30 - 10 min = 9:20am ET
     market_open_minutes   = 9 * 60 + 30          # 570
-    scan_start_minutes    = market_open_minutes - TOTAL_LEAD_MINUTES  # 552 = 9:12am
+    scan_start_minutes    = market_open_minutes - TOTAL_LEAD_MINUTES  # 560 = 9:20am
     now_minutes           = hour * 60 + minute
 
     # ── Step 1: Time gate ──────────────────────────────────────
