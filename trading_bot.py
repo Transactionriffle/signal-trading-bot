@@ -1570,7 +1570,7 @@ def deploy_from_cache(positions: dict, account):
     KELLY_PCT   = 0.10
     MAX_POS     = 10
     equity      = float(account.equity)
-    cash        = float(account.cash)
+    cash        = float(account.effective_buying_power or account.cash)  # new intraday margin framework
     open_slots  = MAX_POS - len(positions)
 
     if open_slots <= 0:
@@ -1794,7 +1794,7 @@ def run():
 
             # Deploy from cache (no Claude calls during market hours)
             open_slots = 10 - len(positions)
-            if open_slots > 0 and float(account.cash) >= equity * 0.10:
+            if open_slots > 0 and float(account.effective_buying_power or account.cash) >= equity * 0.10:
                 if not signal_cache:
                     log.info(
                         f"  {open_slots} slot(s) available but signal cache is empty — "
