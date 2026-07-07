@@ -261,6 +261,7 @@ signal_cache:       list             = []        # ranked BUY signals from pre-m
 signal_cache_time:  float            = 0.0       # when cache was built
 signal_cache_date:  str              = ""        # date of last scan
 last_rescan_time:   float            = 0.0       # last emergency rescan
+closed_this_session: set             = set()     # symbols closed THIS 60s cycle — blocks immediate re-buy
 
 # ── Re-entry cooldown tracking ─────────────────────────────────
 # Option 1: Post-profit cooldown — 4hr block after +5% exit
@@ -1242,12 +1243,26 @@ def get_positions() -> dict:
 def register_reentry_cooldown(symbol: str, exit_reason: str, exit_price: float):
     """
     Registers a re-entry cooldown after a position closes.
-    Option 1: PROFIT_TARGET exit → 4hr cooldown
-    Option 5: STOP_LOSS exit    → 24hr cooldown
-    Option 3: Price gate stored for all exits (2% pullback required)
+
+    PROFIT_TARGET  → 4hr cooldown + 2% price gate
+    STOP_LOSS      → 24hr cooldown + 2% price gate
+    WEAK_SECTOR    → 2hr cooldown + 2% price gate (sector still weak — don't re-enter)
+    TRAILING       → 2% price gate only (no time cooldown — partial win)
+    BREAKEVEN_STOP → 1hr cooldown + 2% price gate (momentum stalled)
+    DRAG           → 1hr cooldown (flat position freed up)
+
+    CRITICAL: All exits also add to closed_this_session set.
+    Bot will NOT re-buy any symbol closed in the current 60s cycle.
     """
-    global reentry_cooldown
+    global reentry_cooldown, closed_this_session
     now = time.time()
+
+    # Always add to closed_this_session — prevents same-cycle re-entry
+    closed_this_session.add(symbol)
+
+    # Also remove from signal cache immediately — don't redeploy a just-closed position
+    global signal_cache
+    signal_cache = [s for s in signal_cache if s["symbol"] != symbol]
 
     if "PROFIT_TARGET" in exit_reason:
         reentry_cooldown[symbol] = {
@@ -1257,9 +1272,8 @@ def register_reentry_cooldown(symbol: str, exit_reason: str, exit_price: float):
             "expires":    now + PROFIT_COOLDOWN_SECS,
         }
         log.info(
-            f"  ⏳ {symbol}: profit cooldown active — "
-            f"no re-entry for 4hrs, price gate ${exit_price*(1-PRICE_GATE_PCT):.2f} "
-            f"(2% below exit ${exit_price:.2f})"
+            f"  ⏳ {symbol}: profit cooldown — "
+            f"4hr block + price gate ${exit_price*(1-PRICE_GATE_PCT):.2f}"
         )
     elif "STOP_LOSS" in exit_reason:
         reentry_cooldown[symbol] = {
@@ -1269,16 +1283,35 @@ def register_reentry_cooldown(symbol: str, exit_reason: str, exit_price: float):
             "expires":    now + STOP_COOLDOWN_SECS,
         }
         log.info(
-            f"  ⏳ {symbol}: stop loss cooldown active — "
-            f"no re-entry for 24hrs (thesis failed)"
+            f"  ⏳ {symbol}: stop loss cooldown — 24hr block (thesis failed)"
+        )
+    elif "WEAK_SECTOR" in exit_reason:
+        reentry_cooldown[symbol] = {
+            "type":       "weak_sector",
+            "time":       now,
+            "exit_price": exit_price,
+            "expires":    now + 7200,  # 2hr — sector may recover by then
+        }
+        log.info(
+            f"  ⏳ {symbol}: weak sector cooldown — 2hr block + price gate"
+        )
+    elif "BREAKEVEN" in exit_reason or "DRAG" in exit_reason:
+        reentry_cooldown[symbol] = {
+            "type":       "breakeven",
+            "time":       now,
+            "exit_price": exit_price,
+            "expires":    now + 3600,  # 1hr — momentum stalled
+        }
+        log.info(
+            f"  ⏳ {symbol}: breakeven cooldown — 1hr block + price gate"
         )
     else:
-        # Trailing/breakeven exits — only price gate applies, no time cooldown
+        # Trailing exits — price gate only, no time cooldown
         reentry_cooldown[symbol] = {
             "type":       "trailing",
             "time":       now,
             "exit_price": exit_price,
-            "expires":    0,  # no time cooldown
+            "expires":    0,
         }
 
 def check_reentry_allowed(symbol: str, current_price: float) -> tuple[bool, str]:
@@ -1352,6 +1385,12 @@ def close_position(symbol: str, pnl_pct: float = 0.0, exit_reason: str = "") -> 
         log.info(f"[SELL] Closed {symbol} — {exit_reason} ({pnl_pct*100:+.2f}%)")
         record_trade(symbol, pnl_pct, exit_reason)
 
+        # ── Settlement guard ─────────────────────────────────────
+        # Wait 2 seconds after close before allowing re-buy of same symbol.
+        # Prevents race condition where bot re-buys before close settles,
+        # causing Alpaca to execute as a short sell instead of long.
+        time.sleep(2)
+
         # Register re-entry cooldown based on exit type
         register_reentry_cooldown(symbol, exit_reason, current_price)
         return True
@@ -1381,7 +1420,9 @@ def place_buy(symbol: str, qty: int) -> bool:
 
         order = MarketOrderRequest(
             symbol=symbol, qty=qty,
-            side=OrderSide.BUY, time_in_force=TimeInForce.GTC,
+            side=OrderSide.BUY,
+            time_in_force=TimeInForce.DAY,
+            position_intent="buy_to_open",   # explicitly prevents short sell execution
         )
         trade_client.submit_order(order)
         today_key = datetime.now(ET).strftime("%Y-%m-%d")
@@ -1548,9 +1589,12 @@ def deploy_from_cache(positions: dict, account):
     seen = set()
     available = []
     for s in signal_cache:
-        if s["symbol"] not in positions and s["symbol"] not in seen:
-            seen.add(s["symbol"])
+        sym = s["symbol"]
+        if sym not in positions and sym not in seen and sym not in closed_this_session:
+            seen.add(sym)
             available.append(s)
+        elif sym in closed_this_session:
+            log.info(f"  {sym}: closed this cycle — skipping redeploy (re-entry loop prevention)")
 
     if not available:
         # Cache exhausted — emergency rescan max once per hour
@@ -1726,6 +1770,9 @@ def run():
             # Assess market state every cycle
             assess_market_state()
 
+            # ── Clear per-cycle state ──────────────────────────
+            closed_this_session.clear()  # reset every 60s cycle
+
             positions = get_positions()
             log.info(f"Open positions: {list(positions.keys()) or 'none'}")
             prune_peaks(list(positions.keys()))
@@ -1751,8 +1798,13 @@ def run():
                 if not signal_cache:
                     log.info(
                         f"  {open_slots} slot(s) available but signal cache is empty — "
-                        f"waiting for tomorrow's 6am ET pre-market scan. "
+                        f"waiting for tomorrow's pre-market scan. "
                         f"News WebSocket will trigger immediate re-score on breaking events."
+                    )
+                elif closed_this_session:
+                    log.info(
+                        f"  Skipping deploy — {len(closed_this_session)} position(s) just closed "
+                        f"this cycle {closed_this_session} — deploying next cycle to avoid re-entry loop"
                     )
                 else:
                     deploy_from_cache(positions, account)
