@@ -330,8 +330,8 @@ def extract_tickers(symbols: list, headline: str) -> list:
 def on_news_message(ws, message):
     """
     Handles incoming news from Alpaca WebSocket stream.
+    Sends subscribe after auth confirmation.
     Filters for high-value events on universe tickers.
-    Adds to news_queue for main thread to process.
     """
     global news_triggered, news_queue
     try:
@@ -340,7 +340,29 @@ def on_news_message(ws, message):
             data = [data]
 
         for article in data:
-            if article.get("T") != "n":  # only news type messages
+            msg_type = article.get("T")
+
+            # ── Auth/subscription confirmation ────────────────
+            if msg_type == "success":
+                if article.get("msg") == "connected":
+                    log.info("📰 News WebSocket connection confirmed")
+                elif article.get("msg") == "authenticated":
+                    log.info("📰 News WebSocket authenticated — subscribing to all news")
+                    ws.send(json.dumps({
+                        "action": "subscribe",
+                        "news":   ["*"],
+                    }))
+                continue
+
+            if msg_type == "subscription":
+                log.info(f"📰 News WebSocket subscribed: {article.get('news', [])}")
+                continue
+
+            if msg_type == "error":
+                log.warning(f"📰 News WebSocket error message: {article.get('msg')}")
+                continue
+
+            if msg_type != "n":  # only news type messages
                 continue
 
             headline = article.get("headline", "")
@@ -379,15 +401,12 @@ def on_news_message(ws, message):
         log.warning(f"News message error: {e}")
 
 def on_news_open(ws):
-    log.info("📰 News WebSocket connected — subscribing to all news")
+    log.info("📰 News WebSocket connected — authenticating...")
+    # Send auth first — subscribe is sent after auth confirmation in on_news_message
     ws.send(json.dumps({
-        "action":  "auth",
-        "key":     ALPACA_KEY,
-        "secret":  ALPACA_SECRET,
-    }))
-    ws.send(json.dumps({
-        "action": "subscribe",
-        "news":   ["*"],  # subscribe to all news
+        "action": "auth",
+        "key":    ALPACA_KEY,
+        "secret": ALPACA_SECRET,
     }))
 
 def on_news_error(ws, error):
@@ -400,7 +419,10 @@ def start_news_stream():
     """
     Starts news WebSocket in a background daemon thread.
     Automatically reconnects on disconnect.
+    Auth is sent first; subscribe is sent after auth confirmation.
     """
+    import ssl
+
     def run():
         while True:
             try:
@@ -412,10 +434,15 @@ def start_news_stream():
                     on_error   = on_news_error,
                     on_close   = on_news_close,
                 )
-                ws.run_forever(ping_interval=30, ping_timeout=10)
+                ws.run_forever(
+                    ping_interval  = 20,
+                    ping_timeout   = 10,
+                    sslopt         = {"cert_reqs": ssl.CERT_NONE},
+                    reconnect      = 5,
+                )
             except Exception as e:
                 log.warning(f"News stream crashed: {e} — reconnecting in 30s")
-            time.sleep(30)  # reconnect delay
+            time.sleep(30)
 
     thread = threading.Thread(target=run, daemon=True)
     thread.start()
