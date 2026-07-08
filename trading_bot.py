@@ -418,12 +418,17 @@ def on_news_close(ws, close_status_code, close_msg):
 def start_news_stream():
     """
     Starts news WebSocket in a background daemon thread.
-    Automatically reconnects on disconnect.
     Auth is sent first; subscribe is sent after auth confirmation.
+    Longer reconnect delay prevents connection limit errors on Render redeploy.
     """
     import ssl
 
     def run():
+        # Initial delay — prevents connection limit errors when Render
+        # restarts quickly (old process may not have closed yet)
+        time.sleep(5)
+        consecutive_failures = 0
+
         while True:
             try:
                 log.info("📰 Starting news WebSocket stream...")
@@ -435,14 +440,19 @@ def start_news_stream():
                     on_close   = on_news_close,
                 )
                 ws.run_forever(
-                    ping_interval  = 20,
-                    ping_timeout   = 10,
-                    sslopt         = {"cert_reqs": ssl.CERT_NONE},
-                    reconnect      = 5,
+                    ping_interval = 20,
+                    ping_timeout  = 10,
+                    sslopt        = {"cert_reqs": ssl.CERT_NONE},
                 )
+                consecutive_failures = 0
             except Exception as e:
-                log.warning(f"News stream crashed: {e} — reconnecting in 30s")
-            time.sleep(30)
+                consecutive_failures += 1
+                log.warning(f"News stream crashed: {e} — reconnecting...")
+
+            # Exponential backoff — prevents hammering Alpaca on repeated failures
+            delay = min(30 * consecutive_failures, 120)
+            log.info(f"📰 News WebSocket reconnecting in {delay}s...")
+            time.sleep(delay)
 
     thread = threading.Thread(target=run, daemon=True)
     thread.start()
@@ -1823,10 +1833,7 @@ def run():
             open_slots = 10 - len(positions)
             if open_slots > 0 and float(account.regt_buying_power or account.cash) >= equity * 0.10:
                 if not signal_cache:
-                    # ── Emergency rescan on restart ────────────────────
-                    # If cache is empty during market hours (e.g. after Render restart),
-                    # run ONE rescan immediately. Gated by last_rescan_time (1hr cooldown)
-                    # to prevent repeated mid-session scans.
+                    global last_rescan_time
                     time_since_rescan = time.time() - last_rescan_time
                     if time_since_rescan > 3600:
                         log.info(
