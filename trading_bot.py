@@ -1823,11 +1823,24 @@ def run():
             open_slots = 10 - len(positions)
             if open_slots > 0 and float(account.regt_buying_power or account.cash) >= equity * 0.10:
                 if not signal_cache:
-                    log.info(
-                        f"  {open_slots} slot(s) available but signal cache is empty — "
-                        f"waiting for tomorrow's pre-market scan. "
-                        f"News WebSocket will trigger immediate re-score on breaking events."
-                    )
+                    # ── Emergency rescan on restart ────────────────────
+                    # If cache is empty during market hours (e.g. after Render restart),
+                    # run ONE rescan immediately. Gated by last_rescan_time (1hr cooldown)
+                    # to prevent repeated mid-session scans.
+                    time_since_rescan = time.time() - last_rescan_time
+                    if time_since_rescan > 3600:
+                        log.info(
+                            f"  Cache empty mid-session (likely post-restart) — "
+                            f"running one-time emergency rescan"
+                        )
+                        last_rescan_time = time.time()
+                        run_premarket_scan()
+                    else:
+                        log.info(
+                            f"  {open_slots} slot(s) available but signal cache is empty — "
+                            f"next emergency rescan in {max(0,(3600-time_since_rescan)/60):.0f}min. "
+                            f"News WebSocket active for breaking events."
+                        )
                 elif closed_this_session:
                     log.info(
                         f"  Skipping deploy — {len(closed_this_session)} position(s) just closed "
