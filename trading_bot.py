@@ -1277,6 +1277,36 @@ def get_positions() -> dict:
         log.error(f"Failed to get positions: {e}")
         return {}
 
+COOLDOWN_FILE = "/tmp/reentry_cooldowns.json"
+
+def save_cooldowns():
+    """Persist re-entry cooldowns so a bot restart doesn't forget a 24hr
+    stop-loss block. Note: /tmp survives process crashes but NOT Render
+    redeploys (new container). Best-effort protection."""
+    try:
+        with open(COOLDOWN_FILE, "w") as f:
+            json.dump(reentry_cooldown, f)
+    except Exception as e:
+        log.warning(f"Failed to save cooldowns: {e}")
+
+def load_cooldowns():
+    global reentry_cooldown
+    try:
+        with open(COOLDOWN_FILE) as f:
+            data = json.load(f)
+        now = time.time()
+        # Drop already-expired time cooldowns; keep price gates < 48h old
+        reentry_cooldown = {
+            sym: cd for sym, cd in data.items()
+            if (cd.get("expires", 0) > now) or (now - cd.get("time", 0) < 48 * 3600)
+        }
+        if reentry_cooldown:
+            log.info(f"Restored {len(reentry_cooldown)} re-entry cooldown(s): {list(reentry_cooldown.keys())}")
+    except FileNotFoundError:
+        pass
+    except Exception as e:
+        log.warning(f"Failed to load cooldowns: {e}")
+
 def register_reentry_cooldown(symbol: str, exit_reason: str, exit_price: float):
     """
     Registers a re-entry cooldown after a position closes.
@@ -1350,6 +1380,8 @@ def register_reentry_cooldown(symbol: str, exit_reason: str, exit_price: float):
             "exit_price": exit_price,
             "expires":    0,
         }
+
+    save_cooldowns()  # persist across restarts (best-effort)
 
 def check_reentry_allowed(symbol: str, current_price: float) -> tuple[bool, str]:
     """
@@ -1480,19 +1512,38 @@ def is_paused() -> bool:
 def trades_today_count() -> int:
     return trades_today.get(datetime.now(ET).strftime("%Y-%m-%d"), 0)
 
+drawdown_anchor_date: str = ""  # trading day the drawdown anchor was set
+
 def check_drawdown(account) -> bool:
-    global circuit_breaker, starting_equity
+    """
+    Daily drawdown circuit breaker.
+    - Anchor equity resets each new trading day (uses last_equity = prior close)
+    - Breaker auto-resets on a new day, so one bad day doesn't disable
+      the bot forever (old behaviour required a manual restart)
+    """
+    global circuit_breaker, starting_equity, drawdown_anchor_date
+    today = datetime.now(ET).strftime("%Y-%m-%d")
+
+    # New trading day → re-anchor and clear breaker
+    if drawdown_anchor_date != today:
+        drawdown_anchor_date = today
+        try:
+            starting_equity = float(account.last_equity)  # prior close — clean daily anchor
+        except Exception:
+            starting_equity = float(account.equity)
+        if circuit_breaker:
+            log.info("Circuit breaker RESET — new trading day")
+        circuit_breaker = False
+        log.info(f"Daily drawdown anchor: ${starting_equity:,.2f}")
+
     if circuit_breaker:
         return False
-    equity = float(account.equity)
-    if starting_equity is None:
-        starting_equity = equity
-        log.info(f"Starting equity: ${starting_equity:,.2f}")
-        return True
-    drawdown = (starting_equity - equity) / starting_equity
+
+    equity   = float(account.equity)
+    drawdown = (starting_equity - equity) / starting_equity if starting_equity else 0
     if drawdown >= MAX_DRAWDOWN:
         circuit_breaker = True
-        log.critical(f"CIRCUIT BREAKER — drawdown {drawdown*100:.1f}% > {MAX_DRAWDOWN*100:.0f}%")
+        log.critical(f"CIRCUIT BREAKER — intraday drawdown {drawdown*100:.1f}% > {MAX_DRAWDOWN*100:.0f}% — trading halted until tomorrow")
         return False
     return True
 
@@ -1648,7 +1699,7 @@ def deploy_from_cache(positions: dict, account):
                 result = compute_signal(symbol, spy_chg)
                 if result and result["signal"] == "BUY" and result["confidence"] >= MIN_CONFIDENCE and result["composite"] >= 3.0:
                     new_signals.append(result)
-                time.sleep(20)
+                time.sleep(3)
             signal_cache = sorted(new_signals, key=lambda x: x["confidence"], reverse=True)
             available    = signal_cache
         else:
@@ -1657,6 +1708,14 @@ def deploy_from_cache(positions: dict, account):
 
     to_buy = available[:open_slots]
     log.info(f"Deploying into {len(to_buy)} signal(s) from cache: {[s['symbol'] for s in to_buy]}")
+
+    # Sector counts tracked across the WHOLE deploy loop — incremented after
+    # each buy so 3 same-sector candidates can't all pass the cap in one cycle
+    sector_counts: dict = {}
+    for s in positions:
+        sec = SECTOR_MAP.get(s)
+        if sec:
+            sector_counts[sec] = sector_counts.get(sec, 0) + 1
 
     for candidate in to_buy:
         symbol = candidate["symbol"]
@@ -1667,9 +1726,10 @@ def deploy_from_cache(positions: dict, account):
         # ── Sector cap — max 2 positions per sector (backtest validated) ──
         # Apr 26 +$1,196, May 26 +$1,914 better vs uncapped
         # Prevents NVDA×3 concentration regardless of signal quality
+        # NOTE: counts include buys made earlier in THIS loop (same-cycle fix)
         sector = SECTOR_MAP.get(symbol)
         if sector:
-            sector_count = sum(1 for s in positions if SECTOR_MAP.get(s) == sector)
+            sector_count = sector_counts.get(sector, 0)
             if sector_count >= MAX_SECTOR_POSITIONS:
                 log.info(
                     f"  {symbol}: sector '{sector}' capped — "
@@ -1688,8 +1748,12 @@ def deploy_from_cache(positions: dict, account):
         # ── Re-entry cooldown checks (Options 1, 3, 5) ────────
         # Fetch current live price for Option 3 price gate
         try:
-            snap  = trade_client.get_stock_latest_bar(symbol)
-            live_price = float(snap[symbol].c) if snap and symbol in snap else price
+            r = requests.get(
+                f"https://data.alpaca.markets/v2/stocks/{symbol}/trades/latest",
+                headers={"APCA-API-KEY-ID": ALPACA_KEY, "APCA-API-SECRET-KEY": ALPACA_SECRET},
+                timeout=5,
+            )
+            live_price = float(r.json().get("trade", {}).get("p", price)) if r.ok else price
         except Exception:
             live_price = price
 
@@ -1728,21 +1792,25 @@ def deploy_from_cache(positions: dict, account):
         else:
             log.info(f"  {symbol}: {qty} shares @ ~${live_price:.2f} = ${qty*live_price:,.0f} ({kelly*100:.0f}% Kelly)")
 
-        place_buy(symbol, qty)
-        cash -= qty * live_price
+        if place_buy(symbol, qty):
+            cash -= qty * live_price
+            if sector:
+                sector_counts[sector] = sector_counts.get(sector, 0) + 1  # same-cycle cap tracking
 
 # ══════════════════════════════════════════════════════════════
 # MAIN LOOP
 # ══════════════════════════════════════════════════════════════
 
 def run():
+    global last_rescan_time
     load_peaks()
+    load_cooldowns()     # restore stop-loss/profit cooldowns after restart
     start_news_stream()  # Start news WebSocket in background thread
 
     log.info("=" * 60)
     log.info("SIGNAL Trading Bot started")
     log.info(f"  Universe:       36 curated + 15 dynamic = 51 max")
-    log.info(f"  Scan timing:    Pre-market (Sun 8pm / Mon-Fri 6am ET)")
+    log.info(f"  Scan timing:    Sun 8pm ET / Mon-Fri 9:20am ET (dynamic) + restart rescan")
     log.info(f"  Position size:  Kelly 8-12% (confidence-based sizing)")
     log.info(f"  Profit target:  ATR×2.5 per position (3-12% range, fallback +5%)")
     log.info(f"  Sector cap:     Max 2 positions per sector (backtest validated)")
@@ -1833,7 +1901,6 @@ def run():
             open_slots = 10 - len(positions)
             if open_slots > 0 and float(account.regt_buying_power or account.cash) >= equity * 0.10:
                 if not signal_cache:
-                    global last_rescan_time
                     time_since_rescan = time.time() - last_rescan_time
                     if time_since_rescan > 3600:
                         log.info(
