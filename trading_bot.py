@@ -89,8 +89,16 @@ PROFIT_TARGET   =  0.05    # +5%   sell immediately
 PEAK_TRIGGER    =  0.03    # +3%   activate trailing protection
 TRAIL_SELL      =  0.025   # +2.5% sell if falls back here after peak
 STOP_LOSS       = -0.05    # -5%   hard stop (before breakeven activates)
-BREAKEVEN_TRIGGER = 0.01   # +1%   once hit, stop shifts to +0.5%
-BREAKEVEN_STOP    = 0.005  # +0.5% minimum locked-in gain after breakeven
+BREAKEVEN_TRIGGER = 0.01   # +1%   once hit, stop shifts to +0.5% (default / high-VIX)
+BREAKEVEN_STOP    = 0.005  # +0.5% minimum locked-in gain after breakeven (default / high-VIX)
+
+# ── VIX-aware breakeven — calm markets need more room before locking in ──
+# Rationale: in a low-VIX (<18) tape, stocks oscillate ±1% on pure noise.
+# The tight 1%/0.5% breakeven was catching that noise and exiting winners
+# early (avg realised gain was 0.36-0.46% instead of riding toward +3-5%).
+CALM_VIX_THRESHOLD      = 18
+BREAKEVEN_TRIGGER_CALM  = 0.02    # +2%   needs more confirmation in calm markets
+BREAKEVEN_STOP_CALM     = 0.01    # +1%   locked-in gain, still meaningfully positive
 
 # ── Macro thresholds ───────────────────────────────────────────
 SPY_BEAR        = -0.02
@@ -256,6 +264,7 @@ market_state:       str              = "BULL"
 fear_active:        bool             = False
 weak_sectors:       set              = set()
 spy_change:         float            = 0.0
+current_vix:        float | None     = None   # latest VIX reading — used for VIX-aware breakeven stop
 fund_cache:         dict             = {}        # {symbol: (timestamp, result)}
 signal_cache:       list             = []        # ranked BUY signals from pre-market scan
 signal_cache_time:  float            = 0.0       # when cache was built
@@ -715,10 +724,11 @@ def get_vix_level() -> float | None:
         return None
 
 def assess_market_state():
-    global market_state, fear_active, weak_sectors, spy_change
+    global market_state, fear_active, weak_sectors, spy_change, current_vix
 
     vix_now  = get_vix_level()
     vixy_chg = get_quote_change("VIXY")
+    current_vix = vix_now  # stored globally — used by check_profit_targets for VIX-aware breakeven stop
 
     if vix_now is not None:
         fear_active = vix_now >= 25
@@ -1576,6 +1586,13 @@ def check_profit_targets(positions: dict) -> list[str]:
     closed      = []
     active_stop = get_stop_loss()
 
+    # ── VIX-aware breakeven thresholds ─────────────────────────
+    # Calm market (VIX < 18): widen the breakeven band so normal
+    # intraday noise doesn't trigger an early exit on a real winner.
+    is_calm = current_vix is not None and current_vix < CALM_VIX_THRESHOLD
+    be_trigger = BREAKEVEN_TRIGGER_CALM if is_calm else BREAKEVEN_TRIGGER
+    be_stop    = BREAKEVEN_STOP_CALM    if is_calm else BREAKEVEN_STOP
+
     for symbol, pos in positions.items():
         try:
             pnl_pct = float(pos.unrealized_plpc)
@@ -1587,8 +1604,11 @@ def check_profit_targets(positions: dict) -> list[str]:
                 save_peaks()
                 if pnl_pct >= PEAK_TRIGGER:
                     log.info(f"  {symbol}: new peak {pnl_pct*100:+.2f}% — trailing active")
-                elif pnl_pct >= BREAKEVEN_TRIGGER:
-                    log.info(f"  {symbol}: new peak {pnl_pct*100:+.2f}% — breakeven stop active (+0.5%)")
+                elif pnl_pct >= be_trigger:
+                    log.info(
+                        f"  {symbol}: new peak {pnl_pct*100:+.2f}% — breakeven stop active "
+                        f"(+{be_stop*100:.1f}%{' calm-VIX' if is_calm else ''})"
+                    )
 
             current_peak = position_peaks.get(symbol, 0.0)
             reason       = None
@@ -1605,21 +1625,24 @@ def check_profit_targets(positions: dict) -> list[str]:
                 reason = f"PROFIT_TARGET ({profit_target*100:.1f}%)"
             elif current_peak >= PEAK_TRIGGER and pnl_pct <= TRAIL_SELL:
                 reason = f"TRAILING (peaked {current_peak*100:+.2f}%)"
-            elif current_peak >= BREAKEVEN_TRIGGER and pnl_pct <= BREAKEVEN_STOP:
-                reason = f"BREAKEVEN_STOP (peaked {current_peak*100:+.2f}%, locked +0.5%)"
-            elif current_peak < BREAKEVEN_TRIGGER and pnl_pct <= active_stop:
+            elif current_peak >= be_trigger and pnl_pct <= be_stop:
+                reason = (
+                    f"BREAKEVEN_STOP (peaked {current_peak*100:+.2f}%, "
+                    f"locked +{be_stop*100:.1f}%{' calm-VIX' if is_calm else ''})"
+                )
+            elif current_peak < be_trigger and pnl_pct <= active_stop:
                 reason = f"STOP_LOSS ({active_stop*100:.0f}%)"
 
             # ── Weak sector mid-day exit ───────────────────────
-            # Only exit if position is at breakeven (+0.5%) or better
+            # Only exit if position is at breakeven or better (VIX-aware threshold)
             # Never crystallise a loss due to sector rotation
             if not reason and weak_sectors:
                 sector = SECTOR_MAP.get(symbol)
                 if sector and sector in weak_sectors:
-                    if pnl_pct >= BREAKEVEN_STOP:
+                    if pnl_pct >= be_stop:
                         reason = (
                             f"WEAK_SECTOR ({sector.upper()} weak, "
-                            f"P&L {pnl_pct*100:+.2f}% ≥ +0.5% — exiting)"
+                            f"P&L {pnl_pct*100:+.2f}% ≥ +{be_stop*100:.1f}% — exiting)"
                         )
                     else:
                         log.info(
@@ -1819,6 +1842,7 @@ def run():
     log.info(f"  Max positions:  10 concurrent")
     log.info(f"  Profit target:  +{PROFIT_TARGET*100:.0f}%")
     log.info(f"  Trailing:       peak >={PEAK_TRIGGER*100:.0f}% → sell at +{TRAIL_SELL*100:.0f}%")
+    log.info(f"  Breakeven:      calm(VIX<{CALM_VIX_THRESHOLD}) peak>={BREAKEVEN_TRIGGER_CALM*100:.0f}%→lock+{BREAKEVEN_STOP_CALM*100:.0f}% | else peak>={BREAKEVEN_TRIGGER*100:.0f}%→lock+{BREAKEVEN_STOP*100:.1f}%")
     log.info(f"  Stop loss:      -{abs(STOP_LOSS)*100:.0f}%")
     log.info(f"  TA/Fund weight: {TECH_WEIGHT}% / {FUND_WEIGHT}%")
     log.info(f"  Min confidence: {MIN_CONFIDENCE}%")
