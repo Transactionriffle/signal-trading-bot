@@ -281,6 +281,19 @@ reentry_cooldown:   dict[str, dict]  = {}
 
 PROFIT_COOLDOWN_SECS = 14400   # 4 hours after profit target exit
 STOP_COOLDOWN_SECS   = 86400   # 24 hours after stop loss exit
+
+# ── Strike system — repeated stop-loss failures escalate cooldown ──
+# Problem observed: MU stopped out -5% on Jul 24, re-bought, stopped out
+# -5% again on Jul 28. The 24hr cooldown resets the slate each time with
+# no memory that this ticker just failed. A human would sit it out longer
+# after 2+ failures in a short window — this gives the bot the same instinct.
+STRIKE_WINDOW_SECS   = 7 * 86400   # look back 7 days for strike counting
+STRIKE_COOLDOWNS     = {           # strikes within window → cooldown duration
+    1: 86400,        # 1st stop loss this week  → 24hr  (unchanged)
+    2: 3 * 86400,    # 2nd stop loss this week   → 72hr
+    3: 14 * 86400,   # 3rd+ stop loss this week  → 14 days (effectively benched)
+}
+stop_loss_strikes: dict = {}   # {symbol: [timestamp, timestamp, ...]} — rolling log
 PRICE_GATE_PCT       = 0.02    # must pull back 2% from exit price to re-enter
 
 # ── News WebSocket state ───────────────────────────────────────
@@ -1288,6 +1301,7 @@ def get_positions() -> dict:
         return {}
 
 COOLDOWN_FILE = "/tmp/reentry_cooldowns.json"
+STRIKES_FILE  = "/tmp/stop_loss_strikes.json"
 
 def save_cooldowns():
     """Persist re-entry cooldowns so a bot restart doesn't forget a 24hr
@@ -1296,11 +1310,13 @@ def save_cooldowns():
     try:
         with open(COOLDOWN_FILE, "w") as f:
             json.dump(reentry_cooldown, f)
+        with open(STRIKES_FILE, "w") as f:
+            json.dump(stop_loss_strikes, f)
     except Exception as e:
         log.warning(f"Failed to save cooldowns: {e}")
 
 def load_cooldowns():
-    global reentry_cooldown
+    global reentry_cooldown, stop_loss_strikes
     try:
         with open(COOLDOWN_FILE) as f:
             data = json.load(f)
@@ -1316,6 +1332,24 @@ def load_cooldowns():
         pass
     except Exception as e:
         log.warning(f"Failed to load cooldowns: {e}")
+
+    try:
+        with open(STRIKES_FILE) as f:
+            data = json.load(f)
+        now = time.time()
+        # Prune strikes older than the rolling window on load
+        stop_loss_strikes = {
+            sym: [t for t in times if now - t < STRIKE_WINDOW_SECS]
+            for sym, times in data.items()
+        }
+        stop_loss_strikes = {k: v for k, v in stop_loss_strikes.items() if v}
+        flagged = {k: len(v) for k, v in stop_loss_strikes.items() if len(v) >= 2}
+        if flagged:
+            log.info(f"Restored stop-loss strike history — repeat offenders: {flagged}")
+    except FileNotFoundError:
+        pass
+    except Exception as e:
+        log.warning(f"Failed to load strikes: {e}")
 
 def register_reentry_cooldown(symbol: str, exit_reason: str, exit_price: float):
     """
@@ -1353,14 +1387,25 @@ def register_reentry_cooldown(symbol: str, exit_reason: str, exit_price: float):
             f"4hr block + price gate ${exit_price*(1-PRICE_GATE_PCT):.2f}"
         )
     elif "STOP_LOSS" in exit_reason:
+        # ── Strike tracking — escalate cooldown on repeated failures ──
+        global stop_loss_strikes
+        history = stop_loss_strikes.get(symbol, [])
+        history = [t for t in history if now - t < STRIKE_WINDOW_SECS]  # prune old strikes
+        history.append(now)
+        stop_loss_strikes[symbol] = history
+        strike_count = len(history)
+
+        cooldown_secs = STRIKE_COOLDOWNS.get(strike_count, STRIKE_COOLDOWNS[3])
         reentry_cooldown[symbol] = {
             "type":       "stop",
             "time":       now,
             "exit_price": exit_price,
-            "expires":    now + STOP_COOLDOWN_SECS,
+            "expires":    now + cooldown_secs,
         }
+        cooldown_days = cooldown_secs / 86400
         log.info(
-            f"  ⏳ {symbol}: stop loss cooldown — 24hr block (thesis failed)"
+            f"  ⏳ {symbol}: stop loss cooldown — strike {strike_count} in past 7 days "
+            f"→ {cooldown_days:.0f}-day block (escalating penalty for repeat failures)"
         )
     elif "WEAK_SECTOR" in exit_reason:
         reentry_cooldown[symbol] = {
