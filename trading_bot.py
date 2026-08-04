@@ -79,6 +79,14 @@ WORKER_URL      = os.environ.get("CLOUDFLARE_WORKER", "https://winter-cake-6aae.
 TECH_WEIGHT     = int(os.environ.get("TECH_WEIGHT", "40"))
 FUND_WEIGHT     = 100 - TECH_WEIGHT
 MIN_CONFIDENCE  = int(os.environ.get("MIN_CONFIDENCE", "85"))  # raised from 80% — filters weak signals like NFLX (82%)
+
+# Raised from 3.0 → 4.0 (Jul 29 review). Rationale: realised trades were
+# clustering at +0.3-0.5% wins vs -5% stop losses — a ratio that needs a
+# ~93% win rate just to break even, which no live sample sustained. Every
+# marginal (3.0-4.0) entry was negative expected value at that risk/reward.
+# Raising the floor cuts trade count but concentrates capital in the
+# higher-conviction setups the composite score is actually meant to find.
+MIN_COMPOSITE   = float(os.environ.get("MIN_COMPOSITE", "4.0"))
 MAX_TRADES_DAY  = int(os.environ.get("MAX_TRADES_PER_DAY", "10"))
 MAX_DRAWDOWN    = float(os.environ.get("MAX_DRAWDOWN_PCT", "0.15"))
 SCAN_INTERVAL   = 60
@@ -526,7 +534,7 @@ def process_news_queue(positions: dict, account) -> bool:
 
         result = compute_signal(symbol, spy_chg)
 
-        if result and result["signal"] == "BUY" and result["confidence"] >= MIN_CONFIDENCE and result["composite"] >= 3.0:
+        if result and result["signal"] == "BUY" and result["confidence"] >= MIN_CONFIDENCE and result["composite"] >= MIN_COMPOSITE:
             log.info(
                 f"📰 NEWS BUY [{sentiment}] {symbol}: "
                 f"composite={result['composite']:.2f}, confidence={result['confidence']}% "
@@ -557,20 +565,90 @@ def load_journal() -> dict:
         return {}
 
 def record_trade(symbol: str, pnl_pct: float, exit_reason: str):
-    """Record every trade outcome for 90-day audit."""
+    """
+    Record every trade outcome for 90-day audit AND signal-attribution
+    analysis — joins the entry-time composite/confidence/ta/fund scores
+    (captured in entry_signals at buy time) with the realised outcome.
+    This is what makes it possible to answer "does a high composite
+    score actually predict a winning trade?" instead of guessing.
+    """
     journal = load_journal()
     if symbol not in journal:
         journal[symbol] = []
+
+    entry = entry_signals.pop(symbol, {})  # consume + remove — one snapshot per trade
+    save_entry_signals()
+
     journal[symbol].append({
-        "date":   datetime.now(ET).strftime("%Y-%m-%d"),
-        "pnl":    round(pnl_pct * 100, 2),
-        "reason": exit_reason,
+        "date":        datetime.now(ET).strftime("%Y-%m-%d"),
+        "pnl":         round(pnl_pct * 100, 2),
+        "reason":      exit_reason,
+        "composite":   entry.get("composite"),
+        "confidence":  entry.get("confidence"),
+        "ta_score":    entry.get("ta_score"),
+        "fund_score":  entry.get("fund_score"),
+        "sector":      entry.get("sector"),
+        "kelly_pct":   entry.get("kelly_pct"),
     })
     try:
         with open(JOURNAL_FILE, "w") as f:
             json.dump(journal, f)
     except Exception as e:
         log.warning(f"Failed to save journal: {e}")
+
+def analyse_signal_attribution():
+    """
+    Answers: 'does a high composite/confidence score actually predict
+    a winning trade, or is TA/fundamentals just noise?'
+
+    Groups all journalled trades (that have entry-signal data attached)
+    into composite-score buckets and reports win rate + avg P&L per
+    bucket. Call this manually or on a schedule once enough trades
+    have accumulated with the new entry_signals tracking (old trades
+    won't have this data — only trades closed AFTER this fix shipped).
+    """
+    journal = load_journal()
+    all_trades = [t for trades in journal.values() for t in trades if t.get("composite") is not None]
+
+    if len(all_trades) < 10:
+        log.info(
+            f"Signal attribution: only {len(all_trades)} trades with entry-signal "
+            f"data so far — need 10+ for a meaningful read. (Old trades before this "
+            f"fix don't have composite/confidence attached.)"
+        )
+        return
+
+    def bucket(trades, lo, hi):
+        b = [t for t in trades if lo <= t["composite"] < hi]
+        if not b:
+            return None
+        wins = sum(1 for t in b if t["pnl"] > 0)
+        return {
+            "n": len(b),
+            "win_rate": wins / len(b) * 100,
+            "avg_pnl": sum(t["pnl"] for t in b) / len(b),
+        }
+
+    log.info("=" * 60)
+    log.info("SIGNAL ATTRIBUTION — does composite score predict outcome?")
+    log.info("=" * 60)
+    for lo, hi, label in [(3.0, 4.0, "3.0-4.0 (marginal)"),
+                           (4.0, 5.5, "4.0-5.5 (normal)"),
+                           (5.5, 100, "5.5+ (high conviction)")]:
+        r = bucket(all_trades, lo, hi)
+        if r:
+            log.info(f"  {label}: {r['n']} trades, {r['win_rate']:.0f}% win rate, avg P&L {r['avg_pnl']:+.2f}%")
+        else:
+            log.info(f"  {label}: no trades yet")
+
+    # Same breakdown by confidence
+    conf_trades = [t for t in all_trades if t.get("confidence") is not None]
+    for lo, hi, label in [(85, 88, "85-88% conf"), (88, 92, "88-92% conf"), (92, 101, "92%+ conf")]:
+        b = [t for t in conf_trades if lo <= t["confidence"] < hi]
+        if b:
+            wins = sum(1 for t in b if t["pnl"] > 0)
+            log.info(f"  {label}: {len(b)} trades, {wins/len(b)*100:.0f}% win rate, avg P&L {sum(t['pnl'] for t in b)/len(b):+.2f}%")
+    log.info("=" * 60)
 
 def run_90_day_audit():
     """
@@ -1172,7 +1250,7 @@ def run_premarket_scan():
         result = compute_signal(symbol, spy_chg, prefetched_ta=ta)
         if result:
             all_scored.append(result)
-            if result["signal"] == "BUY" and result["confidence"] >= MIN_CONFIDENCE and result["composite"] >= 3.0:
+            if result["signal"] == "BUY" and result["confidence"] >= MIN_CONFIDENCE and result["composite"] >= MIN_COMPOSITE:
                 candidates.append(result)
                 ipo_tag = " [IPO]" if result.get("ipo_mode") else ""
                 log.info(
@@ -1302,6 +1380,30 @@ def get_positions() -> dict:
 
 COOLDOWN_FILE = "/tmp/reentry_cooldowns.json"
 STRIKES_FILE  = "/tmp/stop_loss_strikes.json"
+ENTRY_SIGNALS_FILE = "/tmp/entry_signals.json"
+
+entry_signals: dict = {}   # {symbol: {composite, confidence, ta_score, fund_score, sector, ...}}
+                            # captured at buy time, consumed + cleared at exit time
+                            # so the journal can answer "did high-composite trades win more?"
+
+def save_entry_signals():
+    try:
+        with open(ENTRY_SIGNALS_FILE, "w") as f:
+            json.dump(entry_signals, f)
+    except Exception as e:
+        log.warning(f"Failed to save entry signals: {e}")
+
+def load_entry_signals():
+    global entry_signals
+    try:
+        with open(ENTRY_SIGNALS_FILE) as f:
+            entry_signals = json.load(f)
+        if entry_signals:
+            log.info(f"Restored entry signal snapshots for {len(entry_signals)} open position(s)")
+    except FileNotFoundError:
+        pass
+    except Exception as e:
+        log.warning(f"Failed to load entry signals: {e}")
 
 def save_cooldowns():
     """Persist re-entry cooldowns so a bot restart doesn't forget a 24hr
@@ -1629,7 +1731,7 @@ def check_profit_targets(positions: dict) -> list[str]:
          If position is negative → hold (don't crystallise a loss).
     """
     closed      = []
-    active_stop = get_stop_loss()
+    base_stop   = get_stop_loss()   # -5% normal, -2% in BEAR mode — the ceiling
 
     # ── VIX-aware breakeven thresholds ─────────────────────────
     # Calm market (VIX < 18): widen the breakeven band so normal
@@ -1641,6 +1743,25 @@ def check_profit_targets(positions: dict) -> list[str]:
     for symbol, pos in positions.items():
         try:
             pnl_pct = float(pos.unrealized_plpc)
+
+            # ── Composite-aware stop loss ──────────────────────
+            # Jul 29 review: realised wins clustered at +0.3-0.5% against a
+            # flat -5% stop — that ratio needs ~93% win rate to break even.
+            # Fix: entries with a weaker composite (closer to the MIN_COMPOSITE
+            # floor) get a TIGHTER stop, since they're lower-conviction and
+            # shouldn't be given as much rope. High-conviction entries (which
+            # should also be sized larger via Kelly) get the full -5% to let
+            # the thesis play out. BEAR mode's -2% ceiling always wins (tightest).
+            entry_composite = entry_signals.get(symbol, {}).get("composite")
+            if entry_composite is not None and market_state != "BEAR":
+                if entry_composite < 4.5:
+                    active_stop = -0.03      # marginal entry (4.0-4.5) → tighter -3%
+                elif entry_composite < 6.0:
+                    active_stop = -0.04      # normal entry (4.5-6.0)  → -4%
+                else:
+                    active_stop = base_stop  # high conviction (6.0+)  → full -5%
+            else:
+                active_stop = base_stop      # no entry data (legacy position) or BEAR mode
 
             # Update peak
             prev_peak = position_peaks.get(symbol, 0.0)
@@ -1676,7 +1797,7 @@ def check_profit_targets(positions: dict) -> list[str]:
                     f"locked +{be_stop*100:.1f}%{' calm-VIX' if is_calm else ''})"
                 )
             elif current_peak < be_trigger and pnl_pct <= active_stop:
-                reason = f"STOP_LOSS ({active_stop*100:.0f}%)"
+                reason = f"STOP_LOSS ({active_stop*100:.0f}%{' composite-tiered' if entry_composite is not None else ''})"
 
             # ── Weak sector mid-day exit ───────────────────────
             # Only exit if position is at breakeven or better (VIX-aware threshold)
@@ -1765,7 +1886,7 @@ def deploy_from_cache(positions: dict, account):
                 if symbol in positions:
                     continue
                 result = compute_signal(symbol, spy_chg)
-                if result and result["signal"] == "BUY" and result["confidence"] >= MIN_CONFIDENCE and result["composite"] >= 3.0:
+                if result and result["signal"] == "BUY" and result["confidence"] >= MIN_CONFIDENCE and result["composite"] >= MIN_COMPOSITE:
                     new_signals.append(result)
                 time.sleep(3)
             signal_cache = sorted(new_signals, key=lambda x: x["confidence"], reverse=True)
@@ -1860,6 +1981,21 @@ def deploy_from_cache(positions: dict, account):
         else:
             log.info(f"  {symbol}: {qty} shares @ ~${live_price:.2f} = ${qty*live_price:,.0f} ({kelly*100:.0f}% Kelly)")
 
+        # ── Store entry signal snapshot — required to analyse which
+        # analysis (TA vs fundamentals) actually drives outcomes.
+        # Without this, exit-time journal entries have no link back to
+        # what the composite/confidence/scores were when the bot bought.
+        entry_signals[symbol] = {
+            "composite":  composite,
+            "confidence": confidence,
+            "ta_score":   candidate.get("ta_score"),
+            "fund_score": candidate.get("fund_score"),
+            "sector":     sector,
+            "kelly_pct":  kelly,
+            "entry_price": live_price,
+        }
+        save_entry_signals()
+
         if place_buy(symbol, qty):
             cash -= qty * live_price
             if sector:
@@ -1873,6 +2009,7 @@ def run():
     global last_rescan_time
     load_peaks()
     load_cooldowns()     # restore stop-loss/profit cooldowns after restart
+    load_entry_signals()  # restore entry snapshots for signal-attribution analysis
     start_news_stream()  # Start news WebSocket in background thread
 
     log.info("=" * 60)
@@ -1891,6 +2028,8 @@ def run():
     log.info(f"  Stop loss:      -{abs(STOP_LOSS)*100:.0f}%")
     log.info(f"  TA/Fund weight: {TECH_WEIGHT}% / {FUND_WEIGHT}%")
     log.info(f"  Min confidence: {MIN_CONFIDENCE}%")
+    log.info(f"  Min composite:  {MIN_COMPOSITE} (raised from 3.0 — Jul 29 review)")
+    log.info(f"  Stop loss:      tiered by entry composite — <4.5: -3% | 4.5-6.0: -4% | 6.0+: -5%")
     log.info(f"  Max drawdown:   {MAX_DRAWDOWN*100:.0f}%")
     log.info(f"  90-day audit:   Volume, TA alignment, win rate")
     log.info(f"  Pause:          set PAUSED=true in Render")
@@ -1907,6 +2046,20 @@ def run():
                 f.write(datetime.now(ET).strftime("%Y-%m-%d"))
     except FileNotFoundError:
         with open(audit_file, "w") as f:
+            f.write(datetime.now(ET).strftime("%Y-%m-%d"))
+
+    # Weekly signal-attribution check — faster feedback loop than the 90-day
+    # audit while enough entry-tagged trades accumulate to be meaningful.
+    attribution_file = "/tmp/last_attribution.txt"
+    try:
+        with open(attribution_file) as f:
+            last_attr = datetime.strptime(f.read().strip(), "%Y-%m-%d").replace(tzinfo=ET)
+        if (datetime.now(ET) - last_attr).days >= 7:
+            analyse_signal_attribution()
+            with open(attribution_file, "w") as f:
+                f.write(datetime.now(ET).strftime("%Y-%m-%d"))
+    except FileNotFoundError:
+        with open(attribution_file, "w") as f:
             f.write(datetime.now(ET).strftime("%Y-%m-%d"))
 
     while True:
