@@ -266,6 +266,7 @@ def is_likely_etf(symbol: str) -> bool:
 # ── Runtime state ──────────────────────────────────────────────
 trades_today:       dict[str, int]   = defaultdict(int)
 circuit_breaker:    bool             = False
+api_credit_exhausted: bool           = False  # set True on Anthropic 'credit balance too low' — halts trading, not silent HOLD
 starting_equity:    float | None     = None
 position_peaks:     dict[str, float] = {}
 market_state:       str              = "BULL"
@@ -498,6 +499,14 @@ def process_news_queue(positions: dict, account) -> bool:
 
     if not news_queue:
         return False
+
+    if api_credit_exhausted:
+        log.warning(
+            f"⏸ {len(news_queue)} news trigger(s) queued but Anthropic API credit "
+            f"is exhausted — holding queue rather than processing blind (was: silently "
+            f"treated as HOLD/SELL, losing real signals like today's AMD/NVDA news)"
+        )
+        return False  # queue is preserved — not cleared — will be retried once credit restored
 
     traded = False
     to_process = news_queue.copy()
@@ -768,6 +777,39 @@ trade_client = TradingClient(
 )
 ai_client = anthropic.Anthropic(api_key=ANTHROPIC_KEY)
 
+def safe_claude_call(**kwargs):
+    """
+    Thin wrapper around ai_client.messages.create() that detects
+    Anthropic credit exhaustion specifically (vs a generic transient
+    error) and sets a global flag instead of letting every caller
+    silently degrade to 'HOLD/SELL — no action'.
+
+    Root cause fixed Aug 7: the bot ran out of API credit mid-session.
+    Every subsequent Claude call failed with a 400, and every caller's
+    bare except-clause swallowed it as a neutral/no-signal result —
+    which is NOT neutral, it's unknown. News-triggered buys on real
+    bullish headlines (AMD, NVDA, GOOG, META, MSFT) were silently
+    skipped as 'HOLD/SELL' for hours with no alerting.
+    """
+    global api_credit_exhausted
+    try:
+        response = ai_client.messages.create(**kwargs)
+        if api_credit_exhausted:
+            api_credit_exhausted = False  # recovered — clear the flag
+            log.info("✅ Anthropic API credit restored — resuming normal operation")
+        return response
+    except anthropic.APIStatusError as e:
+        if e.status_code == 400 and "credit balance is too low" in str(e).lower():
+            if not api_credit_exhausted:
+                api_credit_exhausted = True
+                log.critical(
+                    "🚨 ANTHROPIC API CREDIT EXHAUSTED — all Claude-dependent "
+                    "signals (fundamentals, earnings checks, news scoring) will "
+                    "be BLOCKED (not silently skipped) until credit is restored. "
+                    "Go to console.anthropic.com → Plans & Billing."
+                )
+        raise
+
 # ══════════════════════════════════════════════════════════════
 # MACRO LAYER
 # ══════════════════════════════════════════════════════════════
@@ -899,7 +941,7 @@ def fetch_fundamental(symbol: str, ta: dict) -> dict | None:
             '{"fundSignal":"BUY","fundScore":7,"confidence":82,"thesis":"one sentence"} '
             "fundScore -10 to +10. confidence 0-100."
         )
-        response = ai_client.messages.create(
+        response = safe_claude_call(
             model="claude-sonnet-4-5",
             max_tokens=150,
             tools=[{"type": "web_search_20250305", "name": "web_search"}],
@@ -938,7 +980,7 @@ def check_earnings_proximity(symbol: str, today: str) -> tuple[bool, str]:
             '{"earnings_within_3_days":false,"earnings_date":null} '
             "Set earnings_within_3_days to true only if earnings are confirmed within 3 calendar days."
         )
-        response = ai_client.messages.create(
+        response = safe_claude_call(
             model="claude-sonnet-4-5",
             max_tokens=60,
             tools=[{"type": "web_search_20250305", "name": "web_search"}],
@@ -1207,6 +1249,14 @@ def run_premarket_scan():
     unless cache is exhausted.
     """
     global signal_cache, signal_cache_time, signal_cache_date, fund_cache
+
+    if api_credit_exhausted:
+        log.critical(
+            "🚨 Skipping pre-market scan — Anthropic API credit exhausted. "
+            "Cache will stay empty/stale until credit is restored and the next "
+            "scan window (or emergency rescan) runs. Check console.anthropic.com."
+        )
+        return
 
     now_et = datetime.now(ET)
     today  = now_et.strftime("%Y-%m-%d")
