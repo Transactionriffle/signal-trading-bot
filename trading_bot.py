@@ -100,6 +100,36 @@ STOP_LOSS       = -0.05    # -5%   hard stop (before breakeven activates)
 BREAKEVEN_TRIGGER = 0.01   # +1%   once hit, stop shifts to +0.5% (default / high-VIX)
 BREAKEVEN_STOP    = 0.005  # +0.5% minimum locked-in gain after breakeven (default / high-VIX)
 
+# ── Dynamic-width trailing stop (Aug 2026) ──────────────────────
+# Arms as soon as peak reaches +0.2%. The gap between peak and the
+# sell-floor is NOT constant — it widens as the peak grows, so small
+# moves get locked in tight (protect against noise) while genuine
+# runners (like MU's +19% day) get progressively more room to
+# breathe instead of being stopped out on the first 0.1% wobble.
+# Table is peak-threshold -> trail gap. Highest matching threshold
+# the peak has reached determines the active gap.
+MICRO_TRAIL_ARM_PCT = 0.002   # +0.2% peak required to arm the trail at all
+DYNAMIC_TRAIL_TABLE = [
+    # (peak_threshold, gap_below_peak)
+    (0.002,  0.001),   # peak +0.2%  → floor 0.1% behind   (tight — noise protection)
+    (0.02,   0.005),   # peak +2%    → floor 0.5% behind
+    (0.05,   0.015),   # peak +5%    → floor 1.5% behind
+    (0.10,   0.03),    # peak +10%   → floor 3.0% behind
+    (0.15,   0.05),    # peak +15%   → floor 5.0% behind   (room for a runner)
+]
+
+def get_dynamic_trail_gap(peak_pct: float) -> float:
+    """Returns the trail gap for the current peak — picks the gap
+    from the highest threshold in DYNAMIC_TRAIL_TABLE the peak has
+    reached. E.g. peak=+7% → uses the +5% row → gap=1.5%."""
+    gap = DYNAMIC_TRAIL_TABLE[0][1]
+    for threshold, table_gap in DYNAMIC_TRAIL_TABLE:
+        if peak_pct >= threshold:
+            gap = table_gap
+        else:
+            break
+    return gap
+
 # ── VIX-aware breakeven — calm markets need more room before locking in ──
 # Rationale: in a low-VIX (<18) tape, stocks oscillate ±1% on pure noise.
 # The tight 1%/0.5% breakeven was catching that noise and exiting winners
@@ -1770,14 +1800,23 @@ def run_risk_checks(account) -> tuple[bool, str]:
 def check_profit_targets(positions: dict) -> list[str]:
     """
     Exit rules — no Claude calls needed.
-    Four exit conditions:
-      1. Profit target +5%
-      2. Trailing protection: peak ≥ +3% → sell if falls to +2.5%
-      3. Breakeven stop: peak ≥ +1% → stop shifts to +0.5%
-      4. Hard stop loss: -5% (tightens to -2% in BEAR mode)
+    Priority order (first match wins):
+      1. Profit target (ATR-based, e.g. +5-12%)
+      2. Dynamic-width trail: peak ≥ +0.2% arms it. Gap between peak
+         and sell-floor widens as the peak grows (see DYNAMIC_TRAIL_TABLE):
+         tight (0.1%) near breakeven to protect against noise, wide
+         (up to 5%) at high peaks so a genuine runner (like MU's +19%
+         day) gets room to keep going instead of being stopped out on
+         the first small wobble.
+      3. Old fixed trailing: peak ≥ +3% → sell if falls to +2.5%
+         (kept as a fallback path; in practice #2 fires first since
+         it arms much earlier at +0.2%)
+      4. Breakeven stop: peak ≥ +1% (or +2% calm-VIX) → stop shifts
+         to +0.5% (or +1% calm-VIX)
+      5. Hard stop loss: composite-tiered -3%/-4%/-5% (-2% in BEAR mode)
     Plus:
-      5. Weak sector mid-day exit: if sector turns weak AND position
-         is at breakeven (+0.5%) or better → exit to protect gains.
+      6. Weak sector mid-day exit: if sector turns weak AND position
+         is at breakeven or better → exit to protect gains.
          If position is negative → hold (don't crystallise a loss).
     """
     closed      = []
@@ -1818,8 +1857,13 @@ def check_profit_targets(positions: dict) -> list[str]:
             if pnl_pct > prev_peak:
                 position_peaks[symbol] = pnl_pct
                 save_peaks()
-                if pnl_pct >= PEAK_TRIGGER:
-                    log.info(f"  {symbol}: new peak {pnl_pct*100:+.2f}% — trailing active")
+                if pnl_pct >= MICRO_TRAIL_ARM_PCT:
+                    gap   = get_dynamic_trail_gap(pnl_pct)
+                    floor = pnl_pct - gap
+                    log.info(
+                        f"  {symbol}: new peak {pnl_pct*100:+.2f}% — dynamic trail active, "
+                        f"gap {gap*100:.1f}%, floor {floor*100:+.2f}%"
+                    )
                 elif pnl_pct >= be_trigger:
                     log.info(
                         f"  {symbol}: new peak {pnl_pct*100:+.2f}% — breakeven stop active "
@@ -1837,8 +1881,16 @@ def check_profit_targets(positions: dict) -> list[str]:
             profit_target = position_peaks.get(f"{symbol}_target", PROFIT_TARGET)
 
             # ── Standard exit rules ────────────────────────────
+            # Priority order: profit target > micro-trail > old fixed trail >
+            # breakeven stop > hard stop loss
             if pnl_pct >= profit_target:
                 reason = f"PROFIT_TARGET ({profit_target*100:.1f}%)"
+            elif current_peak >= MICRO_TRAIL_ARM_PCT and pnl_pct <= (current_peak - get_dynamic_trail_gap(current_peak)):
+                gap = get_dynamic_trail_gap(current_peak)
+                reason = (
+                    f"DYNAMIC_TRAIL (peaked {current_peak*100:+.2f}%, "
+                    f"gap {gap*100:.1f}% behind peak)"
+                )
             elif current_peak >= PEAK_TRIGGER and pnl_pct <= TRAIL_SELL:
                 reason = f"TRAILING (peaked {current_peak*100:+.2f}%)"
             elif current_peak >= be_trigger and pnl_pct <= be_stop:
