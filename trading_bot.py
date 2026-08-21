@@ -1946,7 +1946,7 @@ def deploy_from_cache(positions: dict, account):
     """
     global signal_cache, last_rescan_time
 
-    KELLY_PCT   = 0.10
+    KELLY_PCT   = 0.10  # minimum-cash gate — aligned with new lowest tier (was 0.10, tiers now 10/13/16%)
     MAX_POS     = 10
     equity      = float(account.equity)
     cash        = float(account.regt_buying_power or account.cash)  # intraday buying power
@@ -2053,18 +2053,24 @@ def deploy_from_cache(positions: dict, account):
             log.info(f"  {symbol}: re-entry BLOCKED — {block_reason}")
             continue
 
-        # ── Confidence-based sizing (backtest validated: marginal improvement) ──
-        # High conviction (composite ≥ 6.0, confidence ≥ 90%) → 12% Kelly
-        # Normal (composite ≥ 4.5) → 10% Kelly
-        # Marginal (composite < 4.5) → 8% Kelly
+        # ── Confidence-based sizing (raised Aug 2026 — moderate increase) ──
+        # Previous tiers (8/10/12%) left ~80% of the account idle on most
+        # days (Aug 13-20 sample: only 2-3 positions open at a time out of
+        # a $103k account). Raising tiers increases capital utilisation per
+        # trade without changing which signals qualify or how fast the
+        # cache is exhausted — a separate lever (composite floor / cooldowns)
+        # from the idle-cash problem, addressed independently.
+        # High conviction (composite ≥ 6.0, confidence ≥ 90%) → 16% Kelly (was 12%)
+        # Normal (composite ≥ 4.5)                            → 13% Kelly (was 10%)
+        # Marginal (composite < 4.5)                          → 10% Kelly (was 8%)
         composite  = candidate.get("composite", 0)
         confidence = candidate.get("confidence", 85)
         if composite >= 6.0 and confidence >= 90:
-            kelly = 0.12
+            kelly = 0.16
         elif composite >= 4.5:
-            kelly = 0.10
+            kelly = 0.13
         else:
-            kelly = 0.08
+            kelly = 0.10
 
         alloc  = min(equity * kelly, cash * 0.95)
         qty    = int(alloc / live_price)
@@ -2118,7 +2124,7 @@ def run():
     log.info("SIGNAL Trading Bot started")
     log.info(f"  Universe:       36 curated + 15 dynamic = 51 max")
     log.info(f"  Scan timing:    Sun 8pm ET / Mon-Fri 9:20am ET (dynamic) + restart rescan")
-    log.info(f"  Position size:  Kelly 8-12% (confidence-based sizing)")
+    log.info(f"  Position size:  Kelly 10-16% (confidence-based sizing, raised Aug 2026)")
     log.info(f"  Profit target:  ATR×2.5 per position (3-12% range, fallback +5%)")
     log.info(f"  Sector cap:     Max 2 positions per sector (backtest validated)")
     log.info(f"  Re-entry rules: +5% exit → 4hr cooldown + 2% price gate")
