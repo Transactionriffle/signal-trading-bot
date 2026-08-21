@@ -204,7 +204,10 @@ CURATED_TICKERS = [
     "CRWD",   # $120B — cybersecurity market leader
     "SPOT",   # $80B — profitability inflection, subscriber growth
     # NFLX removed — Jun 15 trade hit -4%, weak signal (composite 2.50, min threshold)
-    "NUVL",   # $10B  — acquisition target, biotech catalyst
+    "CPRX",   # $10B  — Catalyst Pharmaceuticals, rare disease portfolio
+              #          (Firdapse, Agamree, Fycompa), +24% revenue YoY,
+              #          +45.9% EPS growth, profitable (not binary-catalyst
+              #          dependent like NUVL was) — replaces NUVL Aug 21 2026
     "DECK",   # $22B  — UGG/HOKA, consistent earnings beats (mid-cap)
     "IOT",    # $19B  — Samsara, Connected Operations platform, 30% ARR growth,
               #          3rd consecutive GAAP profitable quarter, composite 7.90 Jul 1
@@ -233,7 +236,7 @@ SECTOR_MAP: dict[str, str] = {
     "GS":"financials","BAC":"financials","MS":"financials","BLK":"financials",
     # Healthcare
     "LLY":"healthcare","UNH":"healthcare","ABBV":"healthcare",
-    "ISRG":"healthcare","NUVL":"healthcare",
+    "ISRG":"healthcare","CPRX":"healthcare",
     # Energy
     "XOM":"energy","CVX":"energy","COP":"energy","SLB":"energy",
     # Industrials
@@ -793,7 +796,7 @@ SECTOR_MAP = {
     "JPM":"financials","V":"financials","MA":"financials",
     "GS":"financials","BAC":"financials","BLK":"financials",
     "LLY":"healthcare","UNH":"healthcare","ABBV":"healthcare",
-    "ISRG":"healthcare","NUVL":"healthcare",
+    "ISRG":"healthcare","CPRX":"healthcare",
     "XOM":"energy","CVX":"energy","COP":"energy","SLB":"energy",
     "GEV":"industrials","CAT":"industrials","RTX":"industrials","HON":"industrials",
     "COST":"consumer","WMT":"consumer","MCD":"consumer","FDX":"consumer",
@@ -1737,6 +1740,23 @@ def place_buy(symbol: str, qty: int) -> bool:
         return True
     except Exception as e:
         log.error(f"Failed to buy {symbol}: {e}")
+        # ── Permanent failure detection ────────────────────────
+        # "asset is not active" (code 40010001) means the ticker is
+        # delisted/halted/suspended — retrying every 60s cycle forever
+        # wastes time and clutters logs (observed: NUVL retried 10+
+        # times across 10 minutes on Aug 21 before being caught here).
+        # Remove it from the cache immediately so it isn't retried
+        # again until the next pre-market scan re-evaluates it fresh.
+        err_str = str(e).lower()
+        if "not active" in err_str or "40010001" in err_str:
+            global signal_cache
+            before = len(signal_cache)
+            signal_cache = [s for s in signal_cache if s["symbol"] != symbol]
+            if len(signal_cache) < before:
+                log.warning(
+                    f"  {symbol}: asset not active — removed from cache "
+                    f"(will not retry until next scan)"
+                )
         return False
 
 # ══════════════════════════════════════════════════════════════
