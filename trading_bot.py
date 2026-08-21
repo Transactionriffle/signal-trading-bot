@@ -296,6 +296,45 @@ def is_likely_etf(symbol: str) -> bool:
         fund_cache[cache_key] = (time.time(), False)
         return False
 
+# Keywords/patterns identifying SPACs (blank-check acquisition companies).
+# Root cause Aug 21: RFAI/RFAIU (RF Acquisition Corp II) spiked +230-473%
+# on a merger-vote approval — a shell company with "no significant
+# operations" that still cleared the composite floor because its extreme
+# TA/momentum score outweighed near-zero fundamentals in the 40/60 blend.
+# This is a hard veto, independent of composite math — same category as
+# the ETF exclusion, for a different structurally-risky instrument type.
+SPAC_NAME_KEYWORDS = [
+    "acquisition corp", "acquisition corporation", "acquisition co",
+    "blank check", "spac", "special purpose acquisition",
+    "capital corp ii", "capital corp iii",  # common serial-SPAC-sponsor naming
+]
+
+def is_likely_spac(symbol: str) -> bool:
+    """
+    Detects SPACs / blank-check companies via Alpaca asset name lookup,
+    same mechanism as is_likely_etf(). SPACs have no operating business —
+    price action is driven entirely by merger-vote speculation, which can
+    produce an extreme TA/momentum score that masks near-zero fundamentals
+    in the composite blend. Hard veto: blocked regardless of composite score.
+    Result cached in fund_cache, same TTL pattern as the ETF check.
+    """
+    cache_key = f"spac_check_{symbol}"
+    if cache_key in fund_cache:
+        _, result = fund_cache[cache_key]
+        return result
+
+    try:
+        asset = trade_client.get_asset(symbol)
+        name  = (asset.name or "").lower()
+        is_spac = any(kw in name for kw in SPAC_NAME_KEYWORDS)
+        if is_spac:
+            log.warning(f"  {symbol}: identified as SPAC/blank-check company ('{asset.name}') — blocking")
+        fund_cache[cache_key] = (time.time(), is_spac)
+        return is_spac
+    except Exception:
+        fund_cache[cache_key] = (time.time(), False)
+        return False
+
 # ── Runtime state ──────────────────────────────────────────────
 trades_today:       dict[str, int]   = defaultdict(int)
 circuit_breaker:    bool             = False
@@ -1043,6 +1082,15 @@ def compute_signal(symbol: str, spy_chg: float = 0.0, prefetched_ta: dict | None
         ETF_EXCLUSIONS.add(symbol)  # add to exclusion list for this session
         return None
 
+    # SPAC / blank-check company check — hard veto, independent of composite
+    # score. Root cause Aug 21: RFAI (RF Acquisition Corp II) spiked
+    # +230-473% on a merger-vote approval and cleared the composite floor
+    # via an extreme TA score despite having "no significant operations" —
+    # cost a $712 realised loss on a ~2-minute round trip. This blocks the
+    # ticker before compute_signal ever runs TA/fundamentals on it.
+    if is_likely_spac(symbol):
+        return None
+
     # Use prefetched TA if provided (avoids double-fetching during pre-market scan)
     ta = prefetched_ta if prefetched_ta is not None else fetch_technicals(symbol)
 
@@ -1726,6 +1774,14 @@ def place_buy(symbol: str, qty: int) -> bool:
                     return False
         except Exception:
             pass  # if check fails, proceed cautiously
+
+        # ── Layer 3: SPAC guard (defense in depth) ────────────
+        # compute_signal() already blocks SPACs before scoring, but this
+        # catches any stale cache entry built before this fix deployed,
+        # or any path that bypasses compute_signal entirely.
+        if is_likely_spac(symbol):
+            log.warning(f"[SKIP] {symbol} is a SPAC/blank-check company — blocked at buy time")
+            return False
 
         order = MarketOrderRequest(
             symbol=symbol, qty=qty,
