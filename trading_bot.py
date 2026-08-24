@@ -1072,6 +1072,71 @@ def check_earnings_proximity(symbol: str, today: str) -> tuple[bool, str]:
         log.warning(f"Earnings check failed for {symbol}: {e}")
         return False, ""
 
+def check_structural_risk(symbol: str, today: str) -> tuple[bool, str]:
+    """
+    Generalized hard-veto check: does this instrument have a structural
+    reason its price may not reflect normal business fundamentals?
+
+    Root cause Aug 21: RFAI/RFAIU (a SPAC) spiked +230-473% on a merger
+    vote and cost a combined -$4,788 realised loss because its extreme
+    TA/momentum score outweighed near-zero fundamentals in the composite
+    blend. The SPAC name-check (is_likely_spac) fixed that ONE case, but
+    the same failure mode applies to a wider category: any instrument
+    where price action is decoupled from normal operating fundamentals
+    (recent IPO with thin float, pending/announced M&A trading on deal
+    odds, reverse stock split, recently halted, SPAC unit/right/warrant,
+    thinly-traded ADR). Rather than add a new special-case filter each
+    time one of these bites, this asks Claude directly and treats any
+    "yes" as a hard veto — independent of composite score, same pattern
+    as check_earnings_proximity but for structural rather than timing risk.
+
+    Returns (has_structural_risk, reason).
+    Cached 24h per symbol — same TTL as the earnings check.
+    """
+    cache_key = f"structural_risk_{symbol}"
+    if cache_key in fund_cache:
+        cached_time, cached_result = fund_cache[cache_key]
+        if time.time() - cached_time < 86400:
+            return cached_result
+
+    try:
+        prompt = (
+            f"For the stock ticker {symbol} as of {today}, is there any structural "
+            "reason its current price may NOT reflect normal business fundamentals? "
+            "Specifically check: (1) is it a SPAC, blank-check company, or a SPAC "
+            "unit/right/warrant; (2) did it IPO within the last 180 days with a very "
+            "small public float; (3) is it currently the target of an announced-but-"
+            "not-closed M&A deal, trading on deal-completion odds rather than "
+            "fundamentals; (4) did it recently do a reverse stock split; (5) was "
+            "trading recently halted for volatility (LULD circuit breaker); (6) is it "
+            "a thinly-traded foreign ADR with very low US daily volume. "
+            'Return ONLY this JSON with NO other text: '
+            '{"structural_risk":false,"reason":""} '
+            "Set structural_risk to true if ANY of the above applies, and give a "
+            "short reason (under 10 words)."
+        )
+        response = safe_claude_call(
+            model="claude-sonnet-4-5",
+            max_tokens=80,
+            tools=[{"type": "web_search_20250305", "name": "web_search"}],
+            messages=[{"role": "user", "content": prompt}],
+        )
+        text = next((b.text for b in response.content if hasattr(b, "text")), "")
+        si, ei = text.find("{"), text.rfind("}")
+        if si == -1:
+            fund_cache[cache_key] = (time.time(), (False, ""))
+            return False, ""
+        result = json.loads(text[si:ei+1])
+        has_risk = bool(result.get("structural_risk", False))
+        reason   = result.get("reason") or ""
+        if has_risk:
+            log.warning(f"  {symbol}: structural risk flagged — {reason} — blocking")
+        fund_cache[cache_key] = (time.time(), (has_risk, reason))
+        return has_risk, reason
+    except Exception as e:
+        log.warning(f"Structural risk check failed for {symbol}: {e}")
+        return False, ""
+
 def compute_signal(symbol: str, spy_chg: float = 0.0, prefetched_ta: dict | None = None) -> dict | None:
     # Skip known ETFs
     if symbol in ETF_EXCLUSIONS:
@@ -1089,6 +1154,16 @@ def compute_signal(symbol: str, spy_chg: float = 0.0, prefetched_ta: dict | None
     # cost a $712 realised loss on a ~2-minute round trip. This blocks the
     # ticker before compute_signal ever runs TA/fundamentals on it.
     if is_likely_spac(symbol):
+        return None
+
+    # Generalized structural risk check — catches the WIDER category the
+    # SPAC check only partially covers (recent IPO/thin float, pending M&A
+    # deal-odds pricing, reverse split, recent volatility halt, thinly-
+    # traded ADR, SPAC units/rights/warrants the name-check might miss).
+    # One Claude call, cached 24h, same cost profile as the earnings check.
+    today_str = datetime.now(ET).strftime("%Y-%m-%d")
+    has_structural_risk, risk_reason = check_structural_risk(symbol, today_str)
+    if has_structural_risk:
         return None
 
     # Use prefetched TA if provided (avoids double-fetching during pre-market scan)
@@ -1755,7 +1830,7 @@ def close_position(symbol: str, pnl_pct: float = 0.0, exit_reason: str = "") -> 
         log.error(f"Failed to close {symbol}: {e}")
         return False
 
-def place_buy(symbol: str, qty: int) -> bool:
+def place_buy(symbol: str, qty: int, composite: float | None = None) -> bool:
     try:
         # ── Layer 1: Duplicate position guard ─────────────────
         # Prevents buying a ticker already held (NVDA ×3 bug Jun 23)
@@ -1783,11 +1858,41 @@ def place_buy(symbol: str, qty: int) -> bool:
             log.warning(f"[SKIP] {symbol} is a SPAC/blank-check company — blocked at buy time")
             return False
 
+        # ── Layer 4: Structural risk guard (cache-only, no extra API call) ──
+        # compute_signal() already ran check_structural_risk() this scan
+        # cycle and cached the result (24h TTL) — re-check the cache here
+        # as a defense-in-depth backstop without paying for a second
+        # Claude+web-search call per trade.
+        cached = fund_cache.get(f"structural_risk_{symbol}")
+        if cached and cached[1][0]:
+            log.warning(f"[SKIP] {symbol} structural risk ({cached[1][1]}) — blocked at buy time")
+            return False
+
+        # ── Durable composite storage (Aug 24 fix) ──────────────
+        # Root cause: NVDA (bought Aug 20) had its entry_composite lost
+        # when the bot redeployed 3+ times before it was sold Aug 24 —
+        # entry_signals lives in /tmp, which is wiped on every Render
+        # redeploy (new container). The stop-loss tiering silently fell
+        # back to the loosest -5% stop with no entry data, and NVDA rode
+        # the full -5.03% instead of the -3%/-4% its actual composite
+        # score should have used.
+        #
+        # Fix: encode the composite score into Alpaca's own
+        # client_order_id field. This is stored in Alpaca's database,
+        # not the bot's filesystem — it survives every redeploy because
+        # it never lives in the container at all. Format: "c{composite}"
+        # e.g. composite 5.40 -> "c540" (2 decimal places, dot removed,
+        # kept short since client_order_id has a 128-char limit).
+        client_id = None
+        if composite is not None:
+            client_id = f"c{round(composite*100):04d}_{int(time.time())}"[:48]
+
         order = MarketOrderRequest(
             symbol=symbol, qty=qty,
             side=OrderSide.BUY,
             time_in_force=TimeInForce.DAY,
             position_intent="buy_to_open",   # explicitly prevents short sell execution
+            client_order_id=client_id,
         )
         trade_client.submit_order(order)
         today_key = datetime.now(ET).strftime("%Y-%m-%d")
@@ -1873,6 +1978,49 @@ def run_risk_checks(account) -> tuple[bool, str]:
 # POSITION MONITORING
 # ══════════════════════════════════════════════════════════════
 
+def get_durable_composite(symbol: str) -> float | None:
+    """
+    Recovers a position's entry composite score from Alpaca's own order
+    history via client_order_id, when the /tmp-based entry_signals cache
+    has lost it (e.g. after a Render redeploy — see place_buy() for the
+    full root-cause writeup). This is the durable fallback: Alpaca's
+    order database survives every bot redeploy since it's never stored
+    in the container's filesystem at all.
+
+    Looks up the most recent FILLED buy order for this symbol and
+    decodes the composite from its client_order_id (format: "cNNNN_ts").
+    Returns None if no matching order is found or decoding fails —
+    callers should then fall back to the flat base stop, same as before.
+    """
+    cache_key = f"durable_composite_{symbol}"
+    if cache_key in fund_cache:
+        cached_time, cached_result = fund_cache[cache_key]
+        if time.time() - cached_time < 3600:  # 1hr cache — avoid hammering the orders API
+            return cached_result
+
+    try:
+        orders = trade_client.get_orders()  # fetch recent orders, filter client-side below
+        matching = [
+            o for o in orders
+            if o.symbol == symbol and o.side.value == "buy"
+            and str(o.status).lower() in ("filled", "orderstatus.filled")
+            and o.client_order_id and o.client_order_id.startswith("c")
+        ]
+        if not matching:
+            fund_cache[cache_key] = (time.time(), None)
+            return None
+        # Most recent matching buy order
+        matching.sort(key=lambda o: o.submitted_at or o.created_at, reverse=True)
+        client_id = matching[0].client_order_id
+        composite_part = client_id.split("_")[0][1:]  # strip leading "c"
+        composite = int(composite_part) / 100
+        fund_cache[cache_key] = (time.time(), composite)
+        return composite
+    except Exception as e:
+        log.warning(f"Durable composite lookup failed for {symbol}: {e}")
+        fund_cache[cache_key] = (time.time(), None)
+        return None
+
 def check_profit_targets(positions: dict) -> list[str]:
     """
     Exit rules — no Claude calls needed.
@@ -1917,7 +2065,18 @@ def check_profit_targets(positions: dict) -> list[str]:
             # shouldn't be given as much rope. High-conviction entries (which
             # should also be sized larger via Kelly) get the full -5% to let
             # the thesis play out. BEAR mode's -2% ceiling always wins (tightest).
+            #
+            # Aug 24 fix: entry_signals (/tmp-backed) is lost on every Render
+            # redeploy — this caused NVDA to silently fall back to the flat
+            # -5% stop instead of its actual tier, riding the full loss
+            # before exiting. Now falls back to get_durable_composite()
+            # (reads Alpaca's own order history via client_order_id) before
+            # giving up and using the flat stop.
             entry_composite = entry_signals.get(symbol, {}).get("composite")
+            if entry_composite is None:
+                entry_composite = get_durable_composite(symbol)
+                if entry_composite is not None:
+                    log.info(f"  {symbol}: entry composite recovered from order history ({entry_composite:.2f}) — /tmp cache was empty")
             if entry_composite is not None and market_state != "BEAR":
                 if entry_composite < 4.5:
                     active_stop = -0.03      # marginal entry (4.0-4.5) → tighter -3%
@@ -1926,7 +2085,7 @@ def check_profit_targets(positions: dict) -> list[str]:
                 else:
                     active_stop = base_stop  # high conviction (6.0+)  → full -5%
             else:
-                active_stop = base_stop      # no entry data (legacy position) or BEAR mode
+                active_stop = base_stop      # no entry data anywhere, or BEAR mode
 
             # Update peak
             prev_peak = position_peaks.get(symbol, 0.0)
@@ -2180,7 +2339,7 @@ def deploy_from_cache(positions: dict, account):
         }
         save_entry_signals()
 
-        if place_buy(symbol, qty):
+        if place_buy(symbol, qty, composite=composite):
             cash -= qty * live_price
             if sector:
                 sector_counts[sector] = sector_counts.get(sector, 0) + 1  # same-cycle cap tracking
