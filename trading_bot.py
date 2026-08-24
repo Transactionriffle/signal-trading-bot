@@ -2219,13 +2219,28 @@ def deploy_from_cache(positions: dict, account):
             spy_chg = get_quote_change("SPY") or 0.0
             universe = build_universe()
             new_signals = []
+            skipped_ta  = 0
             for symbol in universe:
                 if symbol in positions:
                     continue
-                result = compute_signal(symbol, spy_chg)
+                # ── TA pre-filter (Aug 24 fix) ─────────────────
+                # The emergency rescan was missing the same TA pre-filter
+                # the pre-market scan uses — calling Claude on every ticker
+                # in the universe unconditionally. Observed Aug 24: this
+                # took 7+ minutes mid-session (19:47:44 → 19:54:59) scoring
+                # ~40 tickers sequentially with no skip, well over the
+                # ~4min the optimised pre-market scan takes. Same fix:
+                # fetch cheap TA first, skip the paid Claude call entirely
+                # if taScore < 1.5 (clearly bearish / no signal).
+                ta = fetch_technicals(symbol)
+                if ta and ta.get("taScore", 0) < 1.5:
+                    skipped_ta += 1
+                    continue  # no sleep needed — skipping Claude call
+                result = compute_signal(symbol, spy_chg, prefetched_ta=ta)
                 if result and result["signal"] == "BUY" and result["confidence"] >= MIN_CONFIDENCE and result["composite"] >= MIN_COMPOSITE:
                     new_signals.append(result)
                 time.sleep(3)
+            log.info(f"Emergency rescan: {skipped_ta} tickers skipped on weak TA, {len(new_signals)} signal(s) found")
             signal_cache = sorted(new_signals, key=lambda x: x["confidence"], reverse=True)
             available    = signal_cache
         else:
