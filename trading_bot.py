@@ -346,6 +346,17 @@ fear_active:        bool             = False
 weak_sectors:       set              = set()
 spy_change:         float            = 0.0
 current_vix:        float | None     = None   # latest VIX reading — used for VIX-aware breakeven stop
+systemic_derisk_active: bool         = False  # True when VIX severely elevated + multiple sectors weak at once
+
+# ── Systemic de-risk thresholds ──────────────────────────────────
+SYSTEMIC_DERISK_VIX              = 28   # VIX level considered "severe", above the existing FEAR_VIX=25
+SYSTEMIC_DERISK_MIN_WEAK_SECTORS = 3    # 3+ simultaneously weak sectors = broad event, not rotation
+SYSTEMIC_DERISK_MAX_LOSS_EXIT    = -0.02  # during systemic de-risk, allow weak-sector exit up to -2% loss
+                                           # (still well inside the -3%/-4%/-5% composite-tiered hard stop,
+                                           # so this only ever exits EARLIER/SMALLER than the hard stop would)
+GAP_RISK_THRESHOLD = -0.06  # -6% — beyond any composite-tiered stop (max -5%), signals a genuine
+                             # overnight gap rather than a gradual intraday move the normal stop
+                             # logic is designed for. Priority exit, checked before peak/stop logic.
 fund_cache:         dict             = {}        # {symbol: (timestamp, result)}
 signal_cache:       list             = []        # ranked BUY signals from pre-market scan
 signal_cache_time:  float            = 0.0       # when cache was built
@@ -733,10 +744,17 @@ def analyse_signal_attribution():
 
 def run_90_day_audit():
     """
-    Audits curated tickers every 90 days against three criteria:
+    Audits curated tickers every 90 days against four criteria:
     1. Volume & Liquidity — has institutional volume dropped?
     2. Strategy Alignment — does stock still respect TA setups?
     3. Personal Performance — negative win rate over last 90 days?
+    4. Universe-level AI concentration — has the curated list itself
+       drifted toward over-concentration in AI-correlated sectors?
+       (Added Aug 2026 alongside the live AI-correlated position cap —
+       that cap limits how many AI-correlated positions can be HELD at
+       once, but doesn't address the curated LIST itself skewing further
+       AI-heavy over time as tickers get added. This is the periodic
+       check on the universe design, not the runtime position count.)
     """
     journal  = load_journal()
     cutoff   = datetime.now(ET) - timedelta(days=90)
@@ -781,6 +799,23 @@ def run_90_day_audit():
             log.warning(f"  ⚠️  {symbol}: {' | '.join(issues)}")
         else:
             log.info(f"  ✅ {symbol}: passes all criteria")
+
+    # ── Criterion 4: Universe-level AI concentration ────────────
+    ai_count    = sum(1 for s in CURATED_TICKERS if SECTOR_MAP.get(s) in AI_CORRELATED_SECTORS)
+    total_count = len(CURATED_TICKERS)
+    ai_share    = ai_count / total_count if total_count else 0
+    log.info("-" * 60)
+    log.info(f"UNIVERSE COMPOSITION: {ai_count}/{total_count} curated tickers "
+             f"({ai_share*100:.0f}%) are AI-correlated (semis/tech/software/cyber)")
+    if ai_share > UNIVERSE_AI_SHARE_WARN:
+        log.warning(
+            f"⚠️  Curated universe is {ai_share*100:.0f}% AI-correlated — above the "
+            f"{UNIVERSE_AI_SHARE_WARN*100:.0f}% review threshold. The live "
+            f"MAX_AI_CORRELATED_POSITIONS cap limits concurrent exposure, but a "
+            f"universe this skewed means most signals scored highly will be in this "
+            f"bucket, making the cap bind often. Consider adding non-AI-correlated "
+            f"tickers to CURATED_TICKERS to give the scanner more to choose from."
+        )
 
     log.info("=" * 60)
     if flagged:
@@ -841,6 +876,27 @@ SECTOR_MAP = {
     "COST":"consumer","WMT":"consumer","MCD":"consumer","FDX":"consumer",
     "DECK":"consumer","SPOT":"media","NFLX":"media","UBER":"consumer",
 }
+
+# ── AI-correlated concentration cap (Aug 2026) ──────────────────
+# The per-sector cap (2 max) treats "semis", "tech", "software", "cyber"
+# as independent buckets — but in a genuine AI-sector selloff these move
+# in near-lockstep (NVDA, MSFT, PLTR, CRWD are all "the AI trade" despite
+# different sector labels). A bot could hold 2 semis + 2 tech + 2 software
+# + 2 cyber = 8 of 10 positions all riding the same underlying bet with
+# no guardrail noticing, because each individual sector count looks fine.
+# This is a SEPARATE, stricter cap layered on top of the per-sector one.
+AI_CORRELATED_SECTORS  = {"semis", "tech", "software", "cyber"}
+MAX_AI_CORRELATED_POSITIONS = 4  # combined cap across all AI-correlated sectors
+UNIVERSE_AI_SHARE_WARN = 0.45    # if 45%+ of the curated LIST is AI-correlated,
+                                  # flag it in the 90-day audit for manual review
+
+def count_ai_correlated_positions(positions_or_symbols) -> int:
+    """Counts how many current positions fall in an AI-correlated sector,
+    regardless of which specific sector label they carry."""
+    return sum(
+        1 for s in positions_or_symbols
+        if SECTOR_MAP.get(s) in AI_CORRELATED_SECTORS
+    )
 
 # ── Alpaca client ──────────────────────────────────────────────
 trade_client = TradingClient(
@@ -968,6 +1024,28 @@ def assess_market_state():
         if chg is not None and chg <= SECTOR_WEAK:
             weak_sectors.add(sector)
             log.info(f"  Weak sector: {sector.upper()} ({etf} {chg*100:.2f}%) — avoiding")
+
+    # ── Systemic de-risking (Aug 2026) ──────────────────────────
+    # VIX≥25 + normal sector cap alone doesn't distinguish "one sector
+    # rotating out" from "everything crashing together" (e.g. an AI-bubble
+    # burst hitting semis+tech+software+cyber+consumer simultaneously).
+    # If VIX is severely elevated AND 3+ sectors are weak at once, this is
+    # a systemic event, not a rotation — force-reduce exposure regardless
+    # of individual stop levels rather than waiting for each position's
+    # own stop to fire one at a time.
+    global systemic_derisk_active
+    systemic_derisk_active = (
+        current_vix is not None
+        and current_vix >= SYSTEMIC_DERISK_VIX
+        and len(weak_sectors) >= SYSTEMIC_DERISK_MIN_WEAK_SECTORS
+    )
+    if systemic_derisk_active:
+        log.critical(
+            f"🚨 SYSTEMIC DE-RISK ACTIVE — VIX {current_vix:.1f} + "
+            f"{len(weak_sectors)} sectors weak simultaneously ({', '.join(weak_sectors)}). "
+            f"Treating as broad market event, not sector rotation. "
+            f"New buys blocked; existing positions' exits will run more aggressively."
+        )
 
     log.info(f"Market state: {market_state} | Fear: {fear_active} | Weak sectors: {weak_sectors or 'none'}")
 
@@ -2057,6 +2135,35 @@ def check_profit_targets(positions: dict) -> list[str]:
         try:
             pnl_pct = float(pos.unrealized_plpc)
 
+            # ── Overnight gap-risk check (Aug 2026) ────────────
+            # All the exit logic below runs on a 60s polling loop DURING
+            # market hours — it has no way to react to bad news that broke
+            # overnight until the market reopens, by which point a position
+            # already gapped down hard could blow straight through the
+            # composite-tiered stop before the bot's first check even runs.
+            # unrealized_intraday_plpc is Alpaca's own "move since yesterday's
+            # close" figure — if a position gapped down more than
+            # GAP_RISK_THRESHOLD before this cycle's first look at it, treat
+            # it as a priority exit rather than waiting for the position's
+            # peak-tracking/stop-tier logic (which assumes gradual moves).
+            try:
+                intraday_pct = float(pos.unrealized_intraday_plpc)
+            except (AttributeError, TypeError, ValueError):
+                intraday_pct = None
+
+            if intraday_pct is not None and intraday_pct <= GAP_RISK_THRESHOLD:
+                gap_reason = (
+                    f"GAP_RISK (overnight/intraday move {intraday_pct*100:+.2f}% "
+                    f"beyond {GAP_RISK_THRESHOLD*100:.0f}% threshold — priority exit)"
+                )
+                if close_position(symbol, pnl_pct, gap_reason):
+                    closed.append(symbol)
+                    position_peaks.pop(symbol, None)
+                    save_peaks()
+                    global signal_cache
+                    signal_cache = [s for s in signal_cache if s["symbol"] != symbol]
+                continue  # skip the rest of this position's normal exit checks — already handled
+
             # ── Composite-aware stop loss ──────────────────────
             # Jul 29 review: realised wins clustered at +0.3-0.5% against a
             # flat -5% stop — that ratio needs ~93% win rate to break even.
@@ -2137,8 +2244,19 @@ def check_profit_targets(positions: dict) -> list[str]:
                 reason = f"STOP_LOSS ({active_stop*100:.0f}%{' composite-tiered' if entry_composite is not None else ''})"
 
             # ── Weak sector mid-day exit ───────────────────────
-            # Only exit if position is at breakeven or better (VIX-aware threshold)
-            # Never crystallise a loss due to sector rotation
+            # Normally only exits at breakeven or better — never crystallise
+            # a loss due to ordinary sector rotation (a single sector dipping
+            # is common and often reverses).
+            #
+            # EXCEPTION (Aug 2026): during a systemic de-risk event (severe
+            # VIX + 3+ sectors weak simultaneously — see assess_market_state),
+            # this is not rotation, it's a broad selloff. Waiting for each
+            # position's own composite-tiered hard stop (-3% to -5%) to fire
+            # one at a time means riding the full stop distance on every
+            # position during exactly the scenario where speed matters most.
+            # In that mode, allow exiting a small loss (bounded by
+            # SYSTEMIC_DERISK_MAX_LOSS_EXIT) rather than holding for the
+            # full stop distance.
             if not reason and weak_sectors:
                 sector = SECTOR_MAP.get(symbol)
                 if sector and sector in weak_sectors:
@@ -2146,6 +2264,12 @@ def check_profit_targets(positions: dict) -> list[str]:
                         reason = (
                             f"WEAK_SECTOR ({sector.upper()} weak, "
                             f"P&L {pnl_pct*100:+.2f}% ≥ +{be_stop*100:.1f}% — exiting)"
+                        )
+                    elif systemic_derisk_active and pnl_pct >= SYSTEMIC_DERISK_MAX_LOSS_EXIT:
+                        reason = (
+                            f"WEAK_SECTOR_SYSTEMIC ({sector.upper()} weak during systemic "
+                            f"de-risk, P&L {pnl_pct*100:+.2f}% — exiting early rather than "
+                            f"riding to full stop distance)"
                         )
                     else:
                         log.info(
@@ -2197,6 +2321,10 @@ def deploy_from_cache(positions: dict, account):
 
     if market_state == "BEAR":
         log.warning("BEAR MODE — no new positions")
+        return
+
+    if systemic_derisk_active:
+        log.warning("SYSTEMIC DE-RISK ACTIVE — no new positions until conditions normalise")
         return
 
     # Use cached signals — deduplicated by symbol, no Claude calls
@@ -2258,6 +2386,9 @@ def deploy_from_cache(positions: dict, account):
         if sec:
             sector_counts[sec] = sector_counts.get(sec, 0) + 1
 
+    # AI-correlated count tracked the same way, across the whole loop
+    ai_correlated_count = count_ai_correlated_positions(positions.keys())
+
     for candidate in to_buy:
         symbol = candidate["symbol"]
         price  = candidate["price"]
@@ -2275,6 +2406,20 @@ def deploy_from_cache(positions: dict, account):
                 log.info(
                     f"  {symbol}: sector '{sector}' capped — "
                     f"{sector_count}/{MAX_SECTOR_POSITIONS} positions held — skipping"
+                )
+                continue
+
+        # ── AI-correlated concentration cap ─────────────────────
+        # Separate, stricter cap spanning semis/tech/software/cyber
+        # combined. Prevents e.g. 2 semis + 2 tech + 2 software all
+        # being "the AI trade" under different sector labels while
+        # each individual sector count looks compliant.
+        if sector in AI_CORRELATED_SECTORS:
+            if ai_correlated_count >= MAX_AI_CORRELATED_POSITIONS:
+                log.info(
+                    f"  {symbol}: AI-correlated concentration capped — "
+                    f"{ai_correlated_count}/{MAX_AI_CORRELATED_POSITIONS} positions "
+                    f"already in semis/tech/software/cyber — skipping"
                 )
                 continue
 
@@ -2358,6 +2503,8 @@ def deploy_from_cache(positions: dict, account):
             cash -= qty * live_price
             if sector:
                 sector_counts[sector] = sector_counts.get(sector, 0) + 1  # same-cycle cap tracking
+                if sector in AI_CORRELATED_SECTORS:
+                    ai_correlated_count += 1  # same-cycle AI-correlated cap tracking
 
 # ══════════════════════════════════════════════════════════════
 # MAIN LOOP
@@ -2377,6 +2524,9 @@ def run():
     log.info(f"  Position size:  Kelly 10-16% (confidence-based sizing, raised Aug 2026)")
     log.info(f"  Profit target:  ATR×2.5 per position (3-12% range, fallback +5%)")
     log.info(f"  Sector cap:     Max 2 positions per sector (backtest validated)")
+    log.info(f"  AI concentration cap: Max {MAX_AI_CORRELATED_POSITIONS} combined across semis/tech/software/cyber")
+    log.info(f"  Systemic de-risk: VIX≥{SYSTEMIC_DERISK_VIX} + {SYSTEMIC_DERISK_MIN_WEAK_SECTORS}+ weak sectors → blocks new buys, allows early loss-cutting")
+    log.info(f"  Gap-risk exit:  overnight/intraday move beyond {GAP_RISK_THRESHOLD*100:.0f}% → priority exit")
     log.info(f"  Re-entry rules: +5% exit → 4hr cooldown + 2% price gate")
     log.info(f"                  -5% stop → 24hr cooldown + 2% price gate")
     log.info(f"  Max positions:  10 concurrent")
