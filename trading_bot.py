@@ -2123,6 +2123,12 @@ def check_profit_targets(positions: dict) -> list[str]:
     """
     closed      = []
     base_stop   = get_stop_loss()   # -5% normal, -2% in BEAR mode — the ceiling
+    global signal_cache  # declared once here — was previously declared twice, nested
+                          # inside conditional blocks below, which is a SyntaxError in
+                          # Python if any use of the name in this scope could precede a
+                          # later 'global' statement. Aug 31 production crash: bot failed
+                          # to start at all with "name 'signal_cache' is used prior to
+                          # global declaration" — single declaration at top fixes this.
 
     # ── VIX-aware breakeven thresholds ─────────────────────────
     # Calm market (VIX < 18): widen the breakeven band so normal
@@ -2160,7 +2166,6 @@ def check_profit_targets(positions: dict) -> list[str]:
                     closed.append(symbol)
                     position_peaks.pop(symbol, None)
                     save_peaks()
-                    global signal_cache
                     signal_cache = [s for s in signal_cache if s["symbol"] != symbol]
                 continue  # skip the rest of this position's normal exit checks — already handled
 
@@ -2283,7 +2288,6 @@ def check_profit_targets(positions: dict) -> list[str]:
                     position_peaks.pop(symbol, None)
                     save_peaks()
                     # Remove from signal cache so it's not immediately re-bought
-                    global signal_cache
                     signal_cache = [s for s in signal_cache if s["symbol"] != symbol]
             else:
                 peak_str = f" (peak: {current_peak*100:+.2f}%)" if current_peak >= PEAK_TRIGGER else ""
