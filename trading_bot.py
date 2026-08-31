@@ -354,9 +354,11 @@ SYSTEMIC_DERISK_MIN_WEAK_SECTORS = 3    # 3+ simultaneously weak sectors = broad
 SYSTEMIC_DERISK_MAX_LOSS_EXIT    = -0.02  # during systemic de-risk, allow weak-sector exit up to -2% loss
                                            # (still well inside the -3%/-4%/-5% composite-tiered hard stop,
                                            # so this only ever exits EARLIER/SMALLER than the hard stop would)
-GAP_RISK_THRESHOLD = -0.06  # -6% — beyond any composite-tiered stop (max -5%), signals a genuine
-                             # overnight gap rather than a gradual intraday move the normal stop
-                             # logic is designed for. Priority exit, checked before peak/stop logic.
+# GAP_RISK_THRESHOLD removed Aug 31 — the check could not fire until market
+# open regardless (no code runs while market is closed), so it never had
+# any head start over the ordinary composite-tiered stop loss, which would
+# catch the same overnight gap on the exact same first post-open price tick.
+# Redundant complexity with no genuine protective value; removed.
 fund_cache:         dict             = {}        # {symbol: (timestamp, result)}
 signal_cache:       list             = []        # ranked BUY signals from pre-market scan
 signal_cache_time:  float            = 0.0       # when cache was built
@@ -2141,34 +2143,6 @@ def check_profit_targets(positions: dict) -> list[str]:
         try:
             pnl_pct = float(pos.unrealized_plpc)
 
-            # ── Overnight gap-risk check (Aug 2026) ────────────
-            # All the exit logic below runs on a 60s polling loop DURING
-            # market hours — it has no way to react to bad news that broke
-            # overnight until the market reopens, by which point a position
-            # already gapped down hard could blow straight through the
-            # composite-tiered stop before the bot's first check even runs.
-            # unrealized_intraday_plpc is Alpaca's own "move since yesterday's
-            # close" figure — if a position gapped down more than
-            # GAP_RISK_THRESHOLD before this cycle's first look at it, treat
-            # it as a priority exit rather than waiting for the position's
-            # peak-tracking/stop-tier logic (which assumes gradual moves).
-            try:
-                intraday_pct = float(pos.unrealized_intraday_plpc)
-            except (AttributeError, TypeError, ValueError):
-                intraday_pct = None
-
-            if intraday_pct is not None and intraday_pct <= GAP_RISK_THRESHOLD:
-                gap_reason = (
-                    f"GAP_RISK (overnight/intraday move {intraday_pct*100:+.2f}% "
-                    f"beyond {GAP_RISK_THRESHOLD*100:.0f}% threshold — priority exit)"
-                )
-                if close_position(symbol, pnl_pct, gap_reason):
-                    closed.append(symbol)
-                    position_peaks.pop(symbol, None)
-                    save_peaks()
-                    signal_cache = [s for s in signal_cache if s["symbol"] != symbol]
-                continue  # skip the rest of this position's normal exit checks — already handled
-
             # ── Composite-aware stop loss ──────────────────────
             # Jul 29 review: realised wins clustered at +0.3-0.5% against a
             # flat -5% stop — that ratio needs ~93% win rate to break even.
@@ -2530,7 +2504,6 @@ def run():
     log.info(f"  Sector cap:     Max 2 positions per sector (backtest validated)")
     log.info(f"  AI concentration cap: Max {MAX_AI_CORRELATED_POSITIONS} combined across semis/tech/software/cyber")
     log.info(f"  Systemic de-risk: VIX≥{SYSTEMIC_DERISK_VIX} + {SYSTEMIC_DERISK_MIN_WEAK_SECTORS}+ weak sectors → blocks new buys, allows early loss-cutting")
-    log.info(f"  Gap-risk exit:  overnight/intraday move beyond {GAP_RISK_THRESHOLD*100:.0f}% → priority exit")
     log.info(f"  Re-entry rules: +5% exit → 4hr cooldown + 2% price gate")
     log.info(f"                  -5% stop → 24hr cooldown + 2% price gate")
     log.info(f"  Max positions:  10 concurrent")
