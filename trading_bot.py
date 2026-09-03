@@ -393,6 +393,9 @@ PRICE_GATE_PCT       = 0.02    # must pull back 2% from exit price to re-enter
 # ── News WebSocket state ───────────────────────────────────────
 news_triggered:     dict[str, float] = {}        # {symbol: timestamp} — news-triggered tickers
 news_queue:         list             = []         # pending news signals to process
+held_symbols:       set              = set()       # currently-held position symbols, refreshed each
+                                                     # main-loop cycle — lets the WebSocket thread check
+                                                     # "is this ticker held?" without an API call per message
 NEWS_COOLDOWN       = 3600                        # 1 hour before same ticker triggers again
 
 # High-value news keywords that warrant immediate signal scoring
@@ -412,6 +415,42 @@ NEWS_BEARISH_KEYWORDS = [
     "recall", "safety concern",                    # product issues
     "downgrade", "underperform", "sell rating",   # analyst downgrades
 ]
+
+# ── Material adverse event tier (Sep 2026) ──────────────────────
+# Root cause: AMZN was hit with an FTC + 22-state lawsuit alleging
+# $20B+ in deceptive ad-auction pricing (Aug 31 2026) while HELD in
+# the portfolio. The news WAS correctly classified BEARISH via the
+# "lawsuit" keyword above, but process_news_queue() discarded it on
+# sight because the ticker was already in positions — the news
+# pipeline only ever triggered NEW buys, never reviewed EXISTING
+# holdings. Separately, PLTR lost -5.92% overnight to a Google
+# DeepMind product launch that was reported same-day in mainstream
+# press but never reached the bot at all, since it wasn't phrased as
+# any of the keywords above.
+#
+# This tier identifies events severe enough to warrant treating a
+# HELD position's bearish news differently from routine sentiment —
+# regulatory/legal action, credible new competitive threats, and
+# executive-level shocks. It does not replace NEWS_BEARISH_KEYWORDS;
+# it's checked in addition, to flag which bearish items should
+# trigger an immediate re-evaluation of an existing position rather
+# than just being logged.
+NEWS_MATERIAL_ADVERSE_KEYWORDS = [
+    "ftc sues", "ftc lawsuit", "antitrust", "doj sues",           # regulatory/legal
+    "state attorneys general", "class action", "sec charges",
+    "sec investigation", "criminal probe", "subpoena",
+    "competing product", "competitor launch", "rival launches",   # competitive threats
+    "unveiled", "enters the market", "encroach",
+    "ceo resigns", "ceo steps down", "cfo resigns",               # leadership shocks
+    "resigns amid", "fired amid", "ousted",
+    "data breach", "hack", "cyberattack",                         # security incidents
+    "halted trading", "trading suspended",                        # exchange actions
+]
+
+def is_material_adverse(headline: str, summary: str) -> bool:
+    text = (headline + " " + summary).lower()
+    return any(kw in text for kw in NEWS_MATERIAL_ADVERSE_KEYWORDS)
+
 
 PEAKS_FILE   = "/tmp/position_peaks.json"
 JOURNAL_FILE = "/tmp/trade_journal.json"
@@ -437,9 +476,13 @@ def classify_news(headline: str, summary: str) -> str:
 def extract_tickers(symbols: list, headline: str) -> list:
     """
     Returns tickers from the news article that are in our universe.
-    Filters to curated tickers + news-triggered universe.
+    Filters to curated tickers + news-triggered universe + currently-held
+    positions (Sep 2026 fix — a held position outside the curated list
+    could otherwise never have its news seen at all, and even for curated
+    tickers this makes the "is this ticker held" state explicit downstream
+    rather than implicit).
     """
-    universe = set(CURATED_TICKERS) | set(news_triggered.keys())
+    universe = set(CURATED_TICKERS) | set(news_triggered.keys()) | held_symbols
     matched  = [s for s in symbols if s in universe and s not in ETF_EXCLUSIONS]
     return matched
 
@@ -495,22 +538,30 @@ def on_news_message(ws, message):
             if sentiment == "NEUTRAL":
                 continue
 
+            material_adverse = sentiment == "BEARISH" and is_material_adverse(headline, summary)
+
             # Check cooldown — don't re-trigger same ticker within 1 hour
+            # (material adverse events bypass the cooldown for HELD positions —
+            # a held ticker shouldn't wait up to an hour to be reviewed after
+            # regulatory/legal/competitive news, even if it triggered recently)
             now = time.time()
             for symbol in matched:
                 last_trigger = news_triggered.get(symbol, 0)
-                if now - last_trigger < NEWS_COOLDOWN:
+                is_held      = symbol in held_symbols
+                if now - last_trigger < NEWS_COOLDOWN and not (material_adverse and is_held):
                     continue
 
                 news_triggered[symbol] = now
                 news_queue.append({
-                    "symbol":    symbol,
-                    "headline":  headline,
-                    "sentiment": sentiment,
-                    "timestamp": now,
+                    "symbol":           symbol,
+                    "headline":         headline,
+                    "sentiment":        sentiment,
+                    "timestamp":        now,
+                    "material_adverse": material_adverse,
                 })
+                tag = " [MATERIAL ADVERSE]" if material_adverse else ""
                 log.info(
-                    f"📰 NEWS TRIGGER [{sentiment}] {symbol}: {headline[:80]}..."
+                    f"📰 NEWS TRIGGER [{sentiment}]{tag} {symbol}: {headline[:80]}..."
                 )
 
     except Exception as e:
@@ -578,7 +629,19 @@ def process_news_queue(positions: dict, account) -> bool:
     """
     Processes pending news signals from the queue.
     Called from main loop every cycle.
-    Returns True if any news-triggered trade was placed.
+    Returns True if any news-triggered trade (buy OR exit) was placed.
+
+    Sep 2026 fix: previously, ANY news item for an already-held symbol
+    was discarded outright (`if symbol in positions: skip`) — this is
+    what let AMZN ride an FTC/22-state lawsuit (Aug 31) down to a -4.25%
+    loss uncaught, and PLTR miss a same-day Google DeepMind competitive
+    product launch entirely. The news pipeline only ever triggered NEW
+    buys; it never reviewed EXISTING holdings on bad news.
+
+    Held positions now get a re-evaluation path: bearish or material-
+    adverse news re-runs the fundamental check (not the stale entry-time
+    score) and can trigger an early exit via close_position(), separate
+    from the normal composite-tiered stop-loss/trailing logic.
     """
     global news_queue, signal_cache
 
@@ -598,15 +661,70 @@ def process_news_queue(positions: dict, account) -> bool:
     news_queue.clear()
 
     for item in to_process:
-        symbol    = item["symbol"]
-        headline  = item["headline"]
-        sentiment = item["sentiment"]
+        symbol           = item["symbol"]
+        headline         = item["headline"]
+        sentiment        = item["sentiment"]
+        material_adverse = item.get("material_adverse", False)
 
-        # Skip if already in a position
+        # ── Held position review (new path) ────────────────────
         if symbol in positions:
-            log.info(f"📰 {symbol} already held — skipping news trigger")
+            if sentiment != "BEARISH":
+                log.info(f"📰 {symbol} held — {sentiment} news, no action needed")
+                continue
+
+            if not is_market_open():
+                log.info(f"📰 {symbol} held, bearish news queued — market closed")
+                news_queue.append(item)
+                continue
+
+            urgency = "MATERIAL ADVERSE" if material_adverse else "bearish"
+            log.warning(
+                f"📰 HELD POSITION REVIEW [{urgency}] {symbol}: {headline[:70]}... "
+                f"— re-running fundamentals (not trusting stale entry score)"
+            )
+
+            # Force a fresh fundamental read — the entry-time score could be
+            # days old and doesn't know about news that just broke.
+            if symbol in fund_cache:
+                del fund_cache[symbol]
+            spy_chg = spy_change or 0.0
+            result  = compute_signal(symbol, spy_chg)
+
+            pos = positions[symbol]
+            try:
+                pnl_pct = float(pos.unrealized_plpc)
+            except (AttributeError, TypeError, ValueError):
+                pnl_pct = 0.0
+
+            # Exit if fresh fundamentals confirm deterioration (SELL signal
+            # or fundScore has turned negative), OR if it's a material
+            # adverse event regardless of composite (regulatory/legal/
+            # competitive shocks deserve a lower bar than routine sentiment
+            # — same "hard veto over blended score" principle as the SPAC
+            # and structural-risk checks).
+            should_exit = False
+            exit_note   = ""
+            if result and result.get("signal") == "SELL":
+                should_exit = True
+                exit_note   = f"fresh fundamentals turned SELL (composite={result['composite']:.2f})"
+            elif material_adverse:
+                should_exit = True
+                exit_note   = "material adverse event (regulatory/legal/competitive)"
+
+            if should_exit:
+                reason = f"NEWS_ADVERSE ({exit_note}) — {headline[:60]}"
+                if close_position(symbol, pnl_pct, reason):
+                    traded = True
+                    log.warning(f"📰 [SELL] {symbol} exited on adverse news review — {exit_note}")
+            else:
+                log.info(
+                    f"📰 {symbol} held, bearish news reviewed but fundamentals still "
+                    f"intact — holding (composite={result['composite']:.2f} if scored)"
+                    if result else f"📰 {symbol} held, bearish news reviewed — holding"
+                )
             continue
 
+        # ── New-buy candidate path (existing behaviour) ────────
         # Skip if market is not open
         if not is_market_open():
             log.info(f"📰 {symbol} news trigger queued — market closed")
@@ -2101,6 +2219,65 @@ def get_durable_composite(symbol: str) -> float | None:
         fund_cache[cache_key] = (time.time(), None)
         return None
 
+STALE_HOLD_HOURS       = 4        # re-check fundamentals if held longer than this
+STALE_HOLD_RECHECK_SECS = 3600    # don't re-check the SAME position more than once per hour
+last_staleness_check: dict = {}   # {symbol: timestamp of last re-check}
+
+def check_stale_holds(positions: dict) -> list[str]:
+    """
+    Periodically re-runs fundamentals on positions held longer than
+    STALE_HOLD_HOURS, independent of whether news happened to fire.
+
+    Root cause: entry-time composite/fundamental scores are trusted for
+    the ENTIRE duration of a hold — AMZN's FTC lawsuit news reached the
+    news-driven review path (see process_news_queue), but a position
+    could just as easily deteriorate from something that never crosses
+    the WebSocket's keyword filters (a slow-building competitive
+    narrative, a sector-wide re-rating, analyst commentary that isn't
+    phrased as any of the tracked keywords). This is the general-purpose
+    backstop: don't trust a multi-hour-old fundamental score forever.
+
+    Rate-limited to once per hour per symbol to control Claude API cost —
+    this is NOT meant to run every 60s cycle like the price-based checks.
+    """
+    closed = []
+    now    = time.time()
+
+    for symbol, pos in positions.items():
+        entry = entry_signals.get(symbol, {})
+        entry_time = entry.get("entry_time")
+        if entry_time is None:
+            continue  # no entry timestamp (legacy position) — nothing to compare against
+
+        held_hours = (now - entry_time) / 3600
+        if held_hours < STALE_HOLD_HOURS:
+            continue
+
+        last_check = last_staleness_check.get(symbol, 0)
+        if now - last_check < STALE_HOLD_RECHECK_SECS:
+            continue  # already re-checked this symbol recently
+
+        last_staleness_check[symbol] = now
+        log.info(f"  {symbol}: held {held_hours:.1f}hrs — re-running stale fundamentals check")
+
+        if symbol in fund_cache:
+            del fund_cache[symbol]
+        result = compute_signal(symbol, spy_change or 0.0)
+
+        if result and result.get("signal") == "SELL":
+            try:
+                pnl_pct = float(pos.unrealized_plpc)
+            except (AttributeError, TypeError, ValueError):
+                pnl_pct = 0.0
+            reason = f"STALE_FUNDAMENTALS_DETERIORATED (composite={result['composite']:.2f} after {held_hours:.1f}hr hold)"
+            if close_position(symbol, pnl_pct, reason):
+                closed.append(symbol)
+                log.warning(f"  [SELL] {symbol} exited — fundamentals deteriorated since entry ({held_hours:.1f}hrs ago)")
+        elif result:
+            log.info(f"  {symbol}: fundamentals still support hold (composite={result['composite']:.2f})")
+
+    return closed
+
 def check_profit_targets(positions: dict) -> list[str]:
     """
     Exit rules — no Claude calls needed.
@@ -2139,7 +2316,41 @@ def check_profit_targets(positions: dict) -> list[str]:
     be_trigger = BREAKEVEN_TRIGGER_CALM if is_calm else BREAKEVEN_TRIGGER
     be_stop    = BREAKEVEN_STOP_CALM    if is_calm else BREAKEVEN_STOP
 
-    for symbol, pos in positions.items():
+    # ── Overnight-hold prioritisation (Sep 2026) ────────────────
+    # Root cause: PLTR (bought Sep 1, held overnight) breached its own
+    # -4% composite-tier stop and closed at -5.92% the next morning —
+    # exchange gaps at the open can blow through a percentage-based
+    # check before this polling loop even gets to look at the position.
+    # We can't prevent the gap itself (no resting broker-side stop order
+    # exists — that's the real structural fix, tracked separately), but
+    # we CAN make sure an overnight-held position is the very first thing
+    # evaluated each cycle rather than being processed in arbitrary dict
+    # order alongside same-day entries — so if the bot's loop is even
+    # slightly delayed, the position most exposed to gap risk is checked
+    # with priority, not last.
+    #
+    # Detection: a position opened TODAY has unrealized_intraday_plpc
+    # equal to unrealized_plpc (today's move IS the total move so far).
+    # A position held OVERNIGHT has these diverge, since total P&L
+    # includes days before today. No extra API call needed — both
+    # fields are already present on the position object.
+    def _is_overnight_hold(pos) -> bool:
+        try:
+            total_pct    = float(pos.unrealized_plpc)
+            intraday_pct = float(pos.unrealized_intraday_plpc)
+            return abs(total_pct - intraday_pct) > 0.0005  # >0.05% divergence = pre-existing position
+        except (AttributeError, TypeError, ValueError):
+            return False  # if the field is missing, don't assume — process in normal order
+
+    ordered_positions = sorted(
+        positions.items(),
+        key=lambda item: (not _is_overnight_hold(item[1]), item[0])  # overnight holds first, then alphabetical
+    )
+    overnight_symbols = [sym for sym, pos in ordered_positions if _is_overnight_hold(pos)]
+    if overnight_symbols:
+        log.info(f"  Overnight-held positions checked first this cycle: {overnight_symbols}")
+
+    for symbol, pos in ordered_positions:
         try:
             pnl_pct = float(pos.unrealized_plpc)
 
@@ -2474,6 +2685,7 @@ def deploy_from_cache(positions: dict, account):
             "sector":     sector,
             "kelly_pct":  kelly,
             "entry_price": live_price,
+            "entry_time":  time.time(),  # Sep 2026 — enables staleness check in check_profit_targets
         }
         save_entry_signals()
 
@@ -2517,6 +2729,8 @@ def run():
     log.info(f"  Stop loss:      tiered by entry composite — <4.5: -3% | 4.5-6.0: -4% | 6.0+: -5%")
     log.info(f"  Max drawdown:   {MAX_DRAWDOWN*100:.0f}%")
     log.info(f"  90-day audit:   Volume, TA alignment, win rate")
+    log.info(f"  Held-position news review: bearish/material-adverse news on a HELD symbol re-runs fundamentals, can trigger early exit")
+    log.info(f"  Stale-hold check: fundamentals re-checked after {STALE_HOLD_HOURS}hr hold, max 1x/hr per symbol")
     log.info(f"  Pause:          set PAUSED=true in Render")
     log.info("=" * 60)
 
@@ -2586,15 +2800,27 @@ def run():
             closed_this_session.clear()  # reset every 60s cycle
 
             positions = get_positions()
+            held_symbols.clear()
+            held_symbols.update(positions.keys())  # keeps WebSocket thread's view current
             log.info(f"Open positions: {list(positions.keys()) or 'none'}")
             prune_peaks(list(positions.keys()))
 
             # Check exits
             closed = check_profit_targets(positions) if positions else []
 
+            # Re-check fundamentals on positions held beyond STALE_HOLD_HOURS
+            # (independent of news — catches slow-building deterioration that
+            # never crosses the news WebSocket's keyword filters)
+            if positions:
+                stale_closed = check_stale_holds(positions)
+                if stale_closed:
+                    closed.extend(stale_closed)
+
             if closed:
                 time.sleep(3)
                 positions = get_positions()
+                held_symbols.clear()
+                held_symbols.update(positions.keys())
                 account   = get_account()
 
             # ── Process news triggers (real-time events) ───────
@@ -2602,6 +2828,8 @@ def run():
             if news_traded:
                 time.sleep(3)
                 positions = get_positions()
+                held_symbols.clear()
+                held_symbols.update(positions.keys())
                 account   = get_account()
 
             # Deploy from cache (no Claude calls during market hours)
