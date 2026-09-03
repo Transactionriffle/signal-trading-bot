@@ -2223,6 +2223,132 @@ STALE_HOLD_HOURS       = 4        # re-check fundamentals if held longer than th
 STALE_HOLD_RECHECK_SECS = 3600    # don't re-check the SAME position more than once per hour
 last_staleness_check: dict = {}   # {symbol: timestamp of last re-check}
 
+# ── Never-touched-breakeven early exit (Sep 2026) ────────────────
+# Root cause: real intraday bar data confirmed that COST and PLTR were
+# BOTH 100% red — never once traded above entry — for their entire
+# hold (46.5 trading hrs and 9.5 trading hrs respectively). AMZN was
+# red 89% of the time, green only briefly right after entry. By
+# contrast, every WINNING trade examined (NVDA, MA, V) was green
+# 87-100% of the time it was held. This is a much stronger and faster
+# signal than the earlier 36-trading-hour continuous-red rule: if a
+# position hasn't touched breakeven at ALL within the first few
+# trading hours, the data suggests it's very unlikely to on its own.
+#
+# Replaces the previous MAX_LOSING_HOLD_HOURS (36hr continuous-red)
+# rule entirely — that rule would have let COST and PLTR run for a
+# day and a half before acting; this one acts within hours.
+NEVER_BREAKEVEN_WINDOW_HOURS = 3   # trading hours to prove it CAN touch breakeven
+ever_touched_breakeven: dict = {}  # {symbol: bool} — True once P&L has been >=0 at least once
+EVER_BREAKEVEN_FILE = "/tmp/ever_touched_breakeven.json"
+
+def save_ever_breakeven():
+    try:
+        with open(EVER_BREAKEVEN_FILE, "w") as f:
+            json.dump(ever_touched_breakeven, f)
+    except Exception as e:
+        log.warning(f"Failed to save ever_touched_breakeven: {e}")
+
+def load_ever_breakeven():
+    global ever_touched_breakeven
+    try:
+        with open(EVER_BREAKEVEN_FILE) as f:
+            ever_touched_breakeven = json.load(f)
+    except FileNotFoundError:
+        pass
+    except Exception as e:
+        log.warning(f"Failed to load ever_touched_breakeven: {e}")
+
+def get_early_exit_stop(symbol: str) -> float:
+    """
+    ATR-scaled stop used ONLY during the NEVER_BREAKEVEN_WINDOW_HOURS
+    probation window — designed to minimise loss impact on a position
+    that hasn't yet proven it can go green at all.
+
+    Tighter than the position's normal composite-tiered stop (-3%/-4%/-5%)
+    for LOW-volatility names, since a bigger adverse move on a low-ATR
+    stock is a stronger signal something is wrong. Slightly more room for
+    genuinely HIGH-volatility names to avoid cutting on normal noise, but
+    always capped low overall since this fires early, before the position
+    has earned any benefit of the doubt.
+    """
+    atr = entry_signals.get(symbol, {}).get("atr_pct", 0.02)
+    # Low ATR (calm stock, e.g. 1%): tight -1.5% stop
+    # High ATR (volatile stock, e.g. 4%+): capped at -2.5%, never looser
+    return -min(0.025, max(0.015, atr * 0.75))
+
+def check_max_losing_hold(positions: dict) -> list[str]:
+    """
+    Tracks whether each position has EVER touched breakeven (P&L >= 0)
+    since entry. If it hasn't within NEVER_BREAKEVEN_WINDOW_HOURS of
+    trading time, force-exits it using an ATR-scaled early-exit stop
+    designed to minimise the loss (see get_early_exit_stop) — rather
+    than waiting for the looser composite-tiered percentage stop.
+
+    Trading hours only (see prior implementation's reasoning): this
+    only runs while the main loop is active, i.e. while the market is
+    open, so elapsed time between calls is trading time by construction.
+    """
+    global ever_touched_breakeven
+    closed = []
+    now    = time.time()
+    MAX_INCREMENT_SECS = SCAN_INTERVAL * 5  # guard against long gaps between calls
+
+    for symbol, pos in positions.items():
+        try:
+            pnl_pct = float(pos.unrealized_plpc)
+        except (AttributeError, TypeError, ValueError):
+            continue
+
+        if pnl_pct >= 0:
+            # Touched breakeven at least once — proven, no longer on probation
+            if symbol in ever_touched_breakeven:
+                del ever_touched_breakeven[symbol]
+                save_ever_breakeven()
+            continue
+
+        entry_time = entry_signals.get(symbol, {}).get("entry_time")
+        if entry_time is None:
+            continue  # legacy position, no entry timestamp — skip
+
+        if symbol not in ever_touched_breakeven:
+            ever_touched_breakeven[symbol] = {"accumulated_hours": 0.0, "last_check": now}
+            save_ever_breakeven()
+            continue
+
+        state   = ever_touched_breakeven[symbol]
+        elapsed = min(now - state["last_check"], MAX_INCREMENT_SECS)
+        state["accumulated_hours"] += elapsed / 3600
+        state["last_check"] = now
+        save_ever_breakeven()
+
+        hours_on_probation = state["accumulated_hours"]
+        early_stop          = get_early_exit_stop(symbol)
+
+        # Two ways to exit during probation: the window expires, OR the
+        # ATR-scaled early stop is hit first (whichever comes first
+        # minimises the loss — no reason to wait out the full window
+        # if the loss-minimising stop already triggered).
+        if hours_on_probation >= NEVER_BREAKEVEN_WINDOW_HOURS:
+            reason = (
+                f"NEVER_BREAKEVEN ({hours_on_probation:.1f} trading-hrs, never touched "
+                f"breakeven — forced exit, {pnl_pct*100:+.2f}%)"
+            )
+        elif pnl_pct <= early_stop:
+            reason = (
+                f"EARLY_EXIT_STOP (ATR-scaled {early_stop*100:.1f}% stop hit during "
+                f"{hours_on_probation:.1f}hr probation — minimising loss, {pnl_pct*100:+.2f}%)"
+            )
+        else:
+            continue
+
+        if close_position(symbol, pnl_pct, reason):
+            closed.append(symbol)
+            del ever_touched_breakeven[symbol]
+            save_ever_breakeven()
+            log.warning(f"  [SELL] {symbol} exited — {reason}")
+
+    return closed
+
 def check_stale_holds(positions: dict) -> list[str]:
     """
     Periodically re-runs fundamentals on positions held longer than
@@ -2686,6 +2812,7 @@ def deploy_from_cache(positions: dict, account):
             "kelly_pct":  kelly,
             "entry_price": live_price,
             "entry_time":  time.time(),  # Sep 2026 — enables staleness check in check_profit_targets
+            "atr_pct":     atr if atr and atr > 0 else 0.02,  # for the never-touched-breakeven early exit
         }
         save_entry_signals()
 
@@ -2705,6 +2832,7 @@ def run():
     load_peaks()
     load_cooldowns()     # restore stop-loss/profit cooldowns after restart
     load_entry_signals()  # restore entry snapshots for signal-attribution analysis
+    load_ever_breakeven()  # restore never-touched-breakeven probation tracking
     start_news_stream()  # Start news WebSocket in background thread
 
     log.info("=" * 60)
@@ -2731,6 +2859,7 @@ def run():
     log.info(f"  90-day audit:   Volume, TA alignment, win rate")
     log.info(f"  Held-position news review: bearish/material-adverse news on a HELD symbol re-runs fundamentals, can trigger early exit")
     log.info(f"  Stale-hold check: fundamentals re-checked after {STALE_HOLD_HOURS}hr hold, max 1x/hr per symbol")
+    log.info(f"  Never-breakeven exit: forced exit if never green within {NEVER_BREAKEVEN_WINDOW_HOURS}hrs, or ATR-scaled early stop hit sooner")
     log.info(f"  Pause:          set PAUSED=true in Render")
     log.info("=" * 60)
 
@@ -2807,6 +2936,15 @@ def run():
 
             # Check exits
             closed = check_profit_targets(positions) if positions else []
+
+            # Force-exit positions that have never touched breakeven since
+            # entry, using an ATR-scaled loss-minimising stop — catches the
+            # COST/AMZN/PLTR pattern (real data showed these were 89-100%
+            # red for their entire hold, never once green)
+            if positions:
+                maxhold_closed = check_max_losing_hold(positions)
+                if maxhold_closed:
+                    closed.extend(maxhold_closed)
 
             # Re-check fundamentals on positions held beyond STALE_HOLD_HOURS
             # (independent of news — catches slow-building deterioration that
