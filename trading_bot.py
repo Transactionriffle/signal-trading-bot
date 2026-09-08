@@ -1972,6 +1972,16 @@ def check_reentry_allowed(symbol: str, current_price: float) -> tuple[bool, str]
         remaining = (expires - now) / 3600
         return False, f"stop loss cooldown ({remaining:.1f}hrs remaining — thesis failed)"
 
+    # Insufficient buying power cooldown (15min) — Sep 2026 fix for the
+    # NVDA retry-loop incident (bot hammered buy attempts every ~1s with
+    # shrinking quantities, all failing identically). Checked explicitly
+    # by type, same as profit/stop above — falling through to the price
+    # gate below would use exit_price=0, which happens to always block
+    # but for the wrong reason and ignores the actual 15min expiry.
+    if cdtype == "insufficient_funds" and expires > 0 and now < expires:
+        remaining = (expires - now) / 60
+        return False, f"insufficient funds cooldown ({remaining:.1f}min remaining)"
+
     # Option 3 — price gate (2% pullback required)
     # Expires after 48 hours — prevents stale gates blocking re-entry indefinitely
     PRICE_GATE_EXPIRY_SECS = 48 * 3600
@@ -2116,6 +2126,34 @@ def place_buy(symbol: str, qty: int, composite: float | None = None) -> bool:
                     f"  {symbol}: asset not active — removed from cache "
                     f"(will not retry until next scan)"
                 )
+
+        # "insufficient buying power" — Sep 2026 fix. Root cause: the bot
+        # was observed hammering NVDA buy attempts every ~1 second for 30+
+        # seconds straight, shrinking the quantity each time and retrying
+        # immediately, always failing the same way. deploy_from_cache()
+        # recalculates qty fresh from account.cash every cycle — if
+        # Alpaca's reported cash doesn't match what its own order engine
+        # validates against at submission time (e.g. a pending order or
+        # margin calc lag), every recalculated qty fails identically,
+        # burning API calls and cluttering logs with zero progress.
+        #
+        # Fix: register a short re-entry cooldown on insufficient-funds
+        # failures specifically, same mechanism as a stop-loss/profit
+        # cooldown, so this ticker is skipped for a cooling-off period
+        # instead of being retried every single cycle.
+        elif "insufficient buying power" in err_str or "insufficient_buying_power" in err_str:
+            global reentry_cooldown
+            reentry_cooldown[symbol] = {
+                "type":       "insufficient_funds",
+                "time":       time.time(),
+                "exit_price": 0,
+                "expires":    time.time() + 900,  # 15 min cooldown — enough for cash/margin state to settle
+            }
+            save_cooldowns()
+            log.warning(
+                f"  {symbol}: insufficient buying power — 15min cooldown applied "
+                f"(was retrying every cycle with no progress)"
+            )
         return False
 
 # ══════════════════════════════════════════════════════════════
