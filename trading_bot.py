@@ -97,6 +97,10 @@ PROFIT_TARGET   =  0.05    # +5%   sell immediately
 PEAK_TRIGGER    =  0.03    # +3%   activate trailing protection
 TRAIL_SELL      =  0.025   # +2.5% sell if falls back here after peak
 STOP_LOSS       = -0.05    # -5%   hard stop (before breakeven activates)
+STOP_LOSS_ACTIVATION_MINUTES = 30  # composite-tiered stop loss only fires after
+                                     # this many minutes held — avoids cutting a
+                                     # fresh position on opening-print/spread noise
+                                     # before the thesis has had time to develop
 BREAKEVEN_TRIGGER = 0.01   # +1%   once hit, stop shifts to +0.5% (default / high-VIX)
 BREAKEVEN_STOP    = 0.005  # +0.5% minimum locked-in gain after breakeven (default / high-VIX)
 
@@ -249,6 +253,85 @@ SECTOR_MAP: dict[str, str] = {
     "DECK":"consumer","ARM":"tech","MRVL":"tech","QCOM":"tech",
     "ASML":"tech","ADBE":"tech","INTC":"tech",
 }
+
+# ── Dynamic sector classification (Sep 2026) ─────────────────────
+# Root cause: PHVS (Pharvaris, a biotech) was bought Sep 8 while
+# healthcare (XLV) was already -1.72% at market open — well past the
+# -1.5% SECTOR_WEAK threshold. The weak-sector filter in
+# deploy_from_cache() correctly checked `if sector and sector in
+# weak_sectors`, but PHVS has NO entry in SECTOR_MAP (it entered the
+# universe via the dynamic momentum screener reacting to Phase 3 trial
+# news, not the curated list), so `sector` was None — falsy — and the
+# entire check was silently skipped. The filter didn't fail; it was
+# never applicable to a ticker it had no classification for.
+#
+# Fix: any ticker not in the static SECTOR_MAP gets a live sector
+# lookup via Yahoo Finance's quoteSummary (assetProfile module, proxied
+# through the same Cloudflare Worker already used for VIX/technicals),
+# cached for 30 days per symbol since a company's sector classification
+# essentially never changes. Falls back to "unknown" (not None) if the
+# lookup fails — "unknown" is still a hashable value the weak_sectors
+# set will simply never contain, but at minimum makes the gap visible
+# in logs rather than silently invisible.
+DYNAMIC_SECTOR_MAP: dict[str, str] = {}   # {symbol: sector} — runtime cache, session-lived
+DYNAMIC_SECTOR_TTL = 30 * 86400            # 30 days — sector classification rarely changes
+
+# Maps Yahoo Finance's broad "sector" field to this bot's sector buckets
+# so a dynamically-looked-up ticker lines up with SECTOR_ETFS/weak_sectors
+YAHOO_SECTOR_TO_BUCKET = {
+    "technology": "tech",
+    "healthcare": "healthcare",
+    "financial services": "financials",
+    "financial": "financials",
+    "energy": "energy",
+    "utilities": "utilities",
+    "consumer cyclical": "consumer",
+    "consumer defensive": "consumer",
+    "industrials": "industrials",
+    "basic materials": "materials",
+}
+
+def get_sector(symbol: str) -> str | None:
+    """
+    Returns this bot's sector bucket for `symbol` — checks the static
+    SECTOR_MAP first (free, instant), then falls back to a live lookup
+    for any ticker not hand-curated there (e.g. dynamically-discovered
+    momentum/news tickers like PHVS). Cached in-session; unresolved
+    lookups are cached as "unknown" so a failed lookup doesn't retry
+    every single cycle.
+    """
+    if symbol in SECTOR_MAP:
+        return SECTOR_MAP[symbol]
+
+    cache_key = f"sector_lookup_{symbol}"
+    if cache_key in fund_cache:
+        cached_time, cached_sector = fund_cache[cache_key]
+        if time.time() - cached_time < DYNAMIC_SECTOR_TTL:
+            return cached_sector if cached_sector != "unknown" else None
+
+    try:
+        url = f"{WORKER_URL}/yahoofinance/quoteSummary/{symbol}?modules=assetProfile"
+        r   = requests.get(url, timeout=10)
+        if r.ok:
+            data = r.json()
+            profile = (
+                data.get("quoteSummary", {})
+                    .get("result", [{}])[0]
+                    .get("assetProfile", {})
+            )
+            yahoo_sector = (profile.get("sector") or "").strip().lower()
+            bucket = YAHOO_SECTOR_TO_BUCKET.get(yahoo_sector)
+            if bucket:
+                fund_cache[cache_key] = (time.time(), bucket)
+                log.info(f"  {symbol}: dynamically classified as '{bucket}' (Yahoo sector: '{yahoo_sector}')")
+                return bucket
+            else:
+                log.warning(f"  {symbol}: Yahoo sector '{yahoo_sector}' has no bucket mapping — treating as unknown")
+    except Exception as e:
+        log.warning(f"  {symbol}: dynamic sector lookup failed: {e}")
+
+    fund_cache[cache_key] = (time.time(), "unknown")
+    return None
 
 # ── ETF exclusions — never trade these ────────────────────────
 ETF_EXCLUSIONS = {
@@ -2595,7 +2678,25 @@ def check_profit_targets(positions: dict) -> list[str]:
                     f"locked +{be_stop*100:.1f}%{' calm-VIX' if is_calm else ''})"
                 )
             elif current_peak < be_trigger and pnl_pct <= active_stop:
-                reason = f"STOP_LOSS ({active_stop*100:.0f}%{' composite-tiered' if entry_composite is not None else ''})"
+                # ── Stop-loss activation delay (Sep 2026) ──────
+                # The composite-tiered stop only fires once the position
+                # has been held for at least STOP_LOSS_ACTIVATION_MINUTES.
+                # A brand-new position can wobble a few tenths of a percent
+                # in its first seconds/minutes purely from bid-ask spread
+                # and opening-print noise — firing a real stop-loss on that
+                # noise before the thesis has had any time to play out
+                # wastes the trade. Falls back to entry_time=None (no
+                # delay applied, stop active immediately) for legacy
+                # positions with no recorded entry timestamp.
+                entry_time = entry_signals.get(symbol, {}).get("entry_time")
+                minutes_held = (time.time() - entry_time) / 60 if entry_time else None
+                if minutes_held is None or minutes_held >= STOP_LOSS_ACTIVATION_MINUTES:
+                    reason = f"STOP_LOSS ({active_stop*100:.0f}%{' composite-tiered' if entry_composite is not None else ''})"
+                else:
+                    log.info(
+                        f"  {symbol}: at {pnl_pct*100:+.2f}% (below {active_stop*100:.0f}% stop) but only "
+                        f"{minutes_held:.1f}min held — stop-loss activates at {STOP_LOSS_ACTIVATION_MINUTES}min, holding"
+                    )
 
             # ── Weak sector mid-day exit ───────────────────────
             # Normally only exits at breakeven or better — never crystallise
@@ -2612,7 +2713,7 @@ def check_profit_targets(positions: dict) -> list[str]:
             # SYSTEMIC_DERISK_MAX_LOSS_EXIT) rather than holding for the
             # full stop distance.
             if not reason and weak_sectors:
-                sector = SECTOR_MAP.get(symbol)
+                sector = get_sector(symbol)
                 if sector and sector in weak_sectors:
                     if pnl_pct >= be_stop:
                         reason = (
@@ -2735,7 +2836,7 @@ def deploy_from_cache(positions: dict, account):
     # each buy so 3 same-sector candidates can't all pass the cap in one cycle
     sector_counts: dict = {}
     for s in positions:
-        sec = SECTOR_MAP.get(s)
+        sec = get_sector(s)
         if sec:
             sector_counts[sec] = sector_counts.get(sec, 0) + 1
 
@@ -2752,7 +2853,11 @@ def deploy_from_cache(positions: dict, account):
         # Apr 26 +$1,196, May 26 +$1,914 better vs uncapped
         # Prevents NVDA×3 concentration regardless of signal quality
         # NOTE: counts include buys made earlier in THIS loop (same-cycle fix)
-        sector = SECTOR_MAP.get(symbol)
+        # NOTE: get_sector() falls back to a live lookup for tickers not in
+        # the static SECTOR_MAP (e.g. dynamically-discovered PHVS Sep 8) —
+        # this is the actual fix for the weak-sector filter below silently
+        # not applying to unmapped tickers.
+        sector = get_sector(symbol)
         if sector:
             sector_count = sector_counts.get(sector, 0)
             if sector_count >= MAX_SECTOR_POSITIONS:
@@ -2893,6 +2998,7 @@ def run():
     log.info(f"  Min confidence: {MIN_CONFIDENCE}%")
     log.info(f"  Min composite:  {MIN_COMPOSITE} (raised from 3.0 — Jul 29 review)")
     log.info(f"  Stop loss:      tiered by entry composite — <4.5: -3% | 4.5-6.0: -4% | 6.0+: -5%")
+    log.info(f"  Stop loss delay: activates {STOP_LOSS_ACTIVATION_MINUTES}min after entry (avoids opening-print noise)")
     log.info(f"  Max drawdown:   {MAX_DRAWDOWN*100:.0f}%")
     log.info(f"  90-day audit:   Volume, TA alignment, win rate")
     log.info(f"  Held-position news review: bearish/material-adverse news on a HELD symbol re-runs fundamentals, can trigger early exit")
