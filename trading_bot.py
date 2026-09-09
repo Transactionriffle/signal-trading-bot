@@ -2,48 +2,67 @@
 SIGNAL Trading Bot
 ==================
 Architecture:
-  Pre-market scan (Sunday 8pm or Monday 6am ET):
-    → Build 50-ticker universe (35 curated + 15 dynamic gainers)
-    → Run full fundamental + technical scan on all tickers
-    → Cache ranked BUY list with scores
+  Pre-market scan (Sunday 8pm ET, or dynamic ~9:20am ET weekdays):
+    → Build up to 55-ticker universe (37 curated + up to 24 dynamic:
+      8 movers + 8 trade-count-active + 8 five-day-momentum)
+    → TA pre-filter (skip Claude entirely if taScore < 1.5)
+    → Run fundamental scan (Claude + web search) on surviving tickers
+    → Hard vetoes applied before scoring: ETF/leveraged-product,
+      SPAC/blank-check, general structural-risk (recent IPO, pending
+      M&A, reverse split, halted, thin ADR), earnings within 3 days
+    → Cache ranked BUY list (composite >= MIN_COMPOSITE, confidence
+      >= MIN_CONFIDENCE) with scores; persisted to disk so a mid-day
+      redeploy doesn't trigger a wasted re-scan
     → Deploy capital at market open from cached list
 
   During market hours:
     → Monitor positions every 60 seconds (zero Claude calls)
-    → Exit rules: +5% profit, trailing +3%→+2.5%, -5% stop loss
-    → Position closes → deploy into next ranked signal from cache
-    → Only re-scan if cache exhausted (max once per 30 minutes)
+    → Exit priority: profit target (ATR-based, adaptive) > stop-loss-
+      magnitude override (always labelled STOP_LOSS regardless of
+      prior peak, for accurate attribution) > dynamic-width trail
+      (arms at +0.2% peak, gap widens with peak size) > old fixed
+      trail (+3%→+2.5%, rarely reached first) > breakeven stop
+      (VIX-aware: wider band when VIX<18) > composite-tiered stop
+      loss (-3%/-4%/-5% by entry conviction, dynamic downside floor
+      tightens as loss deepens) > weak-sector mid-day exit
+    → First 30 min after entry: full noise tolerance, nothing fires.
+      After that: ATR-scaled early-exit stop (hard-capped -0.5%) AND
+      the composite-tiered stop are both active — whichever is
+      tighter effectively governs for a position with zero validation
+    → Held positions get re-evaluated (not ignored) on bearish/
+      material-adverse news, and on a periodic stale-fundamentals
+      recheck independent of news
+    → Position closes → re-entry cooldown (type-specific duration +
+      escalating strikes for repeat stop-losses) → deploy into next
+      ranked signal from cache
+    → Only re-scan if cache exhausted (max once per hour)
+    → Systemic de-risk (severe VIX + 3+ weak sectors): blocks new
+      buys, allows early loss-cutting up to -2% instead of riding
+      each position to its full stop distance one at a time
 
-  Every 90 days — Curated ticker audit:
+  Every 90 days — Curated ticker + universe-composition audit:
     Criterion 1 — Volume & Liquidity: avg daily volume dropped?
-                  Institutional money left = choppy, unpredictable → swap out
     Criterion 2 — Strategy Alignment: does stock still respect TA setups?
-                  Regulatory change or market cap shift → remove
-    Criterion 3 — Personal Performance: negative win rate on ticker
-                  over last 3 months despite following rules → cut immediately
+    Criterion 3 — Personal Performance: negative win rate over last 90 days?
+    Criterion 4 — Universe-level AI concentration: has the curated
+                  LIST itself drifted too AI/tech-heavy over time?
 
 Environment variables (set in Render):
-    ALPACA_API_KEY         (required)
-    ALPACA_SECRET_KEY      (required)
-    ANTHROPIC_API_KEY      (required)
+    ALPACA_API_KEY, ALPACA_SECRET_KEY, ANTHROPIC_API_KEY  (required)
     ALPACA_BASE_URL        (default: https://paper-api.alpaca.markets)
     CLOUDFLARE_WORKER
     TECH_WEIGHT            (default: 40 — 40% TA / 60% fundamental)
-    MIN_CONFIDENCE         (default: 80)
+    MIN_CONFIDENCE         (default: 85)
+    MIN_COMPOSITE          (default: 4.0)
     MAX_TRADES_PER_DAY     (default: 10)
     MAX_DRAWDOWN_PCT       (default: 0.15)
     PAUSED                 (set "true" to halt instantly)
-
-Risk thresholds (backtest validated):
-    PROFIT_TARGET = +5%    47% of trades hit this
-    PEAK_TRIGGER  = +3%    activate trailing
-    TRAIL_SELL    = +2.5%  sell if falls back here after peak
-    STOP_LOSS     = -5%    cut losses (tightens to -2% in bear mode)
 
 Macro layer:
     BULL  SPY >= -2% or VIX < 25       → normal trading
     BEAR  SPY < -2% AND VIX >= 25      → no new buys, stops tighten to -2%
     Fear  VIX >= 25                     → position sizes halved
+    Systemic de-risk  VIX>=28 + 3+ weak sectors → no new buys, faster loss-cutting
     RS    stock % - SPY % boost/penalty per ticker
 """
 
@@ -59,8 +78,8 @@ from datetime import datetime, timezone, timedelta
 from zoneinfo import ZoneInfo
 from collections import defaultdict
 from alpaca.trading.client import TradingClient
-from alpaca.trading.requests import MarketOrderRequest
-from alpaca.trading.enums import OrderSide, TimeInForce
+from alpaca.trading.requests import MarketOrderRequest, GetOrdersRequest
+from alpaca.trading.enums import OrderSide, TimeInForce, QueryOrderStatus
 
 # ── Logging ────────────────────────────────────────────────────
 logging.basicConfig(
@@ -202,6 +221,20 @@ SECTOR_ETFS     = {
     "tech": "XLK", "healthcare": "XLV", "financials": "XLF",
     "energy": "XLE", "utilities": "XLU", "consumer": "XLY",
     "industrials": "XLI", "materials": "XLB",
+    # Sep 2026 audit fix: SECTOR_MAP classifies NVDA/AMD/MU/TSM as "semis",
+    # PLTR/CRM/SNOW as "software", PANW/CRWD/NET as "cyber", and SPOT/NFLX
+    # as "media" — but none of those four buckets had a proxy ETF here,
+    # so weak_sectors could NEVER contain them and the weak-sector buy
+    # filter / mid-day exit was structurally inapplicable to the entire
+    # semiconductor curated list (arguably the highest-volatility, most
+    # news-sensitive part of the universe) plus software/cyber/media.
+    # Verified liquid, real ETFs for each (checked directly, not guessed):
+    # SMH ($65-71B AUM, ~11M/day), IGV ($12-15B AUM, ~15M/day), CIBR
+    # ($9-14B AUM, ~1.2-1.76M/day). "media" specifically has no good
+    # dedicated ETF (PBS/IEME are thin-to-liquidated) — SPOT/NFLX are
+    # standard-classified under Communication Services, so XLC (State
+    # Street, $22B AUM) is the correct, real proxy, not a media-only fund.
+    "semis": "SMH", "software": "IGV", "cyber": "CIBR", "media": "XLC",
 }
 
 # ── Curated universe (35 tickers — sector diversified) ────────
@@ -277,34 +310,13 @@ CURATED_TICKERS = [
 # Consumer/Distribution: 4 (11%) | Mid-cap Growth: 6 (17%)
 # Large-cap (>$100B): 26 | Mid-cap ($15B-$100B): 10
 
-# ── Sector map — used for weak sector filtering ────────────────
-SECTOR_MAP: dict[str, str] = {
-    # Semis
-    "NVDA":"tech","AVGO":"tech","TSM":"tech","MU":"tech","AMD":"tech",
-    # Mega-cap Tech
-    "GOOG":"tech","META":"tech","MSFT":"tech","AMZN":"tech",
-    "AAPL":"tech","TSLA":"tech","ORCL":"tech",
-    # Software / Cyber
-    "PLTR":"tech","CRWD":"tech","PANW":"tech","NET":"tech",
-    "CRM":"tech","SNOW":"tech",
-    # Financials
-    "JPM":"financials","V":"financials","MA":"financials",
-    "GS":"financials","BAC":"financials","MS":"financials","BLK":"financials",
-    # Healthcare
-    "LLY":"healthcare","UNH":"healthcare","ABBV":"healthcare",
-    "ISRG":"healthcare","CPRX":"healthcare",
-    # Energy
-    "XOM":"energy","CVX":"energy","COP":"energy","SLB":"energy",
-    # Industrials
-    "GEV":"industrials","CAT":"industrials","RTX":"industrials","HON":"industrials",
-    "IOT":"industrials",  # Samsara — Connected Operations, fleet/physical asset management
-    # Consumer / Distribution
-    "COST":"consumer","WMT":"consumer","MCD":"consumer","FDX":"consumer",
-    # Mid-cap
-    "SPOT":"consumer","NFLX":"consumer","UBER":"consumer",
-    "DECK":"consumer","ARM":"tech","MRVL":"tech","QCOM":"tech",
-    "ASML":"tech","ADBE":"tech","INTC":"tech",
-}
+# NOTE: SECTOR_MAP is defined once, further below (see "Sector concentration
+# cap" section) with the full semis/tech/software/cyber/financials/healthcare/
+# energy/industrials/consumer split that AI_CORRELATED_SECTORS and get_sector()
+# both depend on. (Sep 2026 audit: a duplicate, incompatible definition used
+# to live here — everything mapped to "tech" — and was silently shadowed by
+# the real one 800+ lines later. Removed to eliminate the trap of someone
+# editing this dead copy and wondering why nothing changes.)
 
 # ── Dynamic sector classification (Sep 2026) ─────────────────────
 # Root cause: PHVS (Pharvaris, a biotech) was bought Sep 8 while
@@ -1753,7 +1765,7 @@ def run_premarket_scan():
     log.info("=" * 60)
     log.info("PRE-MARKET SCAN STARTING")
     log.info(f"  Time: {now_et.strftime('%A %Y-%m-%d %H:%M ET')}")
-    log.info(f"  Universe: 35 curated + up to 15 dynamic = max 50 tickers")
+    log.info(f"  Universe: {len(CURATED_TICKERS)} curated + up to 24 dynamic (8+8+8) = max 55 tickers")
     log.info("=" * 60)
 
     # Clear yesterday's cache
@@ -2384,10 +2396,29 @@ def check_drawdown(account) -> bool:
     return True
 
 def run_risk_checks(account) -> tuple[bool, str]:
+    """
+    HALTS EVERYTHING (monitoring + new entries) — pause and circuit
+    breaker are genuine stop-all conditions.
+    """
     if is_paused():
         return False, "PAUSED"
     if not check_drawdown(account):
         return False, "CIRCUIT BREAKER"
+    return True, "OK"
+
+def can_open_new_position() -> tuple[bool, str]:
+    """
+    Blocks NEW ENTRIES ONLY — the daily trade cap should never stop
+    the bot from managing risk on positions it already holds.
+
+    Fix (Sep 2026 audit): MAX_TRADES_DAY was previously folded into
+    run_risk_checks(), which gates the ENTIRE cycle — hitting the daily
+    cap silently disabled check_profit_targets()/check_max_losing_hold()/
+    check_stale_holds() for every open position until midnight ET. A
+    busy day (exactly when the cap is most likely to be hit) is exactly
+    when continued stop-loss/trailing monitoring matters most. Split so
+    the trade-count limit only ever suppresses deploy_from_cache().
+    """
     if trades_today_count() >= MAX_TRADES_DAY:
         return False, f"MAX TRADES {trades_today_count()}/{MAX_TRADES_DAY}"
     return True, "OK"
@@ -2417,7 +2448,16 @@ def get_durable_composite(symbol: str) -> float | None:
             return cached_result
 
     try:
-        orders = trade_client.get_orders()  # fetch recent orders, filter client-side below
+        # Sep 2026 audit fix: get_orders() with NO arguments defaults to
+        # status=OPEN in the Alpaca SDK — this function was filtering for
+        # status=="filled" against a query that can only ever return open
+        # orders, so `matching` was guaranteed empty every single call.
+        # The entire durable-composite recovery (built specifically to
+        # prevent a repeat of the NVDA flat-stop incident) has likely
+        # never actually worked since it shipped. Explicitly requesting
+        # CLOSED orders fixes this.
+        request = GetOrdersRequest(status=QueryOrderStatus.CLOSED, symbols=[symbol], limit=50)
+        orders  = trade_client.get_orders(filter=request)
         matching = [
             o for o in orders
             if o.symbol == symbol and o.side.value == "buy"
@@ -2723,10 +2763,49 @@ def check_profit_targets(positions: dict) -> list[str]:
             profit_target = position_peaks.get(f"{symbol}_target", PROFIT_TARGET)
 
             # ── Standard exit rules ────────────────────────────
-            # Priority order: profit target > micro-trail > old fixed trail >
-            # breakeven stop > hard stop loss
+            # Priority order: profit target > stop-loss-magnitude override >
+            # micro-trail > old fixed trail > breakeven stop > hard stop loss
+            #
+            # Sep 2026 audit fix: the DYNAMIC_TRAIL branch below only checks
+            # "has price fallen more than the trail gap below its peak" — it
+            # has NO awareness of the position's own stop-loss tier. Once a
+            # position has EVER peaked >= MICRO_TRAIL_ARM_PCT (0.2%), its
+            # current_peak never resets down, so ANY subsequent crash — even
+            # one that blows straight through the -3%/-4%/-5% composite tier
+            # — gets caught and labelled "DYNAMIC_TRAIL" instead of the more
+            # accurate "STOP_LOSS". This didn't cost money (the position still
+            # closes at the same time either way), but it corrupts
+            # analyse_signal_attribution()'s reporting: a real stop-loss-
+            # magnitude loss gets bucketed as a trailing exit, making the
+            # trail's stats look worse and the stop-loss tier's stats look
+            # artificially better than they really are.
+            #
+            # Fix: if the loss has already fallen past the position's own
+            # composite-tiered stop level, classify it as STOP_LOSS
+            # regardless of prior peak — the magnitude of the loss is what
+            # matters for accurate attribution, not whether it once ticked
+            # positive first.
             if pnl_pct >= profit_target:
                 reason = f"PROFIT_TARGET ({profit_target*100:.1f}%)"
+            elif pnl_pct <= active_stop:
+                # Loss has reached stop-loss-tier magnitude — always label
+                # it STOP_LOSS for accurate attribution, even if this
+                # position peaked positive earlier in its life. Still
+                # respects the same activation delay as the dedicated
+                # STOP_LOSS branch further below.
+                entry_time = entry_signals.get(symbol, {}).get("entry_time")
+                minutes_held = (time.time() - entry_time) / 60 if entry_time else None
+                if minutes_held is None or minutes_held >= STOP_LOSS_ACTIVATION_MINUTES:
+                    peak_note = f", peaked {current_peak*100:+.2f}% earlier" if current_peak >= MICRO_TRAIL_ARM_PCT else ""
+                    reason = f"STOP_LOSS ({active_stop*100:.0f}%{' composite-tiered' if entry_composite is not None else ''}{peak_note})"
+                # else: falls through to noise-tolerance window below via the
+                # ordinary STOP_LOSS branch's own delay check — no action here,
+                # just don't claim it as DYNAMIC_TRAIL in the meantime either
+                elif current_peak < MICRO_TRAIL_ARM_PCT:
+                    log.info(
+                        f"  {symbol}: at {pnl_pct*100:+.2f}% (below {active_stop*100:.0f}% stop) but only "
+                        f"{minutes_held:.1f}min held — stop-loss activates at {STOP_LOSS_ACTIVATION_MINUTES}min, holding"
+                    )
             elif current_peak >= MICRO_TRAIL_ARM_PCT and pnl_pct <= (current_peak - get_dynamic_trail_gap(current_peak)):
                 gap = get_dynamic_trail_gap(current_peak)
                 reason = (
@@ -2740,26 +2819,6 @@ def check_profit_targets(positions: dict) -> list[str]:
                     f"BREAKEVEN_STOP (peaked {current_peak*100:+.2f}%, "
                     f"locked +{be_stop*100:.1f}%{' calm-VIX' if is_calm else ''})"
                 )
-            elif current_peak < be_trigger and pnl_pct <= active_stop:
-                # ── Stop-loss activation delay (Sep 2026) ──────
-                # The composite-tiered stop only fires once the position
-                # has been held for at least STOP_LOSS_ACTIVATION_MINUTES.
-                # A brand-new position can wobble a few tenths of a percent
-                # in its first seconds/minutes purely from bid-ask spread
-                # and opening-print noise — firing a real stop-loss on that
-                # noise before the thesis has had any time to play out
-                # wastes the trade. Falls back to entry_time=None (no
-                # delay applied, stop active immediately) for legacy
-                # positions with no recorded entry timestamp.
-                entry_time = entry_signals.get(symbol, {}).get("entry_time")
-                minutes_held = (time.time() - entry_time) / 60 if entry_time else None
-                if minutes_held is None or minutes_held >= STOP_LOSS_ACTIVATION_MINUTES:
-                    reason = f"STOP_LOSS ({active_stop*100:.0f}%{' composite-tiered' if entry_composite is not None else ''})"
-                else:
-                    log.info(
-                        f"  {symbol}: at {pnl_pct*100:+.2f}% (below {active_stop*100:.0f}% stop) but only "
-                        f"{minutes_held:.1f}min held — stop-loss activates at {STOP_LOSS_ACTIVATION_MINUTES}min, holding"
-                    )
             elif current_peak < be_trigger and active_stop < pnl_pct < get_dynamic_downside_floor(pnl_pct, active_stop):
                 # ── Dynamic downside floor (Sep 2026) ───────────
                 # Position hasn't hit the flat tier ceiling yet, but HAS
@@ -3060,7 +3119,7 @@ def run():
 
     log.info("=" * 60)
     log.info("SIGNAL Trading Bot started")
-    log.info(f"  Universe:       36 curated + 15 dynamic = 51 max")
+    log.info(f"  Universe:       {len(CURATED_TICKERS)} curated + up to 24 dynamic (8+8+8) = 55 max")
     log.info(f"  Scan timing:    Sun 8pm ET / Mon-Fri 9:20am ET (dynamic) + restart rescan")
     log.info(f"  Position size:  Kelly 10-16% (confidence-based sizing, raised Aug 2026)")
     log.info(f"  Profit target:  ATR×2.5 per position (3-12% range, fallback +5%)")
@@ -3197,7 +3256,11 @@ def run():
 
             # Deploy from cache (no Claude calls during market hours)
             open_slots = 10 - len(positions)
-            if open_slots > 0 and float(account.regt_buying_power or account.cash) >= equity * 0.10:
+            can_open, cannot_open_reason = can_open_new_position()
+            if not can_open:
+                if open_slots > 0:
+                    log.info(f"  {cannot_open_reason} — new entries blocked, monitoring continues normally")
+            elif open_slots > 0 and float(account.regt_buying_power or account.cash) >= equity * 0.10:
                 if not signal_cache:
                     time_since_rescan = time.time() - last_rescan_time
                     if time_since_rescan > 3600:
