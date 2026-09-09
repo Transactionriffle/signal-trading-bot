@@ -2397,74 +2397,65 @@ STALE_HOLD_RECHECK_SECS = 3600    # don't re-check the SAME position more than o
 last_staleness_check: dict = {}   # {symbol: timestamp of last re-check}
 
 # ── Never-touched-breakeven early exit (Sep 2026) ────────────────
-# Root cause: real intraday bar data confirmed that COST and PLTR were
-# BOTH 100% red — never once traded above entry — for their entire
-# hold (46.5 trading hrs and 9.5 trading hrs respectively). AMZN was
-# red 89% of the time, green only briefly right after entry. By
-# contrast, every WINNING trade examined (NVDA, MA, V) was green
-# 87-100% of the time it was held. This is a much stronger and faster
-# signal than the earlier 36-trading-hour continuous-red rule: if a
-# position hasn't touched breakeven at ALL within the first few
-# trading hours, the data suggests it's very unlikely to on its own.
+# ── Early-hold tight floor (Sep 2026, simplified) ────────────────
+# Root cause: real intraday bar data confirmed COST and PLTR were BOTH
+# 100% red — never once traded above entry — for their entire hold.
+# The original fix gated a tight ATR-scaled stop behind "has this
+# position EVER touched breakeven" — but that created two competing
+# clocks (a 30-min noise-tolerance delay on the composite stop, and a
+# separate "hours on probation since never green" clock), and since
+# the tight floor's ceiling (originally -2.5%) is always reached before
+# the loosest composite tier (-3%), the 30-min delay was effectively
+# dead code for any position that never went green — it never got the
+# chance to matter.
 #
-# Replaces the previous MAX_LOSING_HOLD_HOURS (36hr continuous-red)
-# rule entirely — that rule would have let COST and PLTR run for a
-# day and a half before acting; this one acts within hours.
-NEVER_BREAKEVEN_WINDOW_HOURS = 3   # trading hours to prove it CAN touch breakeven
-ever_touched_breakeven: dict = {}  # {symbol: bool} — True once P&L has been >=0 at least once
-EVER_BREAKEVEN_FILE = "/tmp/ever_touched_breakeven.json"
-
-def save_ever_breakeven():
-    try:
-        with open(EVER_BREAKEVEN_FILE, "w") as f:
-            json.dump(ever_touched_breakeven, f)
-    except Exception as e:
-        log.warning(f"Failed to save ever_touched_breakeven: {e}")
-
-def load_ever_breakeven():
-    global ever_touched_breakeven
-    try:
-        with open(EVER_BREAKEVEN_FILE) as f:
-            ever_touched_breakeven = json.load(f)
-    except FileNotFoundError:
-        pass
-    except Exception as e:
-        log.warning(f"Failed to load ever_touched_breakeven: {e}")
-
+# Simplified to ONE clock: minutes since entry. For the first
+# STOP_LOSS_ACTIVATION_MINUTES, NOTHING fires — full noise tolerance
+# while the position settles in, whether it's touched green or not.
+# After the delay passes, BOTH the ATR-scaled early-exit stop (now
+# hard-capped at -0.5%, tightened further from -1.5%/-2.5% for a
+# faster, cheaper cut) and the composite-tiered stop (checked in
+# check_profit_targets(), with the dynamic downside floor already
+# layered on it) become active together — whichever threshold is
+# tighter for a given position effectively governs from that point on.
 def get_early_exit_stop(symbol: str) -> float:
     """
-    ATR-scaled stop used ONLY during the NEVER_BREAKEVEN_WINDOW_HOURS
-    probation window — designed to minimise loss impact on a position
-    that hasn't yet proven it can go green at all.
+    ATR-scaled stop that becomes active once STOP_LOSS_ACTIVATION_MINUTES
+    has passed since entry — tighter than the composite-tiered stop,
+    designed to minimise loss impact on a position that's still shown
+    no sign of validating (never touched breakeven) once the initial
+    noise-tolerance grace period has elapsed.
 
-    Tighter than the position's normal composite-tiered stop (-3%/-4%/-5%)
-    for LOW-volatility names, since a bigger adverse move on a low-ATR
-    stock is a stronger signal something is wrong. Slightly more room for
-    genuinely HIGH-volatility names to avoid cutting on normal noise, but
-    always capped low overall since this fires early, before the position
-    has earned any benefit of the doubt.
+    Tightened further (Sep 2026): hard-capped at -0.5% regardless of
+    ATR. A position with zero validation after the grace period is cut
+    fast and cheap — this makes the early-exit stop meaningfully
+    tighter than the loosest composite tier (-3%) across the board,
+    not just for low-volatility names, closing the coherence gap where
+    the two rules previously fought each other on timing.
     """
     atr = entry_signals.get(symbol, {}).get("atr_pct", 0.02)
-    # Low ATR (calm stock, e.g. 1%): tight -1.5% stop
-    # High ATR (volatile stock, e.g. 4%+): capped at -2.5%, never looser
-    return -min(0.025, max(0.015, atr * 0.75))
+    return -min(0.005, max(0.003, atr * 0.75))
 
 def check_max_losing_hold(positions: dict) -> list[str]:
     """
-    Tracks whether each position has EVER touched breakeven (P&L >= 0)
-    since entry. If it hasn't within NEVER_BREAKEVEN_WINDOW_HOURS of
-    trading time, force-exits it using an ATR-scaled early-exit stop
-    designed to minimise the loss (see get_early_exit_stop) — rather
-    than waiting for the looser composite-tiered percentage stop.
+    Unified early-hold policy (Sep 2026): NOTHING fires in the first
+    STOP_LOSS_ACTIVATION_MINUTES of a position's life — full noise
+    tolerance while the position settles in, exactly like the composite
+    stop's original intent. After that window passes, the ATR-scaled
+    early-exit stop (get_early_exit_stop) becomes active ALONGSIDE the
+    composite-tiered stop in check_profit_targets() — whichever is
+    tighter effectively governs, since both are checked every cycle
+    from that point on.
 
-    Trading hours only (see prior implementation's reasoning): this
-    only runs while the main loop is active, i.e. while the market is
-    open, so elapsed time between calls is trading time by construction.
+    This replaces the earlier (inverted) version where the tight
+    ATR-scaled stop fired ONLY during the first 30 minutes and then
+    handed off to the looser composite tier — which defeated the
+    purpose of the 30-minute grace period, since the tightest rule was
+    the one active exactly when we wanted maximum tolerance, and the
+    loosest rule took over once tolerance was no longer the goal.
     """
-    global ever_touched_breakeven
     closed = []
     now    = time.time()
-    MAX_INCREMENT_SECS = SCAN_INTERVAL * 5  # guard against long gaps between calls
 
     for symbol, pos in positions.items():
         try:
@@ -2473,52 +2464,25 @@ def check_max_losing_hold(positions: dict) -> list[str]:
             continue
 
         if pnl_pct >= 0:
-            # Touched breakeven at least once — proven, no longer on probation
-            if symbol in ever_touched_breakeven:
-                del ever_touched_breakeven[symbol]
-                save_ever_breakeven()
-            continue
+            continue  # only a downside check — profit targets handled elsewhere
 
         entry_time = entry_signals.get(symbol, {}).get("entry_time")
         if entry_time is None:
             continue  # legacy position, no entry timestamp — skip
 
-        if symbol not in ever_touched_breakeven:
-            ever_touched_breakeven[symbol] = {"accumulated_hours": 0.0, "last_check": now}
-            save_ever_breakeven()
-            continue
+        minutes_held = (now - entry_time) / 60
+        if minutes_held < STOP_LOSS_ACTIVATION_MINUTES:
+            continue  # still inside the grace period — nothing fires yet, by design
 
-        state   = ever_touched_breakeven[symbol]
-        elapsed = min(now - state["last_check"], MAX_INCREMENT_SECS)
-        state["accumulated_hours"] += elapsed / 3600
-        state["last_check"] = now
-        save_ever_breakeven()
-
-        hours_on_probation = state["accumulated_hours"]
-        early_stop          = get_early_exit_stop(symbol)
-
-        # Two ways to exit during probation: the window expires, OR the
-        # ATR-scaled early stop is hit first (whichever comes first
-        # minimises the loss — no reason to wait out the full window
-        # if the loss-minimising stop already triggered).
-        if hours_on_probation >= NEVER_BREAKEVEN_WINDOW_HOURS:
+        early_stop = get_early_exit_stop(symbol)
+        if pnl_pct <= early_stop:
             reason = (
-                f"NEVER_BREAKEVEN ({hours_on_probation:.1f} trading-hrs, never touched "
-                f"breakeven — forced exit, {pnl_pct*100:+.2f}%)"
+                f"EARLY_EXIT_STOP (ATR-scaled {early_stop*100:.1f}% stop hit at "
+                f"{minutes_held:.1f}min held — minimising loss, {pnl_pct*100:+.2f}%)"
             )
-        elif pnl_pct <= early_stop:
-            reason = (
-                f"EARLY_EXIT_STOP (ATR-scaled {early_stop*100:.1f}% stop hit during "
-                f"{hours_on_probation:.1f}hr probation — minimising loss, {pnl_pct*100:+.2f}%)"
-            )
-        else:
-            continue
-
-        if close_position(symbol, pnl_pct, reason):
-            closed.append(symbol)
-            del ever_touched_breakeven[symbol]
-            save_ever_breakeven()
-            log.warning(f"  [SELL] {symbol} exited — {reason}")
+            if close_position(symbol, pnl_pct, reason):
+                closed.append(symbol)
+                log.warning(f"  [SELL] {symbol} exited — {reason}")
 
     return closed
 
@@ -3041,7 +3005,8 @@ def run():
     load_peaks()
     load_cooldowns()     # restore stop-loss/profit cooldowns after restart
     load_entry_signals()  # restore entry snapshots for signal-attribution analysis
-    load_ever_breakeven()  # restore never-touched-breakeven probation tracking
+    # (early-hold tight floor no longer needs separate persisted state —
+    # it derives purely from entry_time, already loaded via entry_signals)
     start_news_stream()  # Start news WebSocket in background thread
 
     log.info("=" * 60)
@@ -3070,7 +3035,7 @@ def run():
     log.info(f"  90-day audit:   Volume, TA alignment, win rate")
     log.info(f"  Held-position news review: bearish/material-adverse news on a HELD symbol re-runs fundamentals, can trigger early exit")
     log.info(f"  Stale-hold check: fundamentals re-checked after {STALE_HOLD_HOURS}hr hold, max 1x/hr per symbol")
-    log.info(f"  Never-breakeven exit: forced exit if never green within {NEVER_BREAKEVEN_WINDOW_HOURS}hrs, or ATR-scaled early stop hit sooner")
+    log.info(f"  Early-hold policy: no exit fires in first {STOP_LOSS_ACTIVATION_MINUTES}min (noise tolerance); after that, ATR-scaled early-exit stop (hard-capped -0.5%) AND composite tier both active")
     log.info(f"  Pause:          set PAUSED=true in Render")
     log.info("=" * 60)
 
