@@ -1826,6 +1826,7 @@ def run_premarket_scan():
     signal_cache      = candidates
     signal_cache_time = time.time()
     signal_cache_date = today
+    save_scan_state()  # persist immediately — a redeploy right after this point must NOT re-scan
 
     log.info("=" * 60)
     log.info(f"PRE-MARKET SCAN COMPLETE — {len(candidates)} BUY signals")
@@ -1920,6 +1921,52 @@ def get_positions() -> dict:
 COOLDOWN_FILE = "/tmp/reentry_cooldowns.json"
 STRIKES_FILE  = "/tmp/stop_loss_strikes.json"
 ENTRY_SIGNALS_FILE = "/tmp/entry_signals.json"
+SCAN_STATE_FILE = "/tmp/scan_state.json"
+
+# ── Scan-gate persistence (Sep 2026) ──────────────────────────────
+# Root cause: signal_cache, signal_cache_date, and last_rescan_time
+# were plain in-memory globals with NO persistence — same class of bug
+# as the earlier entry_composite/NVDA and cooldown/AMZN incidents.
+# should_run_premarket_scan()'s "already scanned today, don't repeat"
+# check (signal_cache_date == today and signal_cache) relies entirely
+# on this state surviving. A Render redeploy during or shortly after
+# the scan window wipes it back to signal_cache_date="" and
+# signal_cache=[] — the gate then correctly (by its own logic) sees
+# "haven't scanned today" and fires a brand new scan, burning a full
+# round of Claude API calls that had already just completed moments
+# before the upload. Persisting this the same way entry_signals and
+# reentry_cooldown already are closes the gap.
+def save_scan_state():
+    try:
+        with open(SCAN_STATE_FILE, "w") as f:
+            json.dump({
+                "signal_cache_date": signal_cache_date,
+                "signal_cache":      signal_cache,
+                "last_rescan_time":  last_rescan_time,
+            }, f)
+    except Exception as e:
+        log.warning(f"Failed to save scan state: {e}")
+
+def load_scan_state():
+    global signal_cache, signal_cache_date, last_rescan_time
+    try:
+        with open(SCAN_STATE_FILE) as f:
+            data = json.load(f)
+        today = datetime.now(ET).strftime("%Y-%m-%d")
+        if data.get("signal_cache_date") == today:
+            signal_cache      = data.get("signal_cache", [])
+            signal_cache_date = data.get("signal_cache_date", "")
+            last_rescan_time  = data.get("last_rescan_time", 0.0)
+            log.info(
+                f"Restored today's scan state — {len(signal_cache)} cached signal(s), "
+                f"scan already completed today (redeploy will NOT trigger a fresh scan)"
+            )
+        else:
+            log.info("Restored scan state is from a prior day — will scan fresh at next window")
+    except FileNotFoundError:
+        pass
+    except Exception as e:
+        log.warning(f"Failed to load scan state: {e}")
 
 entry_signals: dict = {}   # {symbol: {composite, confidence, ta_score, fund_score, sector, ...}}
                             # captured at buy time, consumed + cleared at exit time
@@ -3005,6 +3052,8 @@ def run():
     load_peaks()
     load_cooldowns()     # restore stop-loss/profit cooldowns after restart
     load_entry_signals()  # restore entry snapshots for signal-attribution analysis
+    load_scan_state()     # restore today's scan cache — prevents a redeploy from
+                           # triggering a wasted re-scan if one already ran today
     # (early-hold tight floor no longer needs separate persisted state —
     # it derives purely from entry_time, already loaded via entry_signals)
     start_news_stream()  # Start news WebSocket in background thread
@@ -3171,6 +3220,13 @@ def run():
                     )
                 else:
                     deploy_from_cache(positions, account)
+
+            # Persist scan-gate state every cycle — cheap (one small JSON
+            # write), and covers every place signal_cache/last_rescan_time
+            # gets mutated during the day (deploys, exits, emergency
+            # rescans, news-triggered inserts) without needing a save call
+            # at each individual mutation site.
+            save_scan_state()
 
         except KeyboardInterrupt:
             log.info("Bot stopped.")
