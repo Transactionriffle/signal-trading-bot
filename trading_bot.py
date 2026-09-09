@@ -134,6 +134,58 @@ def get_dynamic_trail_gap(peak_pct: float) -> float:
             break
     return gap
 
+# ── Dynamic downside floor (Sep 2026) ────────────────────────────
+# Mirrors the dynamic trail concept, inverted: the trail widens its
+# gap as a GAIN grows, giving winners more room the further they run.
+# This does the opposite for LOSSES — the effective stop TIGHTENS
+# (moves closer to current price) the deeper a loss gets, rather than
+# giving the position the full remaining distance to its tier ceiling
+# (-3%/-4%/-5%) regardless of how the decline is behaving.
+#
+# Rationale (Sep 8 case): NVDA sat at -2.01% for over 3 hours, still
+# well inside its tier ceiling the whole time — the flat-tier approach
+# would let it ride the FULL remaining distance to -3%/-4%/-5% before
+# doing anything, treating "-0.5% and drifting" identically to "-2.5%
+# and accelerating." A trader reads the RATE and DEPTH of a decline as
+# informative, the same way the trail reads the SIZE of a peak as
+# informative — this generalises that same instinct to the downside,
+# independent of the systemic-derisk exception (which only applies
+# during a severe VIX + multi-sector event).
+#
+# Table is fraction-of-tier-consumed -> effective stop at that point.
+# E.g. tier=-4%: at -1% (25% of tier consumed) still get the full -4%
+# ceiling; at -2.5% (62.5% consumed) effective stop tightens to -3%;
+# beyond -3% it tightens further toward the tier itself. Keeps the
+# 30-minute activation delay untouched — this only changes WHAT the
+# stop level is once the delay has passed, not WHEN it can first fire.
+DYNAMIC_DOWNSIDE_TABLE = [
+    # (fraction_of_tier_consumed, effective_stop_as_fraction_of_tier)
+    (0.0,  1.00),   # 0-25% into the tier   → full tier ceiling, give it room
+    (0.25, 0.85),   # 25-50% into the tier  → tighten to 85% of tier
+    (0.50, 0.65),   # 50-75% into the tier  → tighten to 65% of tier
+    (0.75, 0.50),   # 75%+ into the tier    → tighten to 50% of tier — cut sooner
+                     #                          if it's already deep and not stabilising
+]
+
+def get_dynamic_downside_floor(pnl_pct: float, tier_stop: float) -> float:
+    """
+    Returns the EFFECTIVE stop for the current loss depth, tightening
+    progressively as pnl_pct approaches tier_stop (the tier ceiling,
+    e.g. -0.03/-0.04/-0.05). Both inputs are negative fractions.
+    Returns a value between tier_stop and 0 — always at least as tight
+    as (closer to zero than) the flat tier, never looser.
+    """
+    if tier_stop >= 0:
+        return tier_stop  # guard against misuse — tier stops are always negative
+    fraction_consumed = min(1.0, pnl_pct / tier_stop)  # both negative → ratio is positive, 0..1+
+    multiplier = DYNAMIC_DOWNSIDE_TABLE[0][1]
+    for threshold, table_mult in DYNAMIC_DOWNSIDE_TABLE:
+        if fraction_consumed >= threshold:
+            multiplier = table_mult
+        else:
+            break
+    return tier_stop * multiplier
+
 # ── VIX-aware breakeven — calm markets need more room before locking in ──
 # Rationale: in a low-VIX (<18) tape, stocks oscillate ±1% on pure noise.
 # The tight 1%/0.5% breakeven was catching that noise and exiting winners
@@ -2697,6 +2749,20 @@ def check_profit_targets(positions: dict) -> list[str]:
                         f"  {symbol}: at {pnl_pct*100:+.2f}% (below {active_stop*100:.0f}% stop) but only "
                         f"{minutes_held:.1f}min held — stop-loss activates at {STOP_LOSS_ACTIVATION_MINUTES}min, holding"
                     )
+            elif current_peak < be_trigger and active_stop < pnl_pct < get_dynamic_downside_floor(pnl_pct, active_stop):
+                # ── Dynamic downside floor (Sep 2026) ───────────
+                # Position hasn't hit the flat tier ceiling yet, but HAS
+                # crossed the tightened floor for how deep it already is.
+                # Same activation delay applies — a position can't be cut
+                # by this any earlier than the flat stop could be.
+                entry_time = entry_signals.get(symbol, {}).get("entry_time")
+                minutes_held = (time.time() - entry_time) / 60 if entry_time else None
+                if minutes_held is not None and minutes_held >= STOP_LOSS_ACTIVATION_MINUTES:
+                    dyn_floor = get_dynamic_downside_floor(pnl_pct, active_stop)
+                    reason = (
+                        f"DYNAMIC_STOP ({pnl_pct*100:+.2f}% crossed tightened floor "
+                        f"{dyn_floor*100:.1f}% — tier ceiling was {active_stop*100:.0f}%)"
+                    )
 
             # ── Weak sector mid-day exit ───────────────────────
             # Normally only exits at breakeven or better — never crystallise
@@ -2999,6 +3065,7 @@ def run():
     log.info(f"  Min composite:  {MIN_COMPOSITE} (raised from 3.0 — Jul 29 review)")
     log.info(f"  Stop loss:      tiered by entry composite — <4.5: -3% | 4.5-6.0: -4% | 6.0+: -5%")
     log.info(f"  Stop loss delay: activates {STOP_LOSS_ACTIVATION_MINUTES}min after entry (avoids opening-print noise)")
+    log.info(f"  Dynamic downside floor: tightens toward tier ceiling as loss deepens (mirrors trail, inverted)")
     log.info(f"  Max drawdown:   {MAX_DRAWDOWN*100:.0f}%")
     log.info(f"  90-day audit:   Volume, TA alignment, win rate")
     log.info(f"  Held-position news review: bearish/material-adverse news on a HELD symbol re-runs fundamentals, can trigger early exit")
