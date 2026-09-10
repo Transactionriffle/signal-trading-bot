@@ -17,14 +17,16 @@ Architecture:
 
   During market hours:
     → Monitor positions every 60 seconds (zero Claude calls)
-    → Exit priority: profit target (ATR-based, adaptive) > stop-loss-
-      magnitude override (always labelled STOP_LOSS regardless of
-      prior peak, for accurate attribution) > dynamic-width trail
-      (arms at +0.2% peak, gap widens with peak size) > old fixed
-      trail (+3%→+2.5%, rarely reached first) > breakeven stop
+    → Exit priority: +60% hard ceiling (the only fixed profit exit —
+      ATR/fixed target removed Sep 10 2026) > stop-loss-magnitude
+      override (always labelled STOP_LOSS regardless of prior peak,
+      for accurate attribution) > dynamic-width trail (arms at +1.0%
+      peak, gap widens with peak size; fresh tiers at +5/10/15/20/40%
+      so a runner is never sold at a fixed level below +60%) > old
+      fixed trail (+3%→+2.5%, rarely reached first) > breakeven stop
       (VIX-aware: wider band when VIX<18) > composite-tiered stop
-      loss (-3%/-4%/-5% by entry conviction, dynamic downside floor
-      tightens as loss deepens) > weak-sector mid-day exit
+      loss (-0.75%/-1.0%/-1.5% by entry conviction, dynamic downside
+      floor tightens as loss deepens) > weak-sector mid-day exit
     → First 30 min after entry: full noise tolerance, nothing fires.
       After that: ATR-scaled early-exit stop (hard-capped -0.5%) AND
       the composite-tiered stop are both active — whichever is
@@ -112,10 +114,21 @@ SCAN_INTERVAL   = 60
 ET              = ZoneInfo("America/New_York")
 
 # ── Risk thresholds ────────────────────────────────────────────
-PROFIT_TARGET   =  0.05    # +5%   sell immediately
-PEAK_TRIGGER    =  0.03    # +3%   activate trailing protection
-TRAIL_SELL      =  0.025   # +2.5% sell if falls back here after peak
-STOP_LOSS       = -0.05    # -5%   hard stop (before breakeven activates)
+# Sep 10 2026 — fixed profit target REMOVED. Realised wins were being
+# capped at +0.1-0.5% (MSFT +0.11%) while losses ran to -1.7% (SLB) —
+# a badly inverted win/loss ratio. Winners are now only closed by the
+# escalating dynamic trail (see DYNAMIC_TRAIL_TABLE) or the hard
+# ceiling below. Nothing sells a position at a fixed +5% any more.
+HARD_SELL_CEILING = 0.60   # +60%  the ONLY fixed profit exit — sell immediately, no trail given
+PEAK_TRIGGER    =  0.03    # +3%   activate trailing protection (legacy fallback path)
+TRAIL_SELL      =  0.025   # +2.5% sell if falls back here after peak (legacy fallback path)
+# Sep 10 2026 — hard stop tightened from -5% to -1.5%. This is the CEILING
+# for the highest-conviction tier; the composite tiers below it are
+# tighter still (-0.75% / -1.0% / -1.5%). Target risk:reward is ~2:1 —
+# with wins allowed to run via the trail, a stop this tight only needs
+# a ~34% win rate to break even, versus the ~93% the old -5% flat
+# stop against +0.4% typical wins demanded.
+STOP_LOSS       = -0.015   # -1.5% hard stop ceiling (before breakeven activates)
 STOP_LOSS_ACTIVATION_MINUTES = 30  # composite-tiered stop loss only fires after
                                      # this many minutes held — avoids cutting a
                                      # fresh position on opening-print/spread noise
@@ -124,21 +137,33 @@ BREAKEVEN_TRIGGER = 0.01   # +1%   once hit, stop shifts to +0.5% (default / hig
 BREAKEVEN_STOP    = 0.005  # +0.5% minimum locked-in gain after breakeven (default / high-VIX)
 
 # ── Dynamic-width trailing stop (Aug 2026) ──────────────────────
-# Arms as soon as peak reaches +0.2%. The gap between peak and the
+# Sep 10 2026: arm raised from +0.2% to +1.0%, first gap widened from
+# 0.1% to 0.4%. The +0.2%/0.1% row was producing the +0.1% "wins"
+# (MSFT +0.11% today) — it locked winners in before they had any room
+# to become real gains. Now a position must peak +1% before the trail
+# arms, and its first floor sits at +0.6% — just above the +0.5%
+# breakeven lock, so the two rules stay coherent rather than fighting.
+# Arms as soon as peak reaches +1.0%. The gap between peak and the
 # sell-floor is NOT constant — it widens as the peak grows, so small
 # moves get locked in tight (protect against noise) while genuine
 # runners (like MU's +19% day) get progressively more room to
 # breathe instead of being stopped out on the first 0.1% wobble.
 # Table is peak-threshold -> trail gap. Highest matching threshold
 # the peak has reached determines the active gap.
-MICRO_TRAIL_ARM_PCT = 0.002   # +0.2% peak required to arm the trail at all
+MICRO_TRAIL_ARM_PCT = 0.01    # +1.0% peak required to arm the trail at all (was +0.2%)
+# Sep 10 2026 — table extended upward. With the fixed profit target
+# gone, a runner past +5% keeps trailing under the SAME mechanic, with
+# a fresh (wider) tier arming at +10%, +20% and +40%. +60% is the hard
+# ceiling (HARD_SELL_CEILING) where the position is sold outright.
 DYNAMIC_TRAIL_TABLE = [
     # (peak_threshold, gap_below_peak)
-    (0.002,  0.001),   # peak +0.2%  → floor 0.1% behind   (tight — noise protection)
+    (0.01,   0.004),   # peak +1%    → floor 0.4% behind   (first lock at +0.6%, just above breakeven's +0.5%)
     (0.02,   0.005),   # peak +2%    → floor 0.5% behind
-    (0.05,   0.015),   # peak +5%    → floor 1.5% behind
+    (0.05,   0.015),   # peak +5%    → floor 1.5% behind   (old profit-target level — now just another trail tier)
     (0.10,   0.03),    # peak +10%   → floor 3.0% behind
     (0.15,   0.05),    # peak +15%   → floor 5.0% behind   (room for a runner)
+    (0.20,   0.06),    # peak +20%   → floor 6.0% behind
+    (0.40,   0.10),    # peak +40%   → floor 10.0% behind  (last trail tier before the +60% hard ceiling)
 ]
 
 def get_dynamic_trail_gap(peak_pct: float) -> float:
@@ -498,9 +523,9 @@ systemic_derisk_active: bool         = False  # True when VIX severely elevated 
 # ── Systemic de-risk thresholds ──────────────────────────────────
 SYSTEMIC_DERISK_VIX              = 28   # VIX level considered "severe", above the existing FEAR_VIX=25
 SYSTEMIC_DERISK_MIN_WEAK_SECTORS = 3    # 3+ simultaneously weak sectors = broad event, not rotation
-SYSTEMIC_DERISK_MAX_LOSS_EXIT    = -0.02  # during systemic de-risk, allow weak-sector exit up to -2% loss
-                                           # (still well inside the -3%/-4%/-5% composite-tiered hard stop,
-                                           # so this only ever exits EARLIER/SMALLER than the hard stop would)
+SYSTEMIC_DERISK_MAX_LOSS_EXIT    = -0.005 # during systemic de-risk, allow weak-sector exit up to -0.5% loss
+                                           # (Sep 10: was -2%; tiers are now -0.75%/-1.0%/-1.5%, so this stays
+                                           # inside them — it only ever exits EARLIER/SMALLER than the hard stop would)
 # GAP_RISK_THRESHOLD removed Aug 31 — the check could not fire until market
 # open regardless (no code runs while market is closed), so it never had
 # any head start over the ordinary composite-tiered stop loss, which would
@@ -1317,7 +1342,10 @@ def assess_market_state():
     log.info(f"Market state: {market_state} | Fear: {fear_active} | Weak sectors: {weak_sectors or 'none'}")
 
 def get_stop_loss() -> float:
-    return -0.02 if market_state == "BEAR" else STOP_LOSS
+    # BEAR mode: tightest stop of all. Was -2% when the tiers were
+    # -3/-4/-5%; with tiers now -0.75/-1.0/-1.5% that would have been
+    # LOOSER than every tier, so it's pinned to the tightest tier.
+    return -0.0075 if market_state == "BEAR" else STOP_LOSS
 
 def adjust_qty_for_fear(qty: int, price: float, alloc: float) -> int:
     if fear_active and qty > 1:
@@ -2055,7 +2083,7 @@ def register_reentry_cooldown(symbol: str, exit_reason: str, exit_price: float):
     """
     Registers a re-entry cooldown after a position closes.
 
-    PROFIT_TARGET  → 4hr cooldown + 2% price gate
+    HARD_CEILING   → 4hr cooldown + 2% price gate (the +60% forced exit — replaces PROFIT_TARGET)
     STOP_LOSS      → 24hr cooldown + 2% price gate
     WEAK_SECTOR    → 2hr cooldown + 2% price gate (sector still weak — don't re-enter)
     TRAILING       → 2% price gate only (no time cooldown — partial win)
@@ -2075,7 +2103,7 @@ def register_reentry_cooldown(symbol: str, exit_reason: str, exit_price: float):
     global signal_cache
     signal_cache = [s for s in signal_cache if s["symbol"] != symbol]
 
-    if "PROFIT_TARGET" in exit_reason:
+    if "HARD_CEILING" in exit_reason or "PROFIT_TARGET" in exit_reason:
         reentry_cooldown[symbol] = {
             "type":       "profit",
             "time":       now,
@@ -2632,26 +2660,29 @@ def check_profit_targets(positions: dict) -> list[str]:
     """
     Exit rules — no Claude calls needed.
     Priority order (first match wins):
-      1. Profit target (ATR-based, e.g. +5-12%)
-      2. Dynamic-width trail: peak ≥ +0.2% arms it. Gap between peak
+      1. Hard ceiling: +60% → sell immediately (the ONLY fixed profit
+         exit — the fixed/ATR profit target was removed Sep 10 2026)
+      2. Dynamic-width trail: peak ≥ +1.0% arms it. Gap between peak
          and sell-floor widens as the peak grows (see DYNAMIC_TRAIL_TABLE):
-         tight (0.1%) near breakeven to protect against noise, wide
-         (up to 5%) at high peaks so a genuine runner (like MU's +19%
+         tight (0.4%) near breakeven to protect against noise, wide
+         (up to 10%) at high peaks so a genuine runner (like MU's +19%
          day) gets room to keep going instead of being stopped out on
-         the first small wobble.
+         the first small wobble. Fresh, wider tiers arm at +5%, +10%,
+         +15%, +20% and +40% — a runner is never sold at a fixed level
+         below +60%.
       3. Old fixed trailing: peak ≥ +3% → sell if falls to +2.5%
          (kept as a fallback path; in practice #2 fires first since
-         it arms much earlier at +0.2%)
+         it arms earlier at +1.0% and its floor is above +2.5% by then)
       4. Breakeven stop: peak ≥ +1% (or +2% calm-VIX) → stop shifts
          to +0.5% (or +1% calm-VIX)
-      5. Hard stop loss: composite-tiered -3%/-4%/-5% (-2% in BEAR mode)
+      5. Hard stop loss: composite-tiered -0.75%/-1.0%/-1.5% (-0.75% in BEAR mode)
     Plus:
       6. Weak sector mid-day exit: if sector turns weak AND position
          is at breakeven or better → exit to protect gains.
          If position is negative → hold (don't crystallise a loss).
     """
     closed      = []
-    base_stop   = get_stop_loss()   # -5% normal, -2% in BEAR mode — the ceiling
+    base_stop   = get_stop_loss()   # -1.5% normal, -0.75% in BEAR mode — the ceiling
     global signal_cache  # declared once here — was previously declared twice, nested
                           # inside conditional blocks below, which is a SyntaxError in
                           # Python if any use of the name in this scope could precede a
@@ -2710,8 +2741,13 @@ def check_profit_targets(positions: dict) -> list[str]:
             # Fix: entries with a weaker composite (closer to the MIN_COMPOSITE
             # floor) get a TIGHTER stop, since they're lower-conviction and
             # shouldn't be given as much rope. High-conviction entries (which
-            # should also be sized larger via Kelly) get the full -5% to let
-            # the thesis play out. BEAR mode's -2% ceiling always wins (tightest).
+            # should also be sized larger via Kelly) get the full -1.5% to let
+            # the thesis play out. BEAR mode's -0.75% ceiling always wins (tightest).
+            #
+            # Sep 10 2026: tiers tightened from -3%/-4%/-5% to -0.75%/-1.0%/-1.5%.
+            # The loss side was ~16x the win side (SLB -1.71% vs MSFT +0.11%
+            # the same day). Winners can now run via the trail, so the stop
+            # is sized to what the strategy's wins actually look like.
             #
             # Aug 24 fix: entry_signals (/tmp-backed) is lost on every Render
             # redeploy — this caused NVDA to silently fall back to the flat
@@ -2726,11 +2762,11 @@ def check_profit_targets(positions: dict) -> list[str]:
                     log.info(f"  {symbol}: entry composite recovered from order history ({entry_composite:.2f}) — /tmp cache was empty")
             if entry_composite is not None and market_state != "BEAR":
                 if entry_composite < 4.5:
-                    active_stop = -0.03      # marginal entry (4.0-4.5) → tighter -3%
+                    active_stop = -0.0075    # marginal entry (4.0-4.5) → tighter -0.75%
                 elif entry_composite < 6.0:
-                    active_stop = -0.04      # normal entry (4.5-6.0)  → -4%
+                    active_stop = -0.01      # normal entry (4.5-6.0)  → -1.0%
                 else:
-                    active_stop = base_stop  # high conviction (6.0+)  → full -5%
+                    active_stop = base_stop  # high conviction (6.0+)  → full -1.5%
             else:
                 active_stop = base_stop      # no entry data anywhere, or BEAR mode
 
@@ -2755,23 +2791,22 @@ def check_profit_targets(positions: dict) -> list[str]:
             current_peak = position_peaks.get(symbol, 0.0)
             reason       = None
 
-            # ── Adaptive profit target — ATR-based per position ──
-            # Stored at buy time: position_peaks[f"{symbol}_target"]
-            # High-vol stocks (MU, NVDA, AMD): ATR ~4% → target ~10%
-            # Low-vol stocks (JPM, V, MA):     ATR ~1% → target ~3%
-            # Falls back to fixed PROFIT_TARGET if no ATR stored
-            profit_target = position_peaks.get(f"{symbol}_target", PROFIT_TARGET)
+            # ── Profit side (Sep 10 2026) ─────────────────────
+            # The ATR-based / fixed profit target that used to live here
+            # was REMOVED — it was selling winners at +3-5% while losses
+            # ran to the full tier. A winner now only closes via the
+            # escalating dynamic trail, or at the +60% hard ceiling.
 
             # ── Standard exit rules ────────────────────────────
-            # Priority order: profit target > stop-loss-magnitude override >
+            # Priority order: hard ceiling > stop-loss-magnitude override >
             # micro-trail > old fixed trail > breakeven stop > hard stop loss
             #
             # Sep 2026 audit fix: the DYNAMIC_TRAIL branch below only checks
             # "has price fallen more than the trail gap below its peak" — it
             # has NO awareness of the position's own stop-loss tier. Once a
-            # position has EVER peaked >= MICRO_TRAIL_ARM_PCT (0.2%), its
+            # position has EVER peaked >= MICRO_TRAIL_ARM_PCT (1.0%), its
             # current_peak never resets down, so ANY subsequent crash — even
-            # one that blows straight through the -3%/-4%/-5% composite tier
+            # one that blows straight through the -0.75%/-1.0%/-1.5% composite tier
             # — gets caught and labelled "DYNAMIC_TRAIL" instead of the more
             # accurate "STOP_LOSS". This didn't cost money (the position still
             # closes at the same time either way), but it corrupts
@@ -2785,8 +2820,8 @@ def check_profit_targets(positions: dict) -> list[str]:
             # regardless of prior peak — the magnitude of the loss is what
             # matters for accurate attribution, not whether it once ticked
             # positive first.
-            if pnl_pct >= profit_target:
-                reason = f"PROFIT_TARGET ({profit_target*100:.1f}%)"
+            if pnl_pct >= HARD_SELL_CEILING:
+                reason = f"HARD_CEILING (+{HARD_SELL_CEILING*100:.0f}% reached — forced exit, no trail)"
             elif pnl_pct <= active_stop:
                 # Loss has reached stop-loss-tier magnitude — always label
                 # it STOP_LOSS for accurate attribution, even if this
@@ -2842,7 +2877,7 @@ def check_profit_targets(positions: dict) -> list[str]:
             # EXCEPTION (Aug 2026): during a systemic de-risk event (severe
             # VIX + 3+ sectors weak simultaneously — see assess_market_state),
             # this is not rotation, it's a broad selloff. Waiting for each
-            # position's own composite-tiered hard stop (-3% to -5%) to fire
+            # position's own composite-tiered hard stop (-0.75% to -1.5%) to fire
             # one at a time means riding the full stop distance on every
             # position during exactly the scenario where speed matters most.
             # In that mode, allow exiting a small loss (bounded by
@@ -3067,16 +3102,11 @@ def deploy_from_cache(positions: dict, account):
             continue
         qty = adjust_qty_for_fear(qty, live_price, alloc)
 
-        # ── ATR-based profit target (backtest validated: +$45 avg win) ──
-        # Stores target in peaks dict so check_profit_targets can use it
-        atr = candidate.get("atr_pct", None)
-        if atr and atr > 0:
-            atr_target = min(0.12, max(0.03, atr * 2.5))
-            position_peaks[f"{symbol}_target"] = atr_target
-            save_peaks()
-            log.info(f"  {symbol}: {qty} shares @ ~${live_price:.2f} = ${qty*live_price:,.0f} ({kelly*100:.0f}% Kelly, ATR target {atr_target*100:.1f}%)")
-        else:
-            log.info(f"  {symbol}: {qty} shares @ ~${live_price:.2f} = ${qty*live_price:,.0f} ({kelly*100:.0f}% Kelly)")
+        # ATR-based profit target removed Sep 10 2026 — check_profit_targets()
+        # no longer sells at a fixed level; the escalating trail governs
+        # the profit side. atr_pct is still stored in entry_signals below
+        # for the early-exit stop.
+        log.info(f"  {symbol}: {qty} shares @ ~${live_price:.2f} = ${qty*live_price:,.0f} ({kelly*100:.0f}% Kelly)")
 
         # ── Store entry signal snapshot — required to analyse which
         # analysis (TA vs fundamentals) actually drives outcomes.
@@ -3126,17 +3156,18 @@ def run():
     log.info(f"  Sector cap:     Max 2 positions per sector (backtest validated)")
     log.info(f"  AI concentration cap: Max {MAX_AI_CORRELATED_POSITIONS} combined across semis/tech/software/cyber")
     log.info(f"  Systemic de-risk: VIX≥{SYSTEMIC_DERISK_VIX} + {SYSTEMIC_DERISK_MIN_WEAK_SECTORS}+ weak sectors → blocks new buys, allows early loss-cutting")
-    log.info(f"  Re-entry rules: +5% exit → 4hr cooldown + 2% price gate")
-    log.info(f"                  -5% stop → 24hr cooldown + 2% price gate")
+    log.info(f"  Re-entry rules: +60% ceiling exit → 4hr cooldown + 2% price gate")
+    log.info(f"                  stop loss → 24hr cooldown + 2% price gate (escalating strikes)")
     log.info(f"  Max positions:  10 concurrent")
-    log.info(f"  Profit target:  +{PROFIT_TARGET*100:.0f}%")
+    log.info(f"  Profit target:  NONE — trail-only. Hard ceiling +{HARD_SELL_CEILING*100:.0f}% (sell immediately)")
+    log.info(f"  Trail tiers:    " + " | ".join(f"peak>={t*100:g}%→{g*100:g}% behind" for t, g in DYNAMIC_TRAIL_TABLE))
     log.info(f"  Trailing:       peak >={PEAK_TRIGGER*100:.0f}% → sell at +{TRAIL_SELL*100:.0f}%")
     log.info(f"  Breakeven:      calm(VIX<{CALM_VIX_THRESHOLD}) peak>={BREAKEVEN_TRIGGER_CALM*100:.0f}%→lock+{BREAKEVEN_STOP_CALM*100:.0f}% | else peak>={BREAKEVEN_TRIGGER*100:.0f}%→lock+{BREAKEVEN_STOP*100:.1f}%")
-    log.info(f"  Stop loss:      -{abs(STOP_LOSS)*100:.0f}%")
+    log.info(f"  Stop loss:      -{abs(STOP_LOSS)*100:.1f}% ceiling")
     log.info(f"  TA/Fund weight: {TECH_WEIGHT}% / {FUND_WEIGHT}%")
     log.info(f"  Min confidence: {MIN_CONFIDENCE}%")
     log.info(f"  Min composite:  {MIN_COMPOSITE} (raised from 3.0 — Jul 29 review)")
-    log.info(f"  Stop loss:      tiered by entry composite — <4.5: -3% | 4.5-6.0: -4% | 6.0+: -5%")
+    log.info(f"  Stop loss:      tiered by entry composite — <4.5: -0.75% | 4.5-6.0: -1.0% | 6.0+: -1.5%")
     log.info(f"  Stop loss delay: activates {STOP_LOSS_ACTIVATION_MINUTES}min after entry (avoids opening-print noise)")
     log.info(f"  Dynamic downside floor: tightens toward tier ceiling as loss deepens (mirrors trail, inverted)")
     log.info(f"  Max drawdown:   {MAX_DRAWDOWN*100:.0f}%")
