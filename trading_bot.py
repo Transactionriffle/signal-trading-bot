@@ -25,7 +25,7 @@ Architecture:
       so a runner is never sold at a fixed level below +60%) > old
       fixed trail (+3%→+2.5%, rarely reached first) > breakeven stop
       (VIX-aware: wider band when VIX<18) > composite-tiered stop
-      loss (-0.75%/-1.0%/-1.5% by entry conviction, dynamic downside
+      loss (-3%/-4%/-5% by entry conviction, dynamic downside
       floor tightens as loss deepens) > weak-sector mid-day exit
     → First 30 min after entry: full noise tolerance, nothing fires.
       After that: ATR-scaled early-exit stop (hard-capped -0.5%) AND
@@ -54,8 +54,8 @@ Environment variables (set in Render):
     ALPACA_BASE_URL        (default: https://paper-api.alpaca.markets)
     CLOUDFLARE_WORKER
     TECH_WEIGHT            (default: 40 — 40% TA / 60% fundamental)
-    MIN_CONFIDENCE         (default: 85)
-    MIN_COMPOSITE          (default: 4.0)
+    MIN_CONFIDENCE         (default: 87)
+    MIN_COMPOSITE          (default: 4.2)
     MAX_TRADES_PER_DAY     (default: 10)
     MAX_DRAWDOWN_PCT       (default: 0.15)
     PAUSED                 (set "true" to halt instantly)
@@ -99,7 +99,7 @@ ANTHROPIC_KEY   = os.environ["ANTHROPIC_API_KEY"]
 WORKER_URL      = os.environ.get("CLOUDFLARE_WORKER", "https://winter-cake-6aae.dimitridesplace-65f.workers.dev")
 TECH_WEIGHT     = int(os.environ.get("TECH_WEIGHT", "40"))
 FUND_WEIGHT     = 100 - TECH_WEIGHT
-MIN_CONFIDENCE  = int(os.environ.get("MIN_CONFIDENCE", "85"))  # raised from 80% — filters weak signals like NFLX (82%)
+MIN_CONFIDENCE  = int(os.environ.get("MIN_CONFIDENCE", "87"))  # Sep 11 2026: 85 → 87. (Was raised from 80% earlier — filters weak signals like NFLX (82%))
 
 # Raised from 3.0 → 4.0 (Jul 29 review). Rationale: realised trades were
 # clustering at +0.3-0.5% wins vs -5% stop losses — a ratio that needs a
@@ -107,7 +107,7 @@ MIN_CONFIDENCE  = int(os.environ.get("MIN_CONFIDENCE", "85"))  # raised from 80%
 # marginal (3.0-4.0) entry was negative expected value at that risk/reward.
 # Raising the floor cuts trade count but concentrates capital in the
 # higher-conviction setups the composite score is actually meant to find.
-MIN_COMPOSITE   = float(os.environ.get("MIN_COMPOSITE", "4.0"))
+MIN_COMPOSITE   = float(os.environ.get("MIN_COMPOSITE", "4.2"))  # Sep 11 2026: 4.0 → 4.2 (raised from 3.0 in the Jul 29 review)
 MAX_TRADES_DAY  = int(os.environ.get("MAX_TRADES_PER_DAY", "10"))
 MAX_DRAWDOWN    = float(os.environ.get("MAX_DRAWDOWN_PCT", "0.15"))
 SCAN_INTERVAL   = 60
@@ -122,14 +122,20 @@ ET              = ZoneInfo("America/New_York")
 HARD_SELL_CEILING = 0.60   # +60%  the ONLY fixed profit exit — sell immediately, no trail given
 PEAK_TRIGGER    =  0.03    # +3%   activate trailing protection (legacy fallback path)
 TRAIL_SELL      =  0.025   # +2.5% sell if falls back here after peak (legacy fallback path)
-# Sep 10 2026 — hard stop tightened from -5% to -1.5%. This is the CEILING
-# for the highest-conviction tier; the composite tiers below it are
-# tighter still (-0.75% / -1.0% / -1.5%). Target risk:reward is ~2:1 —
-# with wins allowed to run via the trail, a stop this tight only needs
-# a ~34% win rate to break even, versus the ~93% the old -5% flat
-# stop against +0.4% typical wins demanded.
-STOP_LOSS       = -0.015   # -1.5% hard stop ceiling (before breakeven activates)
-STOP_LOSS_ACTIVATION_MINUTES = 30  # composite-tiered stop loss only fires after
+# Sep 11 2026 — stop tiers ROLLED BACK to the original -3%/-4%/-5%
+# after one day at -0.75/-1.0/-1.5% (the Sep 11 open flushed four
+# carried-over positions at -2.1% to -2.5% — gap losses the tighter
+# tiers couldn't help with, and the tighter tiers would stop out on
+# ordinary intraday noise). Win/loss balance is now addressed on the
+# PROFIT side instead (trail-only, +1% arm, +60% ceiling) rather than
+# by squeezing the stop.
+STOP_LOSS       = -0.05    # -5%   hard stop ceiling (before breakeven activates)
+# Sep 11 2026: activation delay REMOVED (30 → 0). SLB on Sep 10 sold at
+# -1.71% at exactly minute 30 — the loss had already run well past every
+# stop level before anything was allowed to act. Stops now fire from
+# the first monitoring cycle after entry. Left as a constant (0) so
+# every gate below stays wired and it can be re-enabled by one edit.
+STOP_LOSS_ACTIVATION_MINUTES = 0   # composite-tiered stop loss fires immediately (was 30min after
                                      # this many minutes held — avoids cutting a
                                      # fresh position on opening-print/spread noise
                                      # before the thesis has had time to develop
@@ -523,9 +529,9 @@ systemic_derisk_active: bool         = False  # True when VIX severely elevated 
 # ── Systemic de-risk thresholds ──────────────────────────────────
 SYSTEMIC_DERISK_VIX              = 28   # VIX level considered "severe", above the existing FEAR_VIX=25
 SYSTEMIC_DERISK_MIN_WEAK_SECTORS = 3    # 3+ simultaneously weak sectors = broad event, not rotation
-SYSTEMIC_DERISK_MAX_LOSS_EXIT    = -0.005 # during systemic de-risk, allow weak-sector exit up to -0.5% loss
-                                           # (Sep 10: was -2%; tiers are now -0.75%/-1.0%/-1.5%, so this stays
-                                           # inside them — it only ever exits EARLIER/SMALLER than the hard stop would)
+SYSTEMIC_DERISK_MAX_LOSS_EXIT    = -0.02  # during systemic de-risk, allow weak-sector exit up to -2% loss
+                                           # (still well inside the -3%/-4%/-5% composite-tiered hard stop,
+                                           # so this only ever exits EARLIER/SMALLER than the hard stop would)
 # GAP_RISK_THRESHOLD removed Aug 31 — the check could not fire until market
 # open regardless (no code runs while market is closed), so it never had
 # any head start over the ordinary composite-tiered stop loss, which would
@@ -1342,10 +1348,7 @@ def assess_market_state():
     log.info(f"Market state: {market_state} | Fear: {fear_active} | Weak sectors: {weak_sectors or 'none'}")
 
 def get_stop_loss() -> float:
-    # BEAR mode: tightest stop of all. Was -2% when the tiers were
-    # -3/-4/-5%; with tiers now -0.75/-1.0/-1.5% that would have been
-    # LOOSER than every tier, so it's pinned to the tightest tier.
-    return -0.0075 if market_state == "BEAR" else STOP_LOSS
+    return -0.02 if market_state == "BEAR" else STOP_LOSS
 
 def adjust_qty_for_fear(qty: int, price: float, alloc: float) -> int:
     if fear_active and qty > 1:
@@ -2675,14 +2678,14 @@ def check_profit_targets(positions: dict) -> list[str]:
          it arms earlier at +1.0% and its floor is above +2.5% by then)
       4. Breakeven stop: peak ≥ +1% (or +2% calm-VIX) → stop shifts
          to +0.5% (or +1% calm-VIX)
-      5. Hard stop loss: composite-tiered -0.75%/-1.0%/-1.5% (-0.75% in BEAR mode)
+      5. Hard stop loss: composite-tiered -3%/-4%/-5% (-2% in BEAR mode)
     Plus:
       6. Weak sector mid-day exit: if sector turns weak AND position
          is at breakeven or better → exit to protect gains.
          If position is negative → hold (don't crystallise a loss).
     """
     closed      = []
-    base_stop   = get_stop_loss()   # -1.5% normal, -0.75% in BEAR mode — the ceiling
+    base_stop   = get_stop_loss()   # -5% normal, -2% in BEAR mode — the ceiling
     global signal_cache  # declared once here — was previously declared twice, nested
                           # inside conditional blocks below, which is a SyntaxError in
                           # Python if any use of the name in this scope could precede a
@@ -2741,13 +2744,8 @@ def check_profit_targets(positions: dict) -> list[str]:
             # Fix: entries with a weaker composite (closer to the MIN_COMPOSITE
             # floor) get a TIGHTER stop, since they're lower-conviction and
             # shouldn't be given as much rope. High-conviction entries (which
-            # should also be sized larger via Kelly) get the full -1.5% to let
-            # the thesis play out. BEAR mode's -0.75% ceiling always wins (tightest).
-            #
-            # Sep 10 2026: tiers tightened from -3%/-4%/-5% to -0.75%/-1.0%/-1.5%.
-            # The loss side was ~16x the win side (SLB -1.71% vs MSFT +0.11%
-            # the same day). Winners can now run via the trail, so the stop
-            # is sized to what the strategy's wins actually look like.
+            # should also be sized larger via Kelly) get the full -5% to let
+            # the thesis play out. BEAR mode's -2% ceiling always wins (tightest).
             #
             # Aug 24 fix: entry_signals (/tmp-backed) is lost on every Render
             # redeploy — this caused NVDA to silently fall back to the flat
@@ -2762,11 +2760,11 @@ def check_profit_targets(positions: dict) -> list[str]:
                     log.info(f"  {symbol}: entry composite recovered from order history ({entry_composite:.2f}) — /tmp cache was empty")
             if entry_composite is not None and market_state != "BEAR":
                 if entry_composite < 4.5:
-                    active_stop = -0.0075    # marginal entry (4.0-4.5) → tighter -0.75%
+                    active_stop = -0.03      # marginal entry (4.0-4.5) → tighter -3%
                 elif entry_composite < 6.0:
-                    active_stop = -0.01      # normal entry (4.5-6.0)  → -1.0%
+                    active_stop = -0.04      # normal entry (4.5-6.0)  → -4%
                 else:
-                    active_stop = base_stop  # high conviction (6.0+)  → full -1.5%
+                    active_stop = base_stop  # high conviction (6.0+)  → full -5%
             else:
                 active_stop = base_stop      # no entry data anywhere, or BEAR mode
 
@@ -2806,7 +2804,7 @@ def check_profit_targets(positions: dict) -> list[str]:
             # has NO awareness of the position's own stop-loss tier. Once a
             # position has EVER peaked >= MICRO_TRAIL_ARM_PCT (1.0%), its
             # current_peak never resets down, so ANY subsequent crash — even
-            # one that blows straight through the -0.75%/-1.0%/-1.5% composite tier
+            # one that blows straight through the -3%/-4%/-5% composite tier
             # — gets caught and labelled "DYNAMIC_TRAIL" instead of the more
             # accurate "STOP_LOSS". This didn't cost money (the position still
             # closes at the same time either way), but it corrupts
@@ -2877,7 +2875,7 @@ def check_profit_targets(positions: dict) -> list[str]:
             # EXCEPTION (Aug 2026): during a systemic de-risk event (severe
             # VIX + 3+ sectors weak simultaneously — see assess_market_state),
             # this is not rotation, it's a broad selloff. Waiting for each
-            # position's own composite-tiered hard stop (-0.75% to -1.5%) to fire
+            # position's own composite-tiered hard stop (-3% to -5%) to fire
             # one at a time means riding the full stop distance on every
             # position during exactly the scenario where speed matters most.
             # In that mode, allow exiting a small loss (bounded by
@@ -3163,18 +3161,18 @@ def run():
     log.info(f"  Trail tiers:    " + " | ".join(f"peak>={t*100:g}%→{g*100:g}% behind" for t, g in DYNAMIC_TRAIL_TABLE))
     log.info(f"  Trailing:       peak >={PEAK_TRIGGER*100:.0f}% → sell at +{TRAIL_SELL*100:.0f}%")
     log.info(f"  Breakeven:      calm(VIX<{CALM_VIX_THRESHOLD}) peak>={BREAKEVEN_TRIGGER_CALM*100:.0f}%→lock+{BREAKEVEN_STOP_CALM*100:.0f}% | else peak>={BREAKEVEN_TRIGGER*100:.0f}%→lock+{BREAKEVEN_STOP*100:.1f}%")
-    log.info(f"  Stop loss:      -{abs(STOP_LOSS)*100:.1f}% ceiling")
+    log.info(f"  Stop loss:      -{abs(STOP_LOSS)*100:.0f}% ceiling")
     log.info(f"  TA/Fund weight: {TECH_WEIGHT}% / {FUND_WEIGHT}%")
     log.info(f"  Min confidence: {MIN_CONFIDENCE}%")
-    log.info(f"  Min composite:  {MIN_COMPOSITE} (raised from 3.0 — Jul 29 review)")
-    log.info(f"  Stop loss:      tiered by entry composite — <4.5: -0.75% | 4.5-6.0: -1.0% | 6.0+: -1.5%")
-    log.info(f"  Stop loss delay: activates {STOP_LOSS_ACTIVATION_MINUTES}min after entry (avoids opening-print noise)")
+    log.info(f"  Min composite:  {MIN_COMPOSITE} (3.0 → 4.0 Jul 29 review → 4.2 Sep 11)")
+    log.info(f"  Stop loss:      tiered by entry composite — <4.5: -3% | 4.5-6.0: -4% | 6.0+: -5%")
+    log.info(f"  Stop loss delay: NONE — stops active from first cycle after entry (30min grace removed Sep 11)")
     log.info(f"  Dynamic downside floor: tightens toward tier ceiling as loss deepens (mirrors trail, inverted)")
     log.info(f"  Max drawdown:   {MAX_DRAWDOWN*100:.0f}%")
     log.info(f"  90-day audit:   Volume, TA alignment, win rate")
     log.info(f"  Held-position news review: bearish/material-adverse news on a HELD symbol re-runs fundamentals, can trigger early exit")
     log.info(f"  Stale-hold check: fundamentals re-checked after {STALE_HOLD_HOURS}hr hold, max 1x/hr per symbol")
-    log.info(f"  Early-hold policy: no exit fires in first {STOP_LOSS_ACTIVATION_MINUTES}min (noise tolerance); after that, ATR-scaled early-exit stop (hard-capped -0.5%) AND composite tier both active")
+    log.info(f"  Early-hold policy: no grace period — ATR-scaled early-exit stop (hard-capped -0.5%) AND composite tier both active from entry")
     log.info(f"  Pause:          set PAUSED=true in Render")
     log.info("=" * 60)
 
