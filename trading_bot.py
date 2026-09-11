@@ -130,6 +130,29 @@ TRAIL_SELL      =  0.025   # +2.5% sell if falls back here after peak (legacy fa
 # PROFIT side instead (trail-only, +1% arm, +60% ceiling) rather than
 # by squeezing the stop.
 STOP_LOSS       = -0.05    # -5%   hard stop ceiling (before breakeven activates)
+# Sep 11 2026 — no fresh entries from the signal cache in the last part of
+# the session. The Sep 11 log showed the bot still trying to open a new
+# META position at 15:59 ET. A position opened that late gets no intraday
+# management — it's pure overnight-gap exposure on a trade that hasn't
+# proven anything, and the four positions flushed at today's open were
+# exactly that kind of gap loss. Exits, trailing and news handling all keep
+# running until the close; only cache-driven NEW entries stop.
+LAST_ENTRY_ET   = (15, 30) # (hour, minute) ET — no new cache entries at or after this time
+
+# ── Sep 11 2026 — structural scan fix ──────────────────────────
+# The pre-market scan (9:20-9:24 ET) computes TA and relative strength
+# from PRE-MARKET prints, then every deploy for the rest of the session
+# buys on those numbers. Sep 11: SPY -0.60% at 9:20 → +0.88% at 9:32,
+# semis "weak" at 9:20 → fine at 9:32, and the ±1.5 RS term (36% of the
+# 4.2 gate) swung MU 5.90→4.40, AMD 5.50→4.00 on pre-market noise.
+# Fundamentals (60%) don't change intraday and stay pre-market; the
+# TA/RS 40% is now recomputed LIVE at the moment of deployment.
+FIRST_ENTRY_ET  = (9, 45)  # no new cache entries before this — let the opening range form
+REVALIDATE_AT_DEPLOY = True # re-fetch TA + intraday RS and re-test the gates before every buy
+INTRADAY_RS_MAX = 0.75      # RS measured vs today's OPEN (not prior close), capped ±0.75 — tilts, never decides
+REQUIRE_ABOVE_OPEN = True   # only enter a name trading above its 9:30 open (positive intraday RS)
+OVERNIGHT_OPEN_GRACE_MINUTES = 5   # overnight holds: stop-type exits wait until 9:35 unless loss > 2× tier
+MIDDAY_TA_REFRESH_ET = (12, 0)     # one TA-only re-validation of the whole cache; set to None to disable
 # Sep 11 2026: activation delay REMOVED (30 → 0). SLB on Sep 10 sold at
 # -1.71% at exactly minute 30 — the loss had already run well past every
 # stop level before anything was allowed to act. Stops now fire from
@@ -522,6 +545,13 @@ position_peaks:     dict[str, float] = {}
 market_state:       str              = "BULL"
 fear_active:        bool             = False
 weak_sectors:       set              = set()
+# Sep 11 2026 — symbol → epoch of the last close_position() call. A market
+# sell at the open can partially fill (NVDA 24/26/5, TSM 9/10/3/1/1/4 on
+# Sep 11) so the position is still there on the next 60s cycle and the
+# exit logic fires again. Without this, the SAME trade was journaled twice
+# and earned TWO stop-loss strikes (1-day block escalated to 3-day).
+recent_close_calls: dict[str, float] = {}
+RECLOSE_WINDOW_SECS = 15 * 60   # a second close inside this window is a remainder, not a new trade
 spy_change:         float            = 0.0
 current_vix:        float | None     = None   # latest VIX reading — used for VIX-aware breakeven stop
 systemic_derisk_active: bool         = False  # True when VIX severely elevated + multiple sectors weak at once
@@ -541,6 +571,7 @@ fund_cache:         dict             = {}        # {symbol: (timestamp, result)}
 signal_cache:       list             = []        # ranked BUY signals from pre-market scan
 signal_cache_time:  float            = 0.0       # when cache was built
 signal_cache_date:  str              = ""        # date of last scan
+midday_refresh_date: str             = ""        # date the midday TA refresh last ran
 last_rescan_time:   float            = 0.0       # last emergency rescan
 closed_this_session: set             = set()     # symbols closed THIS 60s cycle — blocks immediate re-buy
 
@@ -585,6 +616,20 @@ NEWS_BULLISH_KEYWORDS = [
     "partnership", "contract", "deal",             # business wins
     "buyback", "repurchase",                       # shareholder returns
     "upgrade", "outperform", "overweight",         # analyst upgrades
+]
+# Sep 11 2026 — evergreen / listicle content that keyword-matches "beat",
+# "deal", "contract" etc. but carries zero new information. Each one that
+# slipped through cost three Claude calls: "Here's How Much $1000 Invested
+# In Amazon 15 Years Ago", "What's Going On With Nokia Stock Friday?"
+# (tagged NVDA because the ticker appeared in the symbol list).
+NEWS_JUNK_PATTERNS = [
+    "how much $", "if you invested", "invested in", "years ago",
+    "what's going on with", "what&#39;s going on with", "why is", "why are",
+    "stock friday", "stock monday", "stock tuesday", "stock wednesday", "stock thursday",
+    "stocks to watch", "stocks to buy", "top stocks", "best stocks",
+    "here's why", "here&#39;s why", "here's how", "here&#39;s how",
+    "should you buy", "is it time to", "3 reasons", "5 reasons", "reasons to",
+    "trading ideas", "options activity", "unusual options",
 ]
 NEWS_BEARISH_KEYWORDS = [
     "miss", "missed", "below expectations",        # earnings miss
@@ -709,6 +754,11 @@ def on_news_message(ws, message):
             # Filter to universe tickers
             matched = extract_tickers(symbols, headline)
             if not matched:
+                continue
+
+            # Drop evergreen / listicle content before it costs anything
+            _lower = (headline + " " + summary).lower()
+            if any(pat in _lower for pat in NEWS_JUNK_PATTERNS):
                 continue
 
             # Classify sentiment
@@ -903,6 +953,17 @@ def process_news_queue(positions: dict, account) -> bool:
             continue
 
         # ── New-buy candidate path (existing behaviour) ────────
+        # Sep 11 2026: only BULLISH triggers may open a new position. The
+        # Sep 11 log had "NEWS BUY [BEARISH] META" — a headline classified
+        # bearish was re-scored on fundamentals alone, came back 6.65 /
+        # 85%, and was inserted at the TOP of the cache. A bearish
+        # headline on a stock we don't hold is not a reason to buy it,
+        # whatever the fundamentals say; it's dropped here before it
+        # costs three Claude calls.
+        if sentiment != "BULLISH":
+            log.info(f"📰 {symbol} not held — {sentiment} headline, no new-buy evaluation")
+            continue
+
         # Skip if market is not open
         if not is_market_open():
             log.info(f"📰 {symbol} news trigger queued — market closed")
@@ -1841,15 +1902,21 @@ def run_premarket_scan():
                 )
         time.sleep(3)   # Tier 1 = 50 RPM (1 req/1.2s min). sleep(3) = 4x safety margin. Was 20s.
 
-    # ── Sector diversity enforcement ──────────────────────────
-    # If cache is all-tech, force add the best non-tech signal
-    # even if it's below threshold — prevents $85k idle cash on tech weakness days
+    # ── Sector diversity — visibility only (Sep 11 2026) ──────
+    # This used to force-add the best non-tech name even when it FAILED
+    # the entry gates (floor was composite >= 1.5, no confidence check).
+    # Sep 11 log: BAC 3.90 / 75% and CVX 5.10 / 75% were both cached as
+    # "diversity" picks while MIN_CONFIDENCE was 85 — the gates said no
+    # and the diversity rule overrode them. Diversification is a property
+    # of a portfolio of GOOD trades; it is never a reason to take a weak
+    # one. Cash is a position. The gates now apply to every candidate
+    # without exception; this block only reports which sectors had no
+    # qualifying signal so the gap is visible in the log.
     DIVERSITY_SECTORS = ["financials", "healthcare", "energy", "industrials", "consumer"]
     cached_sectors = {SECTOR_MAP.get(c["symbol"]) for c in candidates}
 
     for sector in DIVERSITY_SECTORS:
         if sector not in cached_sectors:
-            # Find best scoring signal in this sector from all_scored
             sector_best = sorted(
                 [r for r in all_scored if SECTOR_MAP.get(r["symbol"]) == sector
                  and r["signal"] != "SELL"],
@@ -1857,13 +1924,11 @@ def run_premarket_scan():
             )
             if sector_best:
                 best = sector_best[0]
-                # Only add if composite >= 1.5 (some positive signal, not just random)
-                if best["composite"] >= 1.5:
-                    candidates.append(best)
-                    log.info(
-                        f"  📊 DIVERSITY {best['symbol']} ({sector}): "
-                        f"composite={best['composite']:.2f} — added for sector diversity"
-                    )
+                log.info(
+                    f"  📊 {sector}: no qualifying signal — best was {best['symbol']} "
+                    f"composite={best['composite']:.2f}, confidence={best['confidence']}% "
+                    f"(gates: {MIN_COMPOSITE} / {MIN_CONFIDENCE}%) — NOT added"
+                )
 
     candidates.sort(key=lambda x: x["confidence"], reverse=True)
     signal_cache      = candidates
@@ -2227,7 +2292,148 @@ def check_reentry_allowed(symbol: str, current_price: float) -> tuple[bool, str]
     del reentry_cooldown[symbol]
     return True, ""
 
+def is_overnight_hold(pos) -> bool:
+    """A position whose total P&L diverges from its intraday P&L was held
+    before today's open (both fields come free on the Alpaca position)."""
+    try:
+        return abs(float(pos.unrealized_plpc) - float(pos.unrealized_intraday_plpc)) > 0.0005
+    except (AttributeError, TypeError, ValueError):
+        return False
+
+def in_opening_grace() -> bool:
+    """True during the first OVERNIGHT_OPEN_GRACE_MINUTES after 9:30 ET."""
+    n = datetime.now(ET)
+    mins = n.hour * 60 + n.minute
+    return (9 * 60 + 30) <= mins < (9 * 60 + 30 + OVERNIGHT_OPEN_GRACE_MINUTES)
+
+def fetch_intraday_snapshot(symbol: str) -> dict | None:
+    """Live price + today's open for symbol and SPY from Alpaca's snapshot
+    endpoint. Returns {price, open, spy_price, spy_open} or None."""
+    try:
+        r = requests.get(
+            "https://data.alpaca.markets/v2/stocks/snapshots",
+            params={"symbols": f"{symbol},SPY"},
+            headers={"APCA-API-KEY-ID": ALPACA_KEY, "APCA-API-SECRET-KEY": ALPACA_SECRET},
+            timeout=5,
+        )
+        if not r.ok:
+            return None
+        d = r.json()
+        sym, spy = d.get(symbol, {}), d.get("SPY", {})
+        out = {
+            "price":     float(sym.get("latestTrade", {}).get("p", 0) or 0),
+            "open":      float(sym.get("dailyBar", {}).get("o", 0) or 0),
+            "spy_price": float(spy.get("latestTrade", {}).get("p", 0) or 0),
+            "spy_open":  float(spy.get("dailyBar", {}).get("o", 0) or 0),
+        }
+        return out if all(v > 0 for v in out.values()) else None
+    except Exception as e:
+        log.warning(f"  {symbol}: intraday snapshot failed: {e}")
+        return None
+
+def intraday_rs_boost(snap: dict) -> tuple[float, float, str]:
+    """Relative strength vs SPY measured from today's OPEN. Returns
+    (rs_boost, stock_intraday_pct, label). Capped at ±INTRADAY_RS_MAX."""
+    stock_pct = snap["price"] / snap["open"] - 1
+    spy_pct   = snap["spy_price"] / snap["spy_open"] - 1
+    rel       = stock_pct - spy_pct
+    m = INTRADAY_RS_MAX
+    if rel >= 0.02:    boost, label = m,        "STRONG"
+    elif rel >= 0.01:  boost, label = m * 0.5,  "GOOD"
+    elif rel >= 0.0:   boost, label = 0.0,      "NEUTRAL"
+    elif rel >= -0.01: boost, label = -m * 0.5, "WEAK"
+    else:              boost, label = -m,       "POOR"
+    return boost, stock_pct, f"{label} intraday RS {rel*100:+.1f}% (stock {stock_pct*100:+.1f}% / SPY {spy_pct*100:+.1f}% from open)"
+
+def revalidate_candidate(candidate: dict) -> tuple[str, dict | None, str]:
+    """
+    Re-score a cached candidate on LIVE regular-session data. No Claude
+    calls — fundamentals (fundScore, confidence, thesis) are kept from the
+    pre-market scan; TA and RS are refreshed now.
+
+    Returns (verdict, fresh_candidate, note):
+      "ok"    — passes every gate on fresh numbers; fresh_candidate has the
+                updated composite/taScore/price/atr_pct to size and stop on
+      "skip"  — fine structurally but not a buy THIS cycle (below its open,
+                data unavailable); keep it in the cache
+      "drop"  — TA has broken or the fresh composite is under the gate;
+                remove it from the cache
+    """
+    symbol = candidate["symbol"]
+    ta = fetch_technicals(symbol)
+    if not ta:
+        return "skip", None, "TA fetch failed — not buying on stale numbers"
+    ta_score = ta.get("taScore", 0)
+    if ta_score < 1.5:
+        return "drop", None, f"live taScore {ta_score:.1f} < 1.5 — TA has broken since the scan"
+
+    snap = fetch_intraday_snapshot(symbol)
+    if snap:
+        rs_boost, stock_pct, rs_label = intraday_rs_boost(snap)
+        live_price = snap["price"]
+        if REQUIRE_ABOVE_OPEN and stock_pct <= 0:
+            return "skip", None, f"trading below its open ({stock_pct*100:+.2f}%) — {rs_label}"
+    else:
+        rs_boost, rs_label = 0.0, "intraday RS unavailable (snapshot failed) — treated as neutral"
+        live_price = ta.get("price", candidate.get("price", 0))
+
+    fund_score = candidate.get("fundScore", 0)
+    composite  = ta_score * (TECH_WEIGHT / 100) + fund_score * (FUND_WEIGHT / 100) + rs_boost
+    if composite < MIN_COMPOSITE:
+        return "drop", None, (
+            f"fresh composite {composite:.2f} < {MIN_COMPOSITE} "
+            f"(scan had {candidate.get('composite', 0):.2f}; ta {ta_score:.1f}, fund {fund_score:.1f}, {rs_label})"
+        )
+    if candidate.get("confidence", 0) < MIN_CONFIDENCE:
+        return "drop", None, f"confidence {candidate.get('confidence')}% < {MIN_CONFIDENCE}%"
+
+    atr_raw = ta.get("atr14", 0) or ta.get("atr", 0)
+    price_for_atr = ta.get("price", 0) or live_price
+    atr_pct = (atr_raw / price_for_atr) if atr_raw and price_for_atr > 0 else candidate.get("atr_pct", 0.02)
+
+    fresh = dict(candidate)
+    fresh.update({
+        "price":       live_price,
+        "taScore":     ta_score,
+        "composite":   round(composite, 2),
+        "atr_pct":     round(atr_pct, 4),
+        "rs_intraday": round(rs_boost, 2),
+    })
+    return "ok", fresh, (
+        f"revalidated: composite {candidate.get('composite', 0):.2f} → {composite:.2f} "
+        f"(ta {ta_score:.1f}, fund {fund_score:.1f}, {rs_label})"
+    )
+
+def refresh_cache_ta():
+    """Midday TA-only pass over the whole cache (no Claude). Drops names
+    whose TA has broken or whose fresh composite is under the gate;
+    updates the rest so an afternoon deploy sizes on current numbers."""
+    global signal_cache
+    if not signal_cache:
+        return
+    kept, dropped = [], []
+    for c in list(signal_cache):
+        verdict, fresh, note = revalidate_candidate(c)
+        if verdict == "drop":
+            dropped.append(f"{c['symbol']} ({note})")
+        elif verdict == "ok":
+            kept.append(fresh)
+        else:
+            kept.append(c)          # "skip" is a this-moment condition, keep the scan entry
+        time.sleep(0.3)
+    signal_cache = kept
+    log.info(f"  Midday TA refresh: {len(kept)} kept, {len(dropped)} dropped"
+             + (f" — {dropped}" if dropped else ""))
+
 def close_position(symbol: str, pnl_pct: float = 0.0, exit_reason: str = "") -> bool:
+    global recent_close_calls
+    # A close inside RECLOSE_WINDOW_SECS of the previous one for the same
+    # symbol is the bot mopping up a partial fill, not a new exit: still
+    # cancel + resubmit so the shares actually leave, but do NOT record a
+    # second trade or a second cooldown/strike.
+    now_ts = time.time()
+    is_remainder = (now_ts - recent_close_calls.get(symbol, 0)) < RECLOSE_WINDOW_SECS
+    recent_close_calls[symbol] = now_ts
     try:
         # Cancel open orders first
         orders = trade_client.get_orders()
@@ -2247,6 +2453,15 @@ def close_position(symbol: str, pnl_pct: float = 0.0, exit_reason: str = "") -> 
             current_price = 0.0
 
         trade_client.close_position(symbol)
+        if is_remainder:
+            log.info(
+                f"[SELL] Re-submitted remainder for {symbol} — earlier close partially "
+                f"filled; trade already journaled, no extra strike ({pnl_pct*100:+.2f}%)"
+            )
+            time.sleep(2)
+            closed_this_session.add(symbol)   # still block same-cycle re-entry
+            return True
+
         log.info(f"[SELL] Closed {symbol} — {exit_reason} ({pnl_pct*100:+.2f}%)")
         record_trade(symbol, pnl_pct, exit_reason)
 
@@ -2593,6 +2808,11 @@ def check_max_losing_hold(positions: dict) -> list[str]:
             continue  # still inside the grace period — nothing fires yet, by design
 
         early_stop = get_early_exit_stop(symbol)
+        # Same opening-print grace as check_profit_targets: an overnight hold
+        # isn't cut by the -0.5% early-exit stop on the 9:30 print unless it's
+        # already past 2× that level.
+        if in_opening_grace() and is_overnight_hold(pos) and pnl_pct > 2 * early_stop:
+            continue
         if pnl_pct <= early_stop:
             reason = (
                 f"EARLY_EXIT_STOP (ATR-scaled {early_stop*100:.1f}% stop hit at "
@@ -2901,6 +3121,24 @@ def check_profit_targets(positions: dict) -> list[str]:
                             f"P&L {pnl_pct*100:+.2f}% below breakeven — holding"
                         )
 
+            # ── Opening-print grace for OVERNIGHT holds (Sep 11 2026) ──
+            # Not the 30-min grace on fresh entries (removed). This is the
+            # first 5 minutes after 9:30 for positions carried overnight:
+            # the opening auction print is rarely the low of the first
+            # five minutes, and on Sep 11 all four overnight holds were
+            # stopped at 9:30:43-9:30:50 on that print. Stop-type exits
+            # wait until 9:35 — unless the loss is beyond 2× the tier,
+            # which is a gap through the stop, not opening noise.
+            if (reason and in_opening_grace() and is_overnight_hold(pos)
+                    and ("STOP_LOSS" in reason or "DYNAMIC_STOP" in reason)
+                    and pnl_pct > 2 * active_stop):
+                log.info(
+                    f"  {symbol}: {pnl_pct*100:+.2f}% on the opening print (overnight hold) — "
+                    f"stop deferred to 9:{30+OVERNIGHT_OPEN_GRACE_MINUTES:02d} ET unless it passes "
+                    f"{2*active_stop*100:.0f}% (would have been: {reason})"
+                )
+                reason = None
+
             if reason:
                 if close_position(symbol, pnl_pct, reason):
                     closed.append(symbol)
@@ -3075,6 +3313,26 @@ def deploy_from_cache(positions: dict, account):
             log.info(f"  {symbol}: re-entry BLOCKED — {block_reason}")
             continue
 
+        # ── Live re-validation (Sep 11 2026) ────────────────────
+        # The cache entry is a 9:20 pre-market snapshot. Re-score TA and
+        # intraday RS now, on regular-session data, and re-test the gates.
+        # Sizing and the stop tier below use the FRESH composite.
+        if REVALIDATE_AT_DEPLOY:
+            verdict, fresh, note = revalidate_candidate(candidate)
+            if verdict == "drop":
+                log.info(f"  {symbol}: DROPPED from cache — {note}")
+                signal_cache = [c for c in signal_cache if c["symbol"] != symbol]
+                continue
+            if verdict == "skip":
+                log.info(f"  {symbol}: not this cycle — {note}")
+                continue
+            log.info(f"  {symbol}: {note}")
+            candidate = fresh
+            if fresh.get("price", 0) > 0:
+                live_price = fresh["price"]
+            # keep the cache entry current so the next cycle starts from these numbers
+            signal_cache = [fresh if c["symbol"] == symbol else c for c in signal_cache]
+
         # ── Confidence-based sizing (raised Aug 2026 — moderate increase) ──
         # Previous tiers (8/10/12%) left ~80% of the account idle on most
         # days (Aug 13-20 sample: only 2-3 positions open at a time out of
@@ -3102,8 +3360,12 @@ def deploy_from_cache(positions: dict, account):
 
         # ATR-based profit target removed Sep 10 2026 — check_profit_targets()
         # no longer sells at a fixed level; the escalating trail governs
-        # the profit side. atr_pct is still stored in entry_signals below
-        # for the early-exit stop.
+        # the profit side. The ATR value itself is still needed: it's
+        # stored in entry_signals below for the early-exit stop.
+        # (Sep 11 fix: this lookup was dropped together with the target
+        # block, which raised NameError on every deploy attempt for a full
+        # session — the bot could sell but never buy.)
+        atr = candidate.get("atr_pct", None)
         log.info(f"  {symbol}: {qty} shares @ ~${live_price:.2f} = ${qty*live_price:,.0f} ({kelly*100:.0f}% Kelly)")
 
         # ── Store entry signal snapshot — required to analyse which
@@ -3113,8 +3375,9 @@ def deploy_from_cache(positions: dict, account):
         entry_signals[symbol] = {
             "composite":  composite,
             "confidence": confidence,
-            "ta_score":   candidate.get("ta_score"),
-            "fund_score": candidate.get("fund_score"),
+            "ta_score":   candidate.get("taScore"),     # Sep 11 fix: key is taScore (was ta_score → always None)
+            "fund_score": candidate.get("fundScore"),   # Sep 11 fix: key is fundScore (was fund_score → always None)
+            "rs_intraday": candidate.get("rs_intraday"),
             "sector":     sector,
             "kelly_pct":  kelly,
             "entry_price": live_price,
@@ -3135,7 +3398,7 @@ def deploy_from_cache(positions: dict, account):
 # ══════════════════════════════════════════════════════════════
 
 def run():
-    global last_rescan_time
+    global last_rescan_time, midday_refresh_date
     load_peaks()
     load_cooldowns()     # restore stop-loss/profit cooldowns after restart
     load_entry_signals()  # restore entry snapshots for signal-attribution analysis
@@ -3167,6 +3430,10 @@ def run():
     log.info(f"  Min composite:  {MIN_COMPOSITE} (3.0 → 4.0 Jul 29 review → 4.2 Sep 11)")
     log.info(f"  Stop loss:      tiered by entry composite — <4.5: -3% | 4.5-6.0: -4% | 6.0+: -5%")
     log.info(f"  Stop loss delay: NONE — stops active from first cycle after entry (30min grace removed Sep 11)")
+    log.info(f"  Entry window:   {FIRST_ENTRY_ET[0]:02d}:{FIRST_ENTRY_ET[1]:02d}–{LAST_ENTRY_ET[0]:02d}:{LAST_ENTRY_ET[1]:02d} ET (opening range forms first; nothing new late)")
+    log.info(f"  Deploy check:   {'live TA + intraday RS re-validation before every buy' if REVALIDATE_AT_DEPLOY else 'OFF — buying on scan-time numbers'}; RS capped ±{INTRADAY_RS_MAX}, above-open required: {REQUIRE_ABOVE_OPEN}")
+    log.info(f"  Overnight grace: stop-type exits on overnight holds deferred {OVERNIGHT_OPEN_GRACE_MINUTES}min after the open (unless loss > 2× tier)")
+    log.info(f"  Midday refresh: {'TA-only cache re-validation at %02d:%02d ET' % MIDDAY_TA_REFRESH_ET if MIDDAY_TA_REFRESH_ET else 'off'}")
     log.info(f"  Dynamic downside floor: tightens toward tier ceiling as loss deepens (mirrors trail, inverted)")
     log.info(f"  Max drawdown:   {MAX_DRAWDOWN*100:.0f}%")
     log.info(f"  90-day audit:   Volume, TA alignment, win rate")
@@ -3286,9 +3553,33 @@ def run():
             # Deploy from cache (no Claude calls during market hours)
             open_slots = 10 - len(positions)
             can_open, cannot_open_reason = can_open_new_position()
+            _now_et = datetime.now(ET)
+            _hm = (_now_et.hour, _now_et.minute)
+            past_entry_cutoff   = _hm >= LAST_ENTRY_ET
+            before_entry_window = _hm < FIRST_ENTRY_ET
+
+            # Midday TA-only refresh of the cache — once per day, no Claude
+            if (MIDDAY_TA_REFRESH_ET and signal_cache
+                    and _hm >= MIDDAY_TA_REFRESH_ET
+                    and midday_refresh_date != _now_et.strftime("%Y-%m-%d")):
+                midday_refresh_date = _now_et.strftime("%Y-%m-%d")
+                refresh_cache_ta()
+
             if not can_open:
                 if open_slots > 0:
                     log.info(f"  {cannot_open_reason} — new entries blocked, monitoring continues normally")
+            elif before_entry_window:
+                if open_slots > 0 and signal_cache:
+                    log.info(
+                        f"  Opening range forming — no new entries before "
+                        f"{FIRST_ENTRY_ET[0]:02d}:{FIRST_ENTRY_ET[1]:02d} ET; exits keep running"
+                    )
+            elif past_entry_cutoff:
+                if open_slots > 0 and signal_cache:
+                    log.info(
+                        f"  Past {LAST_ENTRY_ET[0]:02d}:{LAST_ENTRY_ET[1]:02d} ET entry cutoff — "
+                        f"no new entries this late in the session; exits/trailing keep running"
+                    )
             elif open_slots > 0 and float(account.regt_buying_power or account.cash) >= equity * 0.10:
                 if not signal_cache:
                     time_since_rescan = time.time() - last_rescan_time
