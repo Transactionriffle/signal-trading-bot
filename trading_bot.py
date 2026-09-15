@@ -54,8 +54,8 @@ Environment variables (set in Render):
     ALPACA_BASE_URL        (default: https://paper-api.alpaca.markets)
     CLOUDFLARE_WORKER
     TECH_WEIGHT            (default: 40 — 40% TA / 60% fundamental)
-    MIN_CONFIDENCE         (default: 87)
-    MIN_COMPOSITE          (default: 4.2)
+    MIN_CONFIDENCE         (default: 85)
+    MIN_COMPOSITE          (default: 4.0)
     MAX_TRADES_PER_DAY     (default: 10)
     MAX_DRAWDOWN_PCT       (default: 0.15)
     PAUSED                 (set "true" to halt instantly)
@@ -99,7 +99,7 @@ ANTHROPIC_KEY   = os.environ["ANTHROPIC_API_KEY"]
 WORKER_URL      = os.environ.get("CLOUDFLARE_WORKER", "https://winter-cake-6aae.dimitridesplace-65f.workers.dev")
 TECH_WEIGHT     = int(os.environ.get("TECH_WEIGHT", "40"))
 FUND_WEIGHT     = 100 - TECH_WEIGHT
-MIN_CONFIDENCE  = int(os.environ.get("MIN_CONFIDENCE", "87"))  # Sep 11 2026: 85 → 87. (Was raised from 80% earlier — filters weak signals like NFLX (82%))
+MIN_CONFIDENCE  = int(os.environ.get("MIN_CONFIDENCE", "85"))  # Sep 15 2026: rolled back from 87 (Sep 11) to 85. (Originally raised from 80% — filters weak signals like NFLX (82%))
 
 # Raised from 3.0 → 4.0 (Jul 29 review). Rationale: realised trades were
 # clustering at +0.3-0.5% wins vs -5% stop losses — a ratio that needs a
@@ -107,7 +107,7 @@ MIN_CONFIDENCE  = int(os.environ.get("MIN_CONFIDENCE", "87"))  # Sep 11 2026: 85
 # marginal (3.0-4.0) entry was negative expected value at that risk/reward.
 # Raising the floor cuts trade count but concentrates capital in the
 # higher-conviction setups the composite score is actually meant to find.
-MIN_COMPOSITE   = float(os.environ.get("MIN_COMPOSITE", "4.2"))  # Sep 11 2026: 4.0 → 4.2 (raised from 3.0 in the Jul 29 review)
+MIN_COMPOSITE   = float(os.environ.get("MIN_COMPOSITE", "4.0"))  # Sep 15 2026: rolled back from 4.2 (Sep 11) to 4.0 (raised from 3.0 in the Jul 29 review)
 MAX_TRADES_DAY  = int(os.environ.get("MAX_TRADES_PER_DAY", "10"))
 MAX_DRAWDOWN    = float(os.environ.get("MAX_DRAWDOWN_PCT", "0.15"))
 SCAN_INTERVAL   = 60
@@ -540,6 +540,8 @@ def is_likely_spac(symbol: str) -> bool:
 trades_today:       dict[str, int]   = defaultdict(int)
 circuit_breaker:    bool             = False
 api_credit_exhausted: bool           = False  # set True on Anthropic 'credit balance too low' — halts trading, not silent HOLD
+last_credit_probe_time: float        = 0.0     # epoch of the last recovery probe attempt (Sep 15 2026 fix)
+CREDIT_PROBE_INTERVAL_SECONDS = 5 * 60          # how often to test whether credit has been restored
 starting_equity:    float | None     = None
 position_peaks:     dict[str, float] = {}
 market_state:       str              = "BULL"
@@ -1263,6 +1265,40 @@ trade_client = TradingClient(
     paper=True, url_override=ALPACA_BASE_URL,
 )
 ai_client = anthropic.Anthropic(api_key=ANTHROPIC_KEY)
+
+def probe_credit_recovery():
+    """
+    Sep 15 2026 fix: api_credit_exhausted used to be a one-way door. Every
+    caller checked the flag BEFORE attempting a Claude call and skipped if
+    set — but the only code that clears the flag lives inside a successful
+    call. Result: once credit ran out, the bot would never call Claude
+    again to find out it had been topped up, and stayed blocked until a
+    manual restart (confirmed live: credit was restored but the bot sat
+    on the stale flag for over an hour with no self-recovery path).
+
+    Called once per main-loop cycle. If the flag isn't set, or the probe
+    interval hasn't elapsed, this is a no-op. Otherwise it makes one
+    minimal, cheap Claude call — success clears the flag (via
+    safe_claude_call's existing logic) and the very next cycle resumes
+    scans/news processing normally; failure just updates the timer so we
+    don't hammer the API every 60s while genuinely still out of credit.
+    """
+    global last_credit_probe_time
+    if not api_credit_exhausted:
+        return
+    now = time.time()
+    if now - last_credit_probe_time < CREDIT_PROBE_INTERVAL_SECONDS:
+        return
+    last_credit_probe_time = now
+    try:
+        safe_claude_call(
+            model="claude-sonnet-4-5",
+            max_tokens=1,
+            messages=[{"role": "user", "content": "ping"}],
+        )
+        log.info("✅ Credit-recovery probe succeeded — flag cleared, resuming normal operation")
+    except Exception:
+        log.info(f"⏳ Credit-recovery probe: still exhausted, retrying in {CREDIT_PROBE_INTERVAL_SECONDS//60}min")
 
 def safe_claude_call(**kwargs):
     """
@@ -3413,7 +3449,7 @@ def run():
     log.info(f"  Universe:       {len(CURATED_TICKERS)} curated + up to 24 dynamic (8+8+8) = 55 max")
     log.info(f"  Scan timing:    Sun 8pm ET / Mon-Fri 9:20am ET (dynamic) + restart rescan")
     log.info(f"  Position size:  Kelly 10-16% (confidence-based sizing, raised Aug 2026)")
-    log.info(f"  Profit target:  ATR×2.5 per position (3-12% range, fallback +5%)")
+    # (accurate profit-target line logged further below — trail-only, no fixed target)
     log.info(f"  Sector cap:     Max 2 positions per sector (backtest validated)")
     log.info(f"  AI concentration cap: Max {MAX_AI_CORRELATED_POSITIONS} combined across semis/tech/software/cyber")
     log.info(f"  Systemic de-risk: VIX≥{SYSTEMIC_DERISK_VIX} + {SYSTEMIC_DERISK_MIN_WEAK_SECTORS}+ weak sectors → blocks new buys, allows early loss-cutting")
@@ -3427,7 +3463,7 @@ def run():
     log.info(f"  Stop loss:      -{abs(STOP_LOSS)*100:.0f}% ceiling")
     log.info(f"  TA/Fund weight: {TECH_WEIGHT}% / {FUND_WEIGHT}%")
     log.info(f"  Min confidence: {MIN_CONFIDENCE}%")
-    log.info(f"  Min composite:  {MIN_COMPOSITE} (3.0 → 4.0 Jul 29 review → 4.2 Sep 11)")
+    log.info(f"  Min composite:  {MIN_COMPOSITE} (3.0 → 4.0 Jul 29 review; briefly 4.2 Sep 11, rolled back Sep 15)")
     log.info(f"  Stop loss:      tiered by entry composite — <4.5: -3% | 4.5-6.0: -4% | 6.0+: -5%")
     log.info(f"  Stop loss delay: NONE — stops active from first cycle after entry (30min grace removed Sep 11)")
     log.info(f"  Entry window:   {FIRST_ENTRY_ET[0]:02d}:{FIRST_ENTRY_ET[1]:02d}–{LAST_ENTRY_ET[0]:02d}:{LAST_ENTRY_ET[1]:02d} ET (opening range forms first; nothing new late)")
@@ -3504,6 +3540,11 @@ def run():
 
             # Assess market state every cycle
             assess_market_state()
+
+            # Sep 15 2026: test for Anthropic credit recovery once per cycle
+            # (no-op unless api_credit_exhausted is set and the retry interval
+            # has elapsed — see probe_credit_recovery() docstring)
+            probe_credit_recovery()
 
             # ── Clear per-cycle state ──────────────────────────
             closed_this_session.clear()  # reset every 60s cycle
