@@ -1938,16 +1938,22 @@ def run_premarket_scan():
                 )
         time.sleep(3)   # Tier 1 = 50 RPM (1 req/1.2s min). sleep(3) = 4x safety margin. Was 20s.
 
-    # ── Sector diversity — visibility only (Sep 11 2026) ──────
-    # This used to force-add the best non-tech name even when it FAILED
-    # the entry gates (floor was composite >= 1.5, no confidence check).
-    # Sep 11 log: BAC 3.90 / 75% and CVX 5.10 / 75% were both cached as
-    # "diversity" picks while MIN_CONFIDENCE was 85 — the gates said no
-    # and the diversity rule overrode them. Diversification is a property
-    # of a portfolio of GOOD trades; it is never a reason to take a weak
-    # one. Cash is a position. The gates now apply to every candidate
-    # without exception; this block only reports which sectors had no
-    # qualifying signal so the gap is visible in the log.
+    # ── Sector diversity — own floor, not a full bypass (Sep 16 2026) ──
+    # History: originally bypassed both gates entirely (composite >= 1.5,
+    # no confidence check) — Sep 11 log showed CVX (5.10 composite / 78%
+    # confidence) and BAC (3.90 / 75%) both added while MIN_CONFIDENCE was
+    # 85%. That got fully disabled on Sep 11 (visibility-only — never
+    # added anything). CVX went on to close +0.22% as a DYNAMIC_TRAIL win,
+    # but one winning trade at 78% confidence doesn't validate skipping
+    # confidence checks entirely — the trades that would have failed
+    # below the old 75% floor were never observed, so the full-bypass
+    # era can't be judged as "working" from a single visible outcome.
+    # Landing here deliberately: a real but LOWER bar for diversity picks
+    # than a normal entry (85%/4.0) — DIVERSITY_MIN_CONFIDENCE (75%) and
+    # DIVERSITY_MIN_COMPOSITE (1.5) — so a sector gap can still be filled,
+    # but never with a trade Claude scored as a coin flip.
+    DIVERSITY_MIN_CONFIDENCE = 75   # below MIN_CONFIDENCE (85) on purpose — a real floor, not a bypass
+    DIVERSITY_MIN_COMPOSITE  = 1.5  # unchanged from the original diversity floor
     DIVERSITY_SECTORS = ["financials", "healthcare", "energy", "industrials", "consumer"]
     cached_sectors = {SECTOR_MAP.get(c["symbol"]) for c in candidates}
 
@@ -1960,11 +1966,21 @@ def run_premarket_scan():
             )
             if sector_best:
                 best = sector_best[0]
-                log.info(
-                    f"  📊 {sector}: no qualifying signal — best was {best['symbol']} "
-                    f"composite={best['composite']:.2f}, confidence={best['confidence']}% "
-                    f"(gates: {MIN_COMPOSITE} / {MIN_CONFIDENCE}%) — NOT added"
-                )
+                if (best["composite"] >= DIVERSITY_MIN_COMPOSITE
+                        and best["confidence"] >= DIVERSITY_MIN_CONFIDENCE):
+                    candidates.append(best)
+                    log.info(
+                        f"  📊 DIVERSITY {best['symbol']} ({sector}): composite={best['composite']:.2f}, "
+                        f"confidence={best['confidence']}% — added for sector diversity "
+                        f"(diversity floor: {DIVERSITY_MIN_COMPOSITE} / {DIVERSITY_MIN_CONFIDENCE}%)"
+                    )
+                else:
+                    log.info(
+                        f"  📊 {sector}: no qualifying signal — best was {best['symbol']} "
+                        f"composite={best['composite']:.2f}, confidence={best['confidence']}% "
+                        f"(diversity floor: {DIVERSITY_MIN_COMPOSITE} / {DIVERSITY_MIN_CONFIDENCE}%, "
+                        f"normal gates: {MIN_COMPOSITE} / {MIN_CONFIDENCE}%) — NOT added"
+                    )
 
     candidates.sort(key=lambda x: x["confidence"], reverse=True)
     signal_cache      = candidates
@@ -2400,8 +2416,19 @@ def revalidate_candidate(candidate: dict) -> tuple[str, dict | None, str]:
     if not ta:
         return "skip", None, "TA fetch failed — not buying on stale numbers"
     ta_score = ta.get("taScore", 0)
-    if ta_score < 1.5:
-        return "drop", None, f"live taScore {ta_score:.1f} < 1.5 — TA has broken since the scan"
+    # Sep 17 2026: independent TA floor at buy time, raised 1.5 -> 3.0.
+    # Three trades in a row (MSFT, META, GOOG) bought on ta ~2.0-2.5 with
+    # fund ~8.0 carrying the composite past the gate on the strength of
+    # the fundamentals score alone — all three lost, fast (12-133min,
+    # EARLY_EXIT_STOP every time). A blended composite has no floor by
+    # construction: fund=8.0 alone contributes 3.2 of the 4.0 gate at the
+    # current 60/40 split, so ta could be near-zero and still clear it.
+    # This is a hard, separate cutoff — no fundScore compensates for it.
+    # The pre-scan/emergency-rescan filters stay at 1.5 (cheap, noisy
+    # pre-market data — only meant to skip an obviously dead Claude call,
+    # not to set the real quality bar).
+    if ta_score < 3.0:
+        return "drop", None, f"live taScore {ta_score:.1f} < 3.0 — too weak to buy regardless of fundamentals"
 
     snap = fetch_intraday_snapshot(symbol)
     if snap:
