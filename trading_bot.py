@@ -97,6 +97,11 @@ ALPACA_SECRET   = os.environ["ALPACA_SECRET_KEY"]
 ALPACA_BASE_URL = os.environ.get("ALPACA_BASE_URL", "https://paper-api.alpaca.markets")
 ANTHROPIC_KEY   = os.environ["ANTHROPIC_API_KEY"]
 WORKER_URL      = os.environ.get("CLOUDFLARE_WORKER", "https://winter-cake-6aae.dimitridesplace-65f.workers.dev")
+# Sep 22 2026 — real, published-rate-limit VIX source (60 req/min free
+# tier), replacing the unofficial Yahoo-via-worker endpoint as primary.
+# Optional: if unset, get_vix_level() falls straight to the Yahoo worker
+# path (unchanged behaviour for anyone who hasn't added a key yet).
+FINNHUB_API_KEY = os.environ.get("FINNHUB_API_KEY", "")
 TECH_WEIGHT     = int(os.environ.get("TECH_WEIGHT", "40"))
 FUND_WEIGHT     = 100 - TECH_WEIGHT
 MIN_CONFIDENCE  = int(os.environ.get("MIN_CONFIDENCE", "85"))  # Sep 15 2026: rolled back from 87 (Sep 11) to 85. (Originally raised from 80% — filters weak signals like NFLX (82%))
@@ -573,6 +578,21 @@ recent_close_calls: dict[str, float] = {}
 RECLOSE_WINDOW_SECS = 15 * 60   # a second close inside this window is a remainder, not a new trade
 spy_change:         float            = 0.0
 current_vix:        float | None     = None   # latest VIX reading — used for VIX-aware breakeven stop
+# Sep 22 2026 fix: get_vix_level() hit Yahoo's undocumented rate limit on
+# the unofficial chart endpoint (repeated 429s for 90+ minutes straight),
+# blanking current_vix to None for the whole outage. That silently disabled
+# systemic de-risk detection (requires a real VIX reading) and defaulted
+# the calm-market breakeven thresholds to the stricter setting, with
+# nothing escalating beyond a repeated WARNING log line. This isn't a
+# limit Yahoo sells a higher tier for — it's an unofficial scraped
+# endpoint, so the real fix is needing it less often: fall back to the
+# last successfully-fetched value (aged out after VIX_STALE_MAX_AGE_SECS,
+# since a fallback stale by 10+ minutes during exactly the kind of sharp
+# move VIX is meant to catch would be actively misleading, not just
+# imprecise) rather than going straight to None on a single failed fetch.
+last_vix_value:     float | None     = None   # last successfully-fetched VIX reading
+last_vix_time:      float            = 0.0    # epoch of that successful fetch
+VIX_STALE_MAX_AGE_SECS = 15 * 60               # a fallback older than this is not used — too stale to trust
 systemic_derisk_active: bool         = False  # True when VIX severely elevated + multiple sectors weak at once
 
 # ── Systemic de-risk thresholds ──────────────────────────────────
@@ -1378,7 +1398,39 @@ def get_quote_change(symbol: str) -> float | None:
         log.warning(f"Quote fetch failed for {symbol}: {e}")
         return None
 
-def get_vix_level() -> float | None:
+def fetch_vix_finnhub() -> float | None:
+    """
+    Primary VIX source (Sep 22 2026 fix). Finnhub's free tier is a real,
+    published rate limit (60 requests/minute) from an actual data
+    provider — unlike the Yahoo-via-Cloudflare-Worker path below, which
+    hit Yahoo's undocumented anti-scraping threshold on an unofficial
+    endpoint for 90+ minutes straight on Sep 22, with no quota to
+    increase and no commercial relationship to raise it. Returns None
+    (not an exception) if no key is configured, so this is a safe no-op
+    for anyone who hasn't set FINNHUB_API_KEY yet.
+    """
+    if not FINNHUB_API_KEY:
+        return None
+    try:
+        r = requests.get(
+            "https://finnhub.io/api/v1/quote",
+            params={"symbol": "^VIX", "token": FINNHUB_API_KEY},
+            timeout=10,
+        )
+        r.raise_for_status()
+        price = r.json().get("c", 0)
+        return float(price) if price and price > 0 else None
+    except Exception as e:
+        log.warning(f"VIX fetch (Finnhub) failed: {e}")
+        return None
+
+def fetch_vix_yahoo_worker() -> float | None:
+    """
+    Secondary VIX source — the original unofficial Yahoo-via-Cloudflare-
+    Worker path, kept as a fallback for when Finnhub is unavailable or
+    unconfigured. Prone to undocumented rate limiting (see Sep 22 2026
+    incident); not the primary path any more.
+    """
     try:
         now     = int(time.time())
         from_ts = now - 86400 * 5
@@ -1388,34 +1440,91 @@ def get_vix_level() -> float | None:
         chart  = r.json().get("chart", {}).get("result", [{}])[0]
         closes = chart.get("indicators", {}).get("quote", [{}])[0].get("close", [])
         closes = [c for c in closes if c is not None]
-        if closes:
-            log.info(f"VIX level: {closes[-1]:.1f}")
-            return closes[-1]
-        return None
+        return closes[-1] if closes else None
     except Exception as e:
-        log.warning(f"VIX fetch failed: {e}")
+        log.warning(f"VIX fetch (Yahoo worker) failed: {e}")
         return None
+
+def get_vix_level() -> float | None:
+    """
+    Three-tier VIX fetch: Finnhub (real published rate limit) -> Yahoo
+    worker (legacy, unofficial, rate-limit-prone) -> last known value
+    (aged out after VIX_STALE_MAX_AGE_SECS — see that constant's comment
+    for why a fallback can't be trusted indefinitely).
+    """
+    global last_vix_value, last_vix_time
+
+    vix    = fetch_vix_finnhub()
+    source = "Finnhub"
+    if vix is None:
+        vix    = fetch_vix_yahoo_worker()
+        source = "Yahoo worker, fallback"
+
+    if vix is not None:
+        log.info(f"VIX level: {vix:.1f} ({source})")
+        last_vix_value = vix
+        last_vix_time  = time.time()
+        return vix
+
+    age = time.time() - last_vix_time
+    if last_vix_value is not None and age < VIX_STALE_MAX_AGE_SECS:
+        log.warning(
+            f"VIX fetch failed (Finnhub + Yahoo worker both unavailable) — "
+            f"using last known value {last_vix_value:.1f} from {age/60:.1f}min ago "
+            f"(falls back to unknown after {VIX_STALE_MAX_AGE_SECS//60}min)"
+        )
+        return last_vix_value
+    log.warning(
+        "VIX fetch failed (Finnhub + Yahoo worker both unavailable)"
+        + (" — no recent fallback available" if last_vix_value is not None else "")
+    )
+    return None
 
 def assess_market_state():
     global market_state, fear_active, weak_sectors, spy_change, current_vix
 
-    vix_now  = get_vix_level()
+    # Sep 22 2026 fix: fear_active used to depend entirely on vix_now, which
+    # comes from an unofficial Yahoo scrape that hit a 90+ minute rate-limit
+    # outage today. Checked real alternatives (Finnhub, Twelve Data, Alpaca's
+    # own index-data endpoints) — none currently offer the actual CBOE VIX
+    # index on a usable free tier; Alpaca explicitly retracted its index-
+    # values endpoints in July 2026 and still lists them as "planned for a
+    # future release" as of Sep 16. VIXY is the one volatility signal that's
+    # ALREADY on a real, published-rate-limit, already-authenticated source
+    # (Alpaca) rather than a scraped endpoint — so it's promoted to the
+    # PRIMARY fear-detection input. It's a proxy (VIX futures ETF %-change,
+    # not the literal index level), so it can't replace vix_now for the
+    # absolute-level logic below (calm-VIX threshold, systemic de-risk
+    # severity tiers, BEAR mode's vix>=25 check) — those still need a real
+    # index number and keep using get_vix_level()'s existing Yahoo-plus-
+    # last-known-value fallback. fear_active is now OR'd across both
+    # signals: either one indicating stress is enough to act on, so a
+    # Yahoo outage no longer silently drops fear detection to "off."
     vixy_chg = get_quote_change("VIXY")
+    vix_now  = get_vix_level()
     current_vix = vix_now  # stored globally — used by check_profit_targets for VIX-aware breakeven stop
 
+    vixy_fear = vixy_chg is not None and vixy_chg >= VIXY_FEAR
+    vix_fear  = vix_now is not None and vix_now >= 25
+    fear_active = vixy_fear or vix_fear
+
     if vix_now is not None:
-        fear_active = vix_now >= 25
         level = "PANIC" if vix_now >= 35 else "FEAR" if vix_now >= 25 else "uncertainty" if vix_now >= 20 else "calm"
         if fear_active:
-            log.warning(f"FEAR ACTIVE — VIX {vix_now:.1f} ({level}). Position sizes halved.")
+            log.warning(
+                f"FEAR ACTIVE — VIX {vix_now:.1f} ({level})"
+                + (f", VIXY {vixy_chg*100:+.1f}%" if vixy_chg is not None else "")
+                + ". Position sizes halved."
+            )
         else:
             log.info(f"VIX {vix_now:.1f} — {level}. Normal sizing.")
     elif vixy_chg is not None:
-        fear_active = vixy_chg >= VIXY_FEAR
-        vix_now     = None
+        if fear_active:
+            log.warning(f"FEAR ACTIVE — VIXY {vixy_chg*100:+.1f}% (VIX index unavailable). Position sizes halved.")
+        else:
+            log.info(f"VIXY {vixy_chg*100:+.1f}% — calm (VIX index unavailable). Normal sizing.")
     else:
-        fear_active = False
-        vix_now     = None
+        log.warning("Neither VIX nor VIXY available this cycle — fear detection blind")
 
     spy_chg = get_quote_change("SPY")
     if spy_chg is not None:
