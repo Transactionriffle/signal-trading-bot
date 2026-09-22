@@ -153,6 +153,23 @@ INTRADAY_RS_MAX = 0.75      # RS measured vs today's OPEN (not prior close), cap
 REQUIRE_ABOVE_OPEN = True   # only enter a name trading above its 9:30 open (positive intraday RS)
 OVERNIGHT_OPEN_GRACE_MINUTES = 5   # overnight holds: stop-type exits wait until 9:35 unless loss > 2× tier
 MIDDAY_TA_REFRESH_ET = (12, 0)     # one TA-only re-validation of the whole cache; set to None to disable
+# Sep 21 2026 — end-of-day profit lock. Root cause: TSM peaked +1.07%,
+# the dynamic trail armed at floor +0.67%, and was still +1.01% at the
+# last check before the 16:00 ET close — never breached its own floor
+# DURING market hours. It then drifted to roughly flat overnight/next-
+# open, while the bot was asleep (check_profit_targets only runs while
+# the market is open — nothing watches a position after the close).
+# The trail didn't fail; it was simply never given another chance to
+# fire before the gap happened. This locks in any still-profitable
+# position in the last few minutes of the session rather than carrying
+# an unrealised gain into a period with zero monitoring. Trade-off,
+# stated plainly: a position that would have run further next session
+# also gets cut here — this trades upside for eliminating overnight/
+# gap giveback on a WIN specifically (the loss-side gap risk on
+# overnight holds is a separate, larger problem — see
+# OVERNIGHT_OPEN_GRACE_MINUTES and the Sep 11 writeup above).
+EOD_LOCK_ET = (15, 55)   # (hour, minute) ET — from this time to the close, lock in any profitable position
+
 # Sep 11 2026: activation delay REMOVED (30 → 0). SLB on Sep 10 sold at
 # -1.71% at exactly minute 30 — the loss had already run well past every
 # stop level before anything was allowed to act. Stops now fire from
@@ -1480,23 +1497,50 @@ def fetch_fundamental(symbol: str, ta: dict) -> dict | None:
         price  = ta.get("price", 0)
         rsi    = ta.get("rsi", 50)
         signal = ta.get("taSignal", "HOLD")
+        # Sep 22 2026 fix, second pass: the previous fix swapped the
+        # anchor number (7/82) for a different anchor number (-3/45) —
+        # a redirected bias, not a removed one. Real fix: describe the
+        # schema by TYPE and CONSTRAINT only, no filled-in example value
+        # at all, so there is nothing for the model to anchor toward in
+        # either direction. This carries more risk of a malformed/
+        # unparseable response (no example to imitate the exact shape),
+        # so the except-clause below now logs the raw response text on
+        # any parse failure instead of silently returning None — a
+        # silent None here is functionally invisible: it just quietly
+        # reduces fundamentals coverage with nothing in the logs to show
+        # it happened. If parse failures turn out to be common, that's
+        # the signal to add back a structural (not numeric) example.
         prompt = (
-            f"Research {symbol} stock. Price ${price:.0f}, RSI {rsi:.0f}, TA {signal}. "
-            "Rate fundamentals. Return ONLY this JSON: "
-            '{"fundSignal":"BUY","fundScore":7,"confidence":82,"thesis":"one sentence"} '
-            "fundScore -10 to +10. confidence 0-100."
+            f"Research {symbol} stock right now via web search. Price ${price:.0f}, "
+            f"RSI {rsi:.0f}, TA signal {signal}. Find the ACTUAL current figures: "
+            "revenue growth %, profit margin %, and P/E ratio. Weigh both the bull "
+            "case AND the bear case before scoring — do not default to a generic "
+            f"strong score just because the technical signal is already {signal}. "
+            "Respond with ONLY a single JSON object, no other text before or after "
+            "it, with exactly these four keys: "
+            "fundSignal — a string, one of BUY, SELL, or HOLD. "
+            "fundScore — a number from -10 to +10, reflecting the ACTUAL figures "
+            "you found, not a default or round number. "
+            "confidence — a number from 0 to 100. "
+            "thesis — a one-sentence string citing the specific revenue growth %, "
+            "margin %, or P/E you found."
         )
         response = safe_claude_call(
             model="claude-sonnet-4-5",
-            max_tokens=150,
+            max_tokens=220,
             tools=[{"type": "web_search_20250305", "name": "web_search"}],
             messages=[{"role": "user", "content": prompt}],
         )
         text = next((b.text for b in response.content if hasattr(b, "text")), "")
         si, ei = text.find("{"), text.rfind("}")
         if si == -1:
+            log.warning(f"Fundamental fetch for {symbol}: no JSON object found in response — raw text: {text[:300]!r}")
             return None
-        result = json.loads(text[si:ei+1])
+        try:
+            result = json.loads(text[si:ei+1])
+        except json.JSONDecodeError as je:
+            log.warning(f"Fundamental fetch for {symbol}: malformed JSON ({je}) — raw text: {text[si:ei+1][:300]!r}")
+            return None
         result["fundScore"]  = max(-10, min(10, float(result.get("fundScore", 0))))
         result["confidence"] = max(0,   min(100, float(result.get("confidence", 50))))
         fund_cache[symbol]   = (time.time(), result)
@@ -2223,7 +2267,7 @@ def register_reentry_cooldown(symbol: str, exit_reason: str, exit_price: float):
     global signal_cache
     signal_cache = [s for s in signal_cache if s["symbol"] != symbol]
 
-    if "HARD_CEILING" in exit_reason or "PROFIT_TARGET" in exit_reason:
+    if "HARD_CEILING" in exit_reason or "PROFIT_TARGET" in exit_reason or "EOD_LOCK" in exit_reason:
         reentry_cooldown[symbol] = {
             "type":       "profit",
             "time":       now,
@@ -2357,6 +2401,12 @@ def in_opening_grace() -> bool:
     n = datetime.now(ET)
     mins = n.hour * 60 + n.minute
     return (9 * 60 + 30) <= mins < (9 * 60 + 30 + OVERNIGHT_OPEN_GRACE_MINUTES)
+
+def in_eod_lock_window() -> bool:
+    """True from EOD_LOCK_ET (15:55 ET) up to the 16:00 ET close."""
+    n = datetime.now(ET)
+    mins = n.hour * 60 + n.minute
+    return (EOD_LOCK_ET[0] * 60 + EOD_LOCK_ET[1]) <= mins < (16 * 60)
 
 def fetch_intraday_snapshot(symbol: str) -> dict | None:
     """Live price + today's open for symbol and SPY from Alpaca's snapshot
@@ -3184,6 +3234,19 @@ def check_profit_targets(positions: dict) -> list[str]:
                             f"P&L {pnl_pct*100:+.2f}% below breakeven — holding"
                         )
 
+            # ── End-of-day profit lock (Sep 21 2026) ──────────
+            # Nothing watches a position between the close and the next
+            # open. A position still profitable this late gets locked in
+            # now rather than risking an overnight/gap giveback the trail
+            # never gets a chance to react to. Only fires if no other
+            # exit reason has already fired this cycle (a real stop or
+            # trail hit still takes priority over this catch-all).
+            if not reason and in_eod_lock_window() and pnl_pct > 0:
+                reason = (
+                    f"EOD_LOCK (profitable {pnl_pct*100:+.2f}% this late in the "
+                    f"session — locking in gain rather than risking overnight/gap giveback)"
+                )
+
             # ── Opening-print grace for OVERNIGHT holds (Sep 11 2026) ──
             # Not the 30-min grace on fresh entries (removed). This is the
             # first 5 minutes after 9:30 for positions carried overnight:
@@ -3496,6 +3559,7 @@ def run():
     log.info(f"  Entry window:   {FIRST_ENTRY_ET[0]:02d}:{FIRST_ENTRY_ET[1]:02d}–{LAST_ENTRY_ET[0]:02d}:{LAST_ENTRY_ET[1]:02d} ET (opening range forms first; nothing new late)")
     log.info(f"  Deploy check:   {'live TA + intraday RS re-validation before every buy' if REVALIDATE_AT_DEPLOY else 'OFF — buying on scan-time numbers'}; RS capped ±{INTRADAY_RS_MAX}, above-open required: {REQUIRE_ABOVE_OPEN}")
     log.info(f"  Overnight grace: stop-type exits on overnight holds deferred {OVERNIGHT_OPEN_GRACE_MINUTES}min after the open (unless loss > 2× tier)")
+    log.info(f"  EOD profit lock: any position still profitable at/after {EOD_LOCK_ET[0]:02d}:{EOD_LOCK_ET[1]:02d} ET is closed rather than held overnight")
     log.info(f"  Midday refresh: {'TA-only cache re-validation at %02d:%02d ET' % MIDDAY_TA_REFRESH_ET if MIDDAY_TA_REFRESH_ET else 'off'}")
     log.info(f"  Dynamic downside floor: tightens toward tier ceiling as loss deepens (mirrors trail, inverted)")
     log.info(f"  Max drawdown:   {MAX_DRAWDOWN*100:.0f}%")
