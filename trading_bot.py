@@ -2,10 +2,7 @@
 SIGNAL Trading Bot
 ==================
 Architecture:
-  Pre-market scan (dynamic ~9:20am ET weekdays; Sunday 8pm window
-  removed Sep 23 2026 — its cache carried Sunday's date, so Monday's
-  own 9:20 scan always superseded it: one fully duplicated Claude
-  round per week whose results were never used):
+  Pre-market scan (Sunday 8pm ET, or dynamic ~9:20am ET weekdays):
     → Build up to 55-ticker universe (37 curated + up to 24 dynamic:
       8 movers + 8 trade-count-active + 8 five-day-momentum)
     → TA pre-filter (skip Claude entirely if taScore < 1.5)
@@ -23,15 +20,12 @@ Architecture:
     → Exit priority: +60% hard ceiling (the only fixed profit exit —
       ATR/fixed target removed Sep 10 2026) > stop-loss-magnitude
       override (always labelled STOP_LOSS regardless of prior peak,
-      for accurate attribution) > dynamic-width trail (arms at +2.0%
-      peak, +3.0% in calm VIX<18 — Sep 23 2026; gap widens with peak
-      size; fresh tiers at +5/10/15/20/40% so a runner is never sold
-      at a fixed level below +60%) > breakeven stop (owns the band
-      BELOW the trail arm: peak +1-2% locks +0.5%; calm-VIX peak
-      +2-3% locks +1% — reparameterised Sep 23 2026 so it can
-      actually fire; the legacy fixed trail was removed the same day,
-      its floor being subsumed by the trail table) > composite-tiered
-      stop loss (-3%/-4%/-5% by entry conviction, dynamic downside
+      for accurate attribution) > dynamic-width trail (arms at +1.0%
+      peak, gap widens with peak size; fresh tiers at +5/10/15/20/40%
+      so a runner is never sold at a fixed level below +60%) > old
+      fixed trail (+3%→+2.5%, rarely reached first) > breakeven stop
+      (VIX-aware: wider band when VIX<18) > composite-tiered stop
+      loss (-3%/-4%/-5% by entry conviction, dynamic downside
       floor tightens as loss deepens) > weak-sector mid-day exit
     → First 30 min after entry: full noise tolerance, nothing fires.
       After that: ATR-scaled early-exit stop (hard-capped -0.5%) AND
@@ -97,12 +91,6 @@ logging.basicConfig(
 )
 log = logging.getLogger("signal-bot")
 
-# ── Shared HTTP session (Sep 23 2026) ──────────────────────────
-# One requests.Session for every HTTP call in the file — connection
-# pooling/keep-alive instead of a fresh TCP+TLS handshake for each of
-# the hundreds of requests per hour.
-HTTP = requests.Session()
-
 # ── Config ─────────────────────────────────────────────────────
 ALPACA_KEY      = os.environ["ALPACA_API_KEY"]
 ALPACA_SECRET   = os.environ["ALPACA_SECRET_KEY"]
@@ -120,22 +108,8 @@ MIN_CONFIDENCE  = int(os.environ.get("MIN_CONFIDENCE", "85"))  # Sep 15 2026: ro
 # Raising the floor cuts trade count but concentrates capital in the
 # higher-conviction setups the composite score is actually meant to find.
 MIN_COMPOSITE   = float(os.environ.get("MIN_COMPOSITE", "4.0"))  # Sep 15 2026: rolled back from 4.2 (Sep 11) to 4.0 (raised from 3.0 in the Jul 29 review)
-# Sep 23 2026 — diversity floors promoted to module level so the
-# deploy-time revalidation can honour them: a diversity pick is tested
-# against ITS OWN floor (75% / 1.5), not the full gates. Previously
-# revalidate_candidate() dropped every diversity pick that didn't
-# independently clear 85% / 4.0 on its first deploy attempt, silently
-# nullifying the Sep 16 "own floor, not a bypass" decision.
-DIVERSITY_MIN_CONFIDENCE = 75   # below MIN_CONFIDENCE (85) on purpose — a real floor, not a bypass
-DIVERSITY_MIN_COMPOSITE  = 1.5  # unchanged from the original diversity floor
 MAX_TRADES_DAY  = int(os.environ.get("MAX_TRADES_PER_DAY", "10"))
 MAX_DRAWDOWN    = float(os.environ.get("MAX_DRAWDOWN_PCT", "0.15"))
-# Sep 23 2026 — explicit gross-exposure policy. Sizing previously used
-# regt_buying_power (~2x cash on a margin account) as "cash": 10 slots
-# x up to 16% Kelly could quietly build ~160% of equity in positions
-# on a strategy never described as levered. Total position value is
-# now hard-capped at MAX_GROSS_EXPOSURE x equity in deploy_from_cache().
-MAX_GROSS_EXPOSURE = 1.00   # 100% of equity — unlevered by design
 SCAN_INTERVAL   = 60
 ET              = ZoneInfo("America/New_York")
 
@@ -146,11 +120,8 @@ ET              = ZoneInfo("America/New_York")
 # escalating dynamic trail (see DYNAMIC_TRAIL_TABLE) or the hard
 # ceiling below. Nothing sells a position at a fixed +5% any more.
 HARD_SELL_CEILING = 0.60   # +60%  the ONLY fixed profit exit — sell immediately, no trail given
-# Sep 23 2026 — legacy fixed trail (peak >= +3% → sell at +2.5%) REMOVED.
-# It was provably unreachable: for any peak >= 3% the dynamic trail's
-# floor (peak - gap) is >= +2.5% and is checked first, so no parameter
-# choice could make the legacy branch fire without making exits worse.
-# Its protection level survives as the dynamic table's own tiers.
+PEAK_TRIGGER    =  0.03    # +3%   activate trailing protection (legacy fallback path)
+TRAIL_SELL      =  0.025   # +2.5% sell if falls back here after peak (legacy fallback path)
 # Sep 11 2026 — stop tiers ROLLED BACK to the original -3%/-4%/-5%
 # after one day at -0.75/-1.0/-1.5% (the Sep 11 open flushed four
 # carried-over positions at -2.1% to -2.5% — gap losses the tighter
@@ -182,14 +153,13 @@ INTRADAY_RS_MAX = 0.75      # RS measured vs today's OPEN (not prior close), cap
 REQUIRE_ABOVE_OPEN = True   # only enter a name trading above its 9:30 open (positive intraday RS)
 OVERNIGHT_OPEN_GRACE_MINUTES = 5   # overnight holds: stop-type exits wait until 9:35 unless loss > 2× tier
 MIDDAY_TA_REFRESH_ET = (12, 0)     # one TA-only re-validation of the whole cache; set to None to disable
-# Sep 23 2026 — the Sep 21 end-of-day profit lock (EOD_LOCK_ET 15:55)
-# was REMOVED. Combined with the -0.5% early-exit stop it had turned
-# the bot into an unintended daily-flat system: every profitable
-# position was force-closed at 15:55, so ONLY losers ever carried
-# overnight, and those were then liquidated by the early-exit stop
-# shortly after the next open. Winners may hold overnight again;
-# loss-side overnight gap risk remains handled by
-# OVERNIGHT_OPEN_GRACE_MINUTES and the ordinary stop ladder.
+# Sep 24 2026 — end-of-day profit lock REMOVED. Combined with the
+# -0.5% early-exit stop it had turned the bot into an unintended
+# daily-flat system: every profitable position was force-closed at
+# 15:55, so ONLY losers ever carried overnight, and those were then
+# liquidated by the early-exit stop shortly after the next open.
+# Winners can hold overnight again; loss-side overnight gap risk
+# remains handled by OVERNIGHT_OPEN_GRACE_MINUTES and the stop ladder.
 
 # Sep 11 2026: activation delay REMOVED (30 → 0). SLB on Sep 10 sold at
 # -1.71% at exactly minute 30 — the loss had already run well past every
@@ -204,29 +174,28 @@ BREAKEVEN_TRIGGER = 0.01   # +1%   once hit, stop shifts to +0.5% (default / hig
 BREAKEVEN_STOP    = 0.005  # +0.5% minimum locked-in gain after breakeven (default / high-VIX)
 
 # ── Dynamic-width trailing stop (Aug 2026) ──────────────────────
-# Sep 23 2026 rework: the trail now ARMS at +2.0% peak (+3.0% in calm
-# VIX<18 tape) instead of +1.0%, and the +1% table row is gone. This
-# gives the breakeven stop a real band to govern: peaks in [+1%, +2%)
-# (calm: [+2%, +3%)) are protected by the breakeven lock (+0.5% /
-# +1% calm) instead of being clipped by a 0.4% trail gap. Previously
-# the trail armed at the SAME peak as the breakeven trigger with a
-# floor always above the breakeven lock — which, given the trail is
-# checked first, made the breakeven branch (and its whole VIX-aware
-# widening) mathematically unreachable dead code.
-# The gap between peak and the sell-floor is NOT constant — it widens
-# as the peak grows, so small moves get locked in tight while genuine
-# runners (like MU's +19% day) get progressively more room to breathe.
+# Sep 10 2026: arm raised from +0.2% to +1.0%, first gap widened from
+# 0.1% to 0.4%. The +0.2%/0.1% row was producing the +0.1% "wins"
+# (MSFT +0.11% today) — it locked winners in before they had any room
+# to become real gains. Now a position must peak +1% before the trail
+# arms, and its first floor sits at +0.6% — just above the +0.5%
+# breakeven lock, so the two rules stay coherent rather than fighting.
+# Arms as soon as peak reaches +1.0%. The gap between peak and the
+# sell-floor is NOT constant — it widens as the peak grows, so small
+# moves get locked in tight (protect against noise) while genuine
+# runners (like MU's +19% day) get progressively more room to
+# breathe instead of being stopped out on the first 0.1% wobble.
 # Table is peak-threshold -> trail gap. Highest matching threshold
 # the peak has reached determines the active gap.
-MICRO_TRAIL_ARM_PCT      = 0.02   # +2.0% peak arms the trail (default)
-MICRO_TRAIL_ARM_PCT_CALM = 0.03   # +3.0% in calm (VIX<18) markets — everything needs more confirmation there, matching the calm breakeven trigger moving to +2%
+MICRO_TRAIL_ARM_PCT = 0.01    # +1.0% peak required to arm the trail at all (was +0.2%)
 # Sep 10 2026 — table extended upward. With the fixed profit target
 # gone, a runner past +5% keeps trailing under the SAME mechanic, with
 # a fresh (wider) tier arming at +10%, +20% and +40%. +60% is the hard
 # ceiling (HARD_SELL_CEILING) where the position is sold outright.
 DYNAMIC_TRAIL_TABLE = [
     # (peak_threshold, gap_below_peak)
-    (0.02,   0.005),   # peak +2%    → floor 0.5% behind   (first trail tier — below this, breakeven governs)
+    (0.01,   0.004),   # peak +1%    → floor 0.4% behind   (first lock at +0.6%, just above breakeven's +0.5%)
+    (0.02,   0.005),   # peak +2%    → floor 0.5% behind
     (0.05,   0.015),   # peak +5%    → floor 1.5% behind   (old profit-target level — now just another trail tier)
     (0.10,   0.03),    # peak +10%   → floor 3.0% behind
     (0.15,   0.05),    # peak +15%   → floor 5.0% behind   (room for a runner)
@@ -317,7 +286,7 @@ SECTOR_WEAK     = -0.015
 # safety margin above the normal composite/confidence gates, since this
 # overrides an actual risk signal rather than a soft preference — the
 # stock has to be unambiguously strong on its own merits to justify it.
-SECTOR_OUTPERFORM_OVERRIDE   = 0.03   # stock must beat its sector's % move by this much (3pp) to override — both legs measured intraday from TODAY'S OPEN (Sep 23 2026)
+SECTOR_OUTPERFORM_OVERRIDE   = 0.03   # stock must beat its sector's % move by this much (3pp) to override
 SECTOR_OVERRIDE_MIN_COMPOSITE_BONUS  = 1.0  # composite must clear MIN_COMPOSITE + this much
 SECTOR_OVERRIDE_MIN_CONFIDENCE_BONUS = 5    # confidence must clear MIN_CONFIDENCE + this much (percentage points)
 SECTOR_ETFS     = {
@@ -478,7 +447,7 @@ def get_sector(symbol: str) -> str | None:
 
     try:
         url = f"{WORKER_URL}/yahoofinance/quoteSummary/{symbol}?modules=assetProfile"
-        r   = HTTP.get(url, timeout=10)
+        r   = requests.get(url, timeout=10)
         if r.ok:
             data = r.json()
             profile = (
@@ -542,12 +511,9 @@ def is_likely_etf(symbol: str) -> bool:
             log.warning(f"  {symbol}: identified as ETF/leveraged product ('{asset.name}') — blocking")
         fund_cache[cache_key] = (time.time(), is_etf)
         return is_etf
-    except Exception as e:
-        # Sep 23 2026 — FAIL CLOSED: a failed asset lookup no longer
-        # passes as "not an ETF", and the failure is NOT cached, so the
-        # next attempt retries. Blocks this ticker this attempt only.
-        log.warning(f"  {symbol}: ETF check failed ({e}) — fail closed, blocking this attempt")
-        return True
+    except Exception:
+        fund_cache[cache_key] = (time.time(), False)
+        return False
 
 # Keywords/patterns identifying SPACs (blank-check acquisition companies).
 # Root cause Aug 21: RFAI/RFAIU (RF Acquisition Corp II) spiked +230-473%
@@ -584,11 +550,9 @@ def is_likely_spac(symbol: str) -> bool:
             log.warning(f"  {symbol}: identified as SPAC/blank-check company ('{asset.name}') — blocking")
         fund_cache[cache_key] = (time.time(), is_spac)
         return is_spac
-    except Exception as e:
-        # Sep 23 2026 — FAIL CLOSED, not cached: a lookup failure blocks
-        # this attempt only instead of certifying "not a SPAC".
-        log.warning(f"  {symbol}: SPAC check failed ({e}) — fail closed, blocking this attempt")
-        return True
+    except Exception:
+        fund_cache[cache_key] = (time.time(), False)
+        return False
 
 # ── Runtime state ──────────────────────────────────────────────
 trades_today:       dict[str, int]   = defaultdict(int)
@@ -606,10 +570,7 @@ weak_sectors:       set              = set()
 # rather than only knowing "weak: yes/no". Needed for the outperformance
 # override below — without the actual number, there's no way to tell a
 # stock quietly bucking a -1.6% sector from one riding a -8% cliff.
-sector_changes:     dict             = {}   # {sector: pct_change vs PRIOR CLOSE — drives weak_sectors}
-sector_intraday_changes: dict        = {}   # Sep 23 2026 — {sector: pct_change vs TODAY'S OPEN}, for the
-                                            # outperformance override so stock and sector are measured from
-                                            # the SAME anchor (both intraday from the open, no gap leakage)
+sector_changes:     dict             = {}   # {sector: pct_change}
 # Sep 11 2026 — symbol → epoch of the last close_position() call. A market
 # sell at the open can partially fill (NVDA 24/26/5, TSM 9/10/3/1/1/4 on
 # Sep 11) so the position is still there on the next 60s cycle and the
@@ -634,10 +595,6 @@ current_vix:        float | None     = None   # latest VIX reading — used for 
 last_vix_value:     float | None     = None   # last successfully-fetched VIX reading
 last_vix_time:      float            = 0.0    # epoch of that successful fetch
 VIX_STALE_MAX_AGE_SECS = 15 * 60               # a fallback older than this is not used — too stale to trust
-VIX_FETCH_INTERVAL_SECS = 5 * 60               # Sep 23 2026 — fetch VIX at most every 5min instead of every
-                                               # 60s cycle. Per-minute polling of the scraped Yahoo endpoint
-                                               # was the root cause of the Sep 22 rate-limit (429) outage;
-                                               # macro state does not move meaningfully inside 60 seconds.
 systemic_derisk_active: bool         = False  # True when VIX severely elevated + multiple sectors weak at once
 
 # ── Systemic de-risk thresholds ──────────────────────────────────
@@ -1222,7 +1179,7 @@ def run_90_day_audit():
 
         # Criterion 1: Volume & Liquidity
         try:
-            r = HTTP.get(
+            r = requests.get(
                 f"https://data.alpaca.markets/v2/stocks/{symbol}/bars",
                 headers={"APCA-API-KEY-ID": ALPACA_KEY, "APCA-API-SECRET-KEY": ALPACA_SECRET},
                 params={"timeframe": "1Day", "limit": 20, "feed": "sip"},
@@ -1419,51 +1376,29 @@ def safe_claude_call(**kwargs):
 # MACRO LAYER
 # ══════════════════════════════════════════════════════════════
 
-def fetch_snapshots(symbols: list) -> dict:
-    """
-    Sep 23 2026 — ONE batched call to Alpaca's multi-symbol snapshot
-    endpoint. Replaces the ~14 sequential per-symbol requests the macro
-    layer used to make every 60s cycle (SPY + VIXY + 12 sector ETFs) —
-    needless latency and API load. Returns {symbol: snapshot} or {}.
-    """
-    try:
-        r = HTTP.get(
-            "https://data.alpaca.markets/v2/stocks/snapshots",
-            headers={"APCA-API-KEY-ID": ALPACA_KEY, "APCA-API-SECRET-KEY": ALPACA_SECRET},
-            params={"symbols": ",".join(symbols), "feed": "sip"},
-            timeout=15,
-        )
-        return r.json() if r.ok else {}
-    except Exception as e:
-        log.warning(f"Batched snapshot fetch failed ({len(symbols)} symbols): {e}")
-        return {}
-
-def _daily_change_from_snapshot(snap) -> float | None:
-    """% change vs PRIOR CLOSE from one snapshot dict (overnight gap included)."""
-    if not snap:
-        return None
-    daily = snap.get("dailyBar", {})
-    prev  = snap.get("prevDailyBar", {})
-    if daily and prev and prev.get("c", 0) > 0:
-        return (daily.get("c", 0) - prev.get("c", 0)) / prev.get("c", 0)
-    latest = snap.get("latestTrade", {})
-    if latest and prev and prev.get("c", 0) > 0:
-        return (latest.get("p", 0) - prev.get("c", 0)) / prev.get("c", 0)
-    return None
-
-def _intraday_change_from_snapshot(snap) -> float | None:
-    """% change vs TODAY'S OPEN from one snapshot dict (no overnight gap)."""
-    if not snap:
-        return None
-    o = snap.get("dailyBar", {}).get("o", 0)
-    p = snap.get("latestTrade", {}).get("p", 0)
-    if o and p:
-        return (p - o) / o
-    return None
-
 def get_quote_change(symbol: str) -> float | None:
-    snaps = fetch_snapshots([symbol])
-    return _daily_change_from_snapshot(snaps.get(symbol))
+    try:
+        headers = {"APCA-API-KEY-ID": ALPACA_KEY, "APCA-API-SECRET-KEY": ALPACA_SECRET}
+        r = requests.get(
+            "https://data.alpaca.markets/v2/stocks/snapshots",
+            headers=headers,
+            params={"symbols": symbol, "feed": "sip"},
+            timeout=15
+        )
+        if not r.ok:
+            return None
+        snap  = r.json().get(symbol, {})
+        daily = snap.get("dailyBar", {})
+        prev  = snap.get("prevDailyBar", {})
+        if daily and prev and prev.get("c", 0) > 0:
+            return (daily.get("c", 0) - prev.get("c", 0)) / prev.get("c", 0)
+        latest = snap.get("latestTrade", {})
+        if latest and prev and prev.get("c", 0) > 0:
+            return (latest.get("p", 0) - prev.get("c", 0)) / prev.get("c", 0)
+        return None
+    except Exception as e:
+        log.warning(f"Quote fetch failed for {symbol}: {e}")
+        return None
 
 def get_vix_level() -> float | None:
     """
@@ -1481,15 +1416,11 @@ def get_vix_level() -> float | None:
     exactly the kind of thing that misleads whoever reads this file next.
     """
     global last_vix_value, last_vix_time
-    # Sep 23 2026 — serve the cached value inside the fetch interval;
-    # only actually hit the endpoint every VIX_FETCH_INTERVAL_SECS.
-    if last_vix_value is not None and time.time() - last_vix_time < VIX_FETCH_INTERVAL_SECS:
-        return last_vix_value
     try:
         now     = int(time.time())
         from_ts = now - 86400 * 5
         url     = f"{WORKER_URL}/yahoofinance/chart/%5EVIX?interval=1d&period1={from_ts}&period2={now}"
-        r       = HTTP.get(url, timeout=20)
+        r       = requests.get(url, timeout=20)
         r.raise_for_status()
         chart  = r.json().get("chart", {}).get("result", [{}])[0]
         closes = chart.get("indicators", {}).get("quote", [{}])[0].get("close", [])
@@ -1512,7 +1443,7 @@ def get_vix_level() -> float | None:
         return None
 
 def assess_market_state():
-    global market_state, fear_active, weak_sectors, spy_change, current_vix, sector_changes, sector_intraday_changes
+    global market_state, fear_active, weak_sectors, spy_change, current_vix, sector_changes
 
     # Sep 22 2026 fix: fear_active used to depend entirely on vix_now, which
     # comes from an unofficial Yahoo scrape that hit a 90+ minute rate-limit
@@ -1531,11 +1462,7 @@ def assess_market_state():
     # last-known-value fallback. fear_active is now OR'd across both
     # signals: either one indicating stress is enough to act on, so a
     # Yahoo outage no longer silently drops fear detection to "off."
-    # Sep 23 2026 — SPY, VIXY and every sector ETF now come from ONE
-    # batched snapshot call per cycle instead of ~14 sequential requests.
-    snap_symbols = ["SPY", "VIXY"] + sorted(set(SECTOR_ETFS.values()))
-    snaps    = fetch_snapshots(snap_symbols)
-    vixy_chg = _daily_change_from_snapshot(snaps.get("VIXY"))
+    vixy_chg = get_quote_change("VIXY")
     vix_now  = get_vix_level()
     current_vix = vix_now  # stored globally — used by check_profit_targets for VIX-aware breakeven stop
 
@@ -1561,7 +1488,7 @@ def assess_market_state():
     else:
         log.warning("Neither VIX nor VIXY available this cycle — fear detection blind")
 
-    spy_chg = _daily_change_from_snapshot(snaps.get("SPY"))
+    spy_chg = get_quote_change("SPY")
     if spy_chg is not None:
         spy_change = spy_chg
         if spy_chg <= SPY_BEAR and vix_now and vix_now >= 25:
@@ -1576,18 +1503,13 @@ def assess_market_state():
 
     weak_sectors = set()
     sector_changes = {}
-    sector_intraday_changes = {}
     for sector, etf in SECTOR_ETFS.items():
-        etf_snap = snaps.get(etf)
-        chg = _daily_change_from_snapshot(etf_snap)
+        chg = get_quote_change(etf)
         if chg is not None:
             sector_changes[sector] = chg
             if chg <= SECTOR_WEAK:
                 weak_sectors.add(sector)
                 log.info(f"  Weak sector: {sector.upper()} ({etf} {chg*100:.2f}%) — avoiding")
-        intraday = _intraday_change_from_snapshot(etf_snap)
-        if intraday is not None:
-            sector_intraday_changes[sector] = intraday  # Sep 23 2026 — feeds the outperformance override (both legs vs today's open)
 
     # ── Systemic de-risking (Aug 2026) ──────────────────────────
     # VIX≥25 + normal sector cap alone doesn't distinguish "one sector
@@ -1629,7 +1551,7 @@ def adjust_qty_for_fear(qty: int, price: float, alloc: float) -> int:
 
 def fetch_technicals(symbol: str) -> dict | None:
     try:
-        r = HTTP.get(f"{WORKER_URL}/technicals/{symbol}", timeout=15)
+        r = requests.get(f"{WORKER_URL}/technicals/{symbol}", timeout=15)
         r.raise_for_status()
         data = r.json()
         return None if "error" in data else data
@@ -1701,11 +1623,7 @@ def fetch_fundamental(symbol: str, ta: dict) -> dict | None:
             tools=[{"type": "web_search_20250305", "name": "web_search"}],
             messages=[{"role": "user", "content": prompt}],
         )
-        # Sep 23 2026 — JOIN all text blocks. With web search enabled the
-        # model often emits a short preamble text block before its tool
-        # calls; taking only the FIRST text block missed the JSON in the
-        # final block and discarded real results as parse failures.
-        text = "".join(b.text for b in response.content if hasattr(b, "text"))
+        text = next((b.text for b in response.content if hasattr(b, "text")), "")
         si, ei = text.find("{"), text.rfind("}")
         if si == -1:
             log.warning(f"Fundamental fetch for {symbol}: no JSON object found in response — raw text: {text[:300]!r}")
@@ -1749,23 +1667,19 @@ def check_earnings_proximity(symbol: str, today: str) -> tuple[bool, str]:
             tools=[{"type": "web_search_20250305", "name": "web_search"}],
             messages=[{"role": "user", "content": prompt}],
         )
-        text = "".join(b.text for b in response.content if hasattr(b, "text"))  # Sep 23: join ALL text blocks — first-block-only missed JSON emitted after web-search preambles
+        text = next((b.text for b in response.content if hasattr(b, "text")), "")
         si, ei = text.find("{"), text.rfind("}")
         if si == -1:
-            # Sep 23 2026 — FAIL CLOSED, and do NOT cache the failure: an
-            # unparseable answer blocks this attempt only; the next attempt
-            # retries instead of inheriting 24h of "verified safe". This is
-            # a hard veto that exists because a single miss cost real money.
-            log.warning(f"  {symbol}: earnings check unparseable — fail closed, blocking this attempt")
-            return True, "earnings check unparseable (fail closed)"
+            fund_cache[cache_key] = (time.time(), (False, ""))
+            return False, ""
         result = json.loads(text[si:ei+1])
         has_earnings = bool(result.get("earnings_within_3_days", False))
         earnings_date = result.get("earnings_date") or ""
         fund_cache[cache_key] = (time.time(), (has_earnings, earnings_date))
         return has_earnings, earnings_date
     except Exception as e:
-        log.warning(f"  {symbol}: earnings check failed ({e}) — fail closed, blocking this attempt")
-        return True, "earnings check failed (fail closed)"
+        log.warning(f"Earnings check failed for {symbol}: {e}")
+        return False, ""
 
 def check_structural_risk(symbol: str, today: str) -> tuple[bool, str]:
     """
@@ -1816,14 +1730,11 @@ def check_structural_risk(symbol: str, today: str) -> tuple[bool, str]:
             tools=[{"type": "web_search_20250305", "name": "web_search"}],
             messages=[{"role": "user", "content": prompt}],
         )
-        text = "".join(b.text for b in response.content if hasattr(b, "text"))  # Sep 23: join ALL text blocks — first-block-only missed JSON emitted after web-search preambles
+        text = next((b.text for b in response.content if hasattr(b, "text")), "")
         si, ei = text.find("{"), text.rfind("}")
         if si == -1:
-            # Sep 23 2026 — FAIL CLOSED, not cached (same posture as the
-            # earnings check): the RFAI class of miss is what this veto
-            # exists for, so a failed check can't read as "verified safe".
-            log.warning(f"  {symbol}: structural risk check unparseable — fail closed, blocking this attempt")
-            return True, "structural check unparseable (fail closed)"
+            fund_cache[cache_key] = (time.time(), (False, ""))
+            return False, ""
         result = json.loads(text[si:ei+1])
         has_risk = bool(result.get("structural_risk", False))
         reason   = result.get("reason") or ""
@@ -1832,8 +1743,8 @@ def check_structural_risk(symbol: str, today: str) -> tuple[bool, str]:
         fund_cache[cache_key] = (time.time(), (has_risk, reason))
         return has_risk, reason
     except Exception as e:
-        log.warning(f"  {symbol}: structural risk check failed ({e}) — fail closed, blocking this attempt")
-        return True, "structural check failed (fail closed)"
+        log.warning(f"Structural risk check failed for {symbol}: {e}")
+        return False, ""
 
 def compute_signal(symbol: str, spy_chg: float = 0.0, prefetched_ta: dict | None = None) -> dict | None:
     # Skip known ETFs
@@ -1842,12 +1753,7 @@ def compute_signal(symbol: str, spy_chg: float = 0.0, prefetched_ta: dict | None
 
     # Secondary ETF check — catches new leveraged ETFs not in exclusion list (e.g. CRDU)
     if is_likely_etf(symbol):
-        # Sep 23 2026 — only a CONFIRMED lookup (cached True) earns the
-        # permanent session exclusion. A fail-closed transient error
-        # blocks this attempt but must not ban the ticker all session.
-        cached = fund_cache.get(f"etf_check_{symbol}")
-        if cached and cached[1]:
-            ETF_EXCLUSIONS.add(symbol)
+        ETF_EXCLUSIONS.add(symbol)  # add to exclusion list for this session
         return None
 
     # SPAC / blank-check company check — hard veto, independent of composite
@@ -1968,7 +1874,7 @@ def build_universe() -> list[str]:
 
     # ── Source 1: Top gainers (movers) ─────────────────────────
     try:
-        r = HTTP.get(
+        r = requests.get(
             f"{DATA_URL}/screener/stocks/movers",
             headers=headers,
             params={"top": 50},
@@ -1997,7 +1903,7 @@ def build_universe() -> list[str]:
     # Much better than volume for quality screening
     s2_added = 0
     try:
-        r = HTTP.get(
+        r = requests.get(
             f"{DATA_URL}/screener/stocks/most-actives",
             headers=headers,
             params={"by": "trades", "top": 50},
@@ -2015,7 +1921,7 @@ def build_universe() -> list[str]:
                         and s2_added < 8):
                     # Quick price check — skip penny stocks
                     try:
-                        snap = HTTP.get(
+                        snap = requests.get(
                             f"{DATA_URL}/stocks/{sym}/snapshot",
                             headers=headers, timeout=5
                         )
@@ -2057,7 +1963,7 @@ def build_universe() -> list[str]:
         # Fetch 5-day bars for watchlist in one call
         watch_syms = [s for s in MOMENTUM_WATCHLIST if s not in symbols and s not in ETF_EXCLUSIONS]
         if watch_syms:
-            r = HTTP.get(
+            r = requests.get(
                 f"{DATA_URL}/stocks/bars",
                 headers=headers,
                 params={
@@ -2126,16 +2032,8 @@ def run_premarket_scan():
     log.info(f"  Universe: {len(CURATED_TICKERS)} curated + up to 24 dynamic (8+8+8) = max 55 tickers")
     log.info("=" * 60)
 
-    # Sep 23 2026 — the blanket fund_cache wipe is GONE. It silently
-    # voided every longer TTL each morning: the 24h earnings/structural
-    # caches, the "30-day" sector classifications and the ETF/SPAC
-    # verdicts all lived at most until the next scan — their stated TTLs
-    # were fiction and their Claude/API calls were re-paid daily. Every
-    # entry class enforces its own TTL at read time (fundamentals 2h,
-    # earnings/structural 24h, sector 30d, durable-composite 1h), and
-    # ETF/SPAC status is immutable within a session, so nothing needs a
-    # scheduled wipe — and the unified mid-session emergency rescan
-    # (which calls this function) no longer destroys warm caches.
+    # Clear yesterday's cache
+    fund_cache = {}
 
     # Assess market state for RS calculation
     spy_chg = get_quote_change("SPY") or 0.0
@@ -2190,8 +2088,8 @@ def run_premarket_scan():
     # than a normal entry (85%/4.0) — DIVERSITY_MIN_CONFIDENCE (75%) and
     # DIVERSITY_MIN_COMPOSITE (1.5) — so a sector gap can still be filled,
     # but never with a trade Claude scored as a coin flip.
-    # Floors live at module level since Sep 23 2026 (see config section)
-    # so the deploy-time revalidation can honour them for flagged picks.
+    DIVERSITY_MIN_CONFIDENCE = 75   # below MIN_CONFIDENCE (85) on purpose — a real floor, not a bypass
+    DIVERSITY_MIN_COMPOSITE  = 1.5  # unchanged from the original diversity floor
     DIVERSITY_SECTORS = ["financials", "healthcare", "energy", "industrials", "consumer"]
     cached_sectors = {SECTOR_MAP.get(c["symbol"]) for c in candidates}
 
@@ -2206,8 +2104,6 @@ def run_premarket_scan():
                 best = sector_best[0]
                 if (best["composite"] >= DIVERSITY_MIN_COMPOSITE
                         and best["confidence"] >= DIVERSITY_MIN_CONFIDENCE):
-                    best = dict(best)
-                    best["diversity"] = True  # Sep 23 2026 — revalidate_candidate tests this pick against the diversity floors, not the full gates
                     candidates.append(best)
                     log.info(
                         f"  📊 DIVERSITY {best['symbol']} ({sector}): composite={best['composite']:.2f}, "
@@ -2236,25 +2132,24 @@ def run_premarket_scan():
 
 def should_run_premarket_scan() -> bool:
     """
-    Returns True ONLY in the weekday pre-market window.
+    Returns True ONLY in designated pre-market windows.
     TIME IS THE PRIMARY GATE — cache state is secondary.
 
-    Scan window (Sep 23 2026 — the Sunday 8pm-10pm window was REMOVED:
-    its cache carried Sunday's signal_cache_date, so Monday's 9:20 gate
-    always saw a stale date and re-scanned anyway — one fully duplicated
-    Claude round per week whose results were never used):
-    - Mon-Fri: dynamic start = 9:30am minus ESTIMATED_SCAN_MINUTES minus
-      BUFFER_MINUTES (the two constants below are the single source of
-      truth for the start time — don't trust any prose estimate here)
+    Scan windows:
+    - Sunday 8pm-10pm ET  → Monday preparation
+    - Mon-Fri: dynamic start = 9:30am minus scan duration minus buffer
+      Scan duration estimate: ~8 min (TA pre-filter + sleep 3s on 55 tickers)
+      Buffer: 10 min safety margin
+      → Scan starts at ~9:12am ET, finishes just before market open
 
-    This ensures signals are as fresh as possible at the 9:30am open.
-    Old approach (6am scan) left the cache stale for 3+ hours.
+    This ensures signals are as fresh as possible at 9:30am open.
+    Old approach (6am scan) left cache stale for 3+ hours.
 
-    This function ONLY gates the scheduled morning scan — it never fires
-    during market hours. Mid-session, the main loop (post-restart empty
-    cache) and deploy_from_cache (cache exhausted) both call
-    run_premarket_scan() directly as the ONE unified emergency-rescan
-    path, throttled to once per hour via last_rescan_time.
+    NEVER scans:
+    - During market hours (9:30am-4pm ET) — cache only
+    - After 4pm ET — wait for next morning
+    - Weekends outside Sunday 8-10pm
+    - On bot restart mid-session (even with empty cache)
     """
     now_et = datetime.now(ET)
     today  = now_et.strftime("%Y-%m-%d")
@@ -2276,9 +2171,12 @@ def should_run_premarket_scan() -> bool:
     # ── Step 1: Time gate ──────────────────────────────────────
     in_window = False
 
+    # Sunday 8pm-10pm ET — prepare for Monday
+    if day == 6 and 20 <= hour < 22:
+        in_window = True
+
     # Weekday: dynamic window from scan_start_minutes to 9:29am
-    # (Sunday branch removed Sep 23 2026 — see docstring)
-    if 0 <= day <= 4:
+    elif 0 <= day <= 4:
         market_open = (hour == 9 and minute >= 30) or hour >= 10
         if not market_open and now_minutes >= scan_start_minutes:
             in_window = True
@@ -2555,20 +2453,12 @@ def check_reentry_allowed(symbol: str, current_price: float) -> tuple[bool, str]
     # Insufficient buying power cooldown (15min) — Sep 2026 fix for the
     # NVDA retry-loop incident (bot hammered buy attempts every ~1s with
     # shrinking quantities, all failing identically). Checked explicitly
-    # by type, same as profit/stop above.
-    if cdtype == "insufficient_funds":
-        if expires > 0 and now < expires:
-            remaining = (expires - now) / 60
-            return False, f"insufficient funds cooldown ({remaining:.1f}min remaining)"
-        # Sep 23 2026 fix: once the 15min expires, DELETE and ALLOW.
-        # Previously control fell through to the price gate with
-        # exit_price=0 → gate = $0.00 → "current > gate" blocked the
-        # ticker for the full 48h gate window ("need 2% pullback from
-        # exit $0.00") — silently turning a 15-minute cooldown into a
-        # 2-day ban, the exact wrong-reason block the comment above
-        # claimed the explicit type check avoided.
-        del reentry_cooldown[symbol]
-        return True, ""
+    # by type, same as profit/stop above — falling through to the price
+    # gate below would use exit_price=0, which happens to always block
+    # but for the wrong reason and ignores the actual 15min expiry.
+    if cdtype == "insufficient_funds" and expires > 0 and now < expires:
+        remaining = (expires - now) / 60
+        return False, f"insufficient funds cooldown ({remaining:.1f}min remaining)"
 
     # Option 3 — price gate (2% pullback required)
     # Expires after 48 hours — prevents stale gates blocking re-entry indefinitely
@@ -2576,7 +2466,7 @@ def check_reentry_allowed(symbol: str, current_price: float) -> tuple[bool, str]
     gate_set_time = cd.get("time", 0)
     gate_expired  = (now - gate_set_time) > PRICE_GATE_EXPIRY_SECS
 
-    if not gate_expired and exit_px > 0:   # Sep 23: exit_px=0 (unknown) can't form a meaningful gate
+    if not gate_expired:
         gate_price = exit_px * (1 - PRICE_GATE_PCT)
         if current_price > gate_price:
             hours_remaining = max(0, PRICE_GATE_EXPIRY_SECS - (now - gate_set_time)) / 3600
@@ -2608,7 +2498,7 @@ def fetch_intraday_snapshot(symbol: str) -> dict | None:
     """Live price + today's open for symbol and SPY from Alpaca's snapshot
     endpoint. Returns {price, open, spy_price, spy_open} or None."""
     try:
-        r = HTTP.get(
+        r = requests.get(
             "https://data.alpaca.markets/v2/stocks/snapshots",
             params={"symbols": f"{symbol},SPY"},
             headers={"APCA-API-KEY-ID": ALPACA_KEY, "APCA-API-SECRET-KEY": ALPACA_SECRET},
@@ -2676,35 +2566,24 @@ def revalidate_candidate(candidate: dict) -> tuple[str, dict | None, str]:
     # the floor (or something like it) needs to come back.
 
     snap = fetch_intraday_snapshot(symbol)
-    if not snap:
-        # Sep 23 2026 — FAIL CLOSED (matches the docstring's own "data
-        # unavailable → skip, don't drop"). Previously a failed snapshot
-        # silently bypassed REQUIRE_ABOVE_OPEN and bought on neutral-RS
-        # numbers — a data outage was the one time the momentum gate
-        # didn't apply.
-        return "skip", None, "intraday snapshot unavailable — not buying without live data"
-    rs_boost, stock_pct, rs_label = intraday_rs_boost(snap)
-    live_price = snap["price"]
-    if REQUIRE_ABOVE_OPEN and stock_pct <= 0:
-        return "skip", None, f"trading below its open ({stock_pct*100:+.2f}%) — {rs_label}"
-
-    # Sep 23 2026 — diversity picks are tested against their OWN floors
-    # (75% / 1.5, see config), not the full gates. Without this, this
-    # function dropped every diversity pick below 85%/4.0 on its first
-    # deploy attempt — nullifying the Sep 16 diversity decision.
-    is_diversity = bool(candidate.get("diversity"))
-    min_comp = DIVERSITY_MIN_COMPOSITE  if is_diversity else MIN_COMPOSITE
-    min_conf = DIVERSITY_MIN_CONFIDENCE if is_diversity else MIN_CONFIDENCE
+    if snap:
+        rs_boost, stock_pct, rs_label = intraday_rs_boost(snap)
+        live_price = snap["price"]
+        if REQUIRE_ABOVE_OPEN and stock_pct <= 0:
+            return "skip", None, f"trading below its open ({stock_pct*100:+.2f}%) — {rs_label}"
+    else:
+        rs_boost, rs_label = 0.0, "intraday RS unavailable (snapshot failed) — treated as neutral"
+        live_price = ta.get("price", candidate.get("price", 0))
 
     fund_score = candidate.get("fundScore", 0)
     composite  = ta_score * (TECH_WEIGHT / 100) + fund_score * (FUND_WEIGHT / 100) + rs_boost
-    if composite < min_comp:
+    if composite < MIN_COMPOSITE:
         return "drop", None, (
-            f"fresh composite {composite:.2f} < {min_comp}{' (diversity floor)' if is_diversity else ''} "
+            f"fresh composite {composite:.2f} < {MIN_COMPOSITE} "
             f"(scan had {candidate.get('composite', 0):.2f}; ta {ta_score:.1f}, fund {fund_score:.1f}, {rs_label})"
         )
-    if candidate.get("confidence", 0) < min_conf:
-        return "drop", None, f"confidence {candidate.get('confidence')}% < {min_conf}%{' (diversity floor)' if is_diversity else ''}"
+    if candidate.get("confidence", 0) < MIN_CONFIDENCE:
+        return "drop", None, f"confidence {candidate.get('confidence')}% < {MIN_CONFIDENCE}%"
 
     atr_raw = ta.get("atr14", 0) or ta.get("atr", 0)
     price_for_atr = ta.get("price", 0) or live_price
@@ -2752,11 +2631,7 @@ def close_position(symbol: str, pnl_pct: float = 0.0, exit_reason: str = "") -> 
     # second trade or a second cooldown/strike.
     now_ts = time.time()
     is_remainder = (now_ts - recent_close_calls.get(symbol, 0)) < RECLOSE_WINDOW_SECS
-    # Sep 23 2026 fix: the timestamp is stamped AFTER the close succeeds
-    # (below). Stamping before the attempt meant a FAILED close left the
-    # timestamp behind, and the retry within 15min took the "remainder"
-    # path — so the real close was never journaled and never earned a
-    # cooldown or a circuit-breaker strike.
+    recent_close_calls[symbol] = now_ts
     try:
         # Cancel open orders first
         orders = trade_client.get_orders()
@@ -2776,7 +2651,6 @@ def close_position(symbol: str, pnl_pct: float = 0.0, exit_reason: str = "") -> 
             current_price = 0.0
 
         trade_client.close_position(symbol)
-        recent_close_calls[symbol] = now_ts  # stamped only once the close actually went through (Sep 23 fix)
         if is_remainder:
             log.info(
                 f"[SELL] Re-submitted remainder for {symbol} — earlier close partially "
@@ -3209,26 +3083,24 @@ def check_profit_targets(positions: dict) -> list[str]:
     Priority order (first match wins):
       1. Hard ceiling: +60% → sell immediately (the ONLY fixed profit
          exit — the fixed/ATR profit target was removed Sep 10 2026)
-      2. Dynamic-width trail: peak ≥ +2.0% arms it (+3.0% in calm
-         VIX<18 — Sep 23 2026 reparameterisation). Gap between peak
-         and sell-floor widens as the peak grows (see
-         DYNAMIC_TRAIL_TABLE); fresh, wider tiers arm at +5%, +10%,
+      2. Dynamic-width trail: peak ≥ +1.0% arms it. Gap between peak
+         and sell-floor widens as the peak grows (see DYNAMIC_TRAIL_TABLE):
+         tight (0.4%) near breakeven to protect against noise, wide
+         (up to 10%) at high peaks so a genuine runner (like MU's +19%
+         day) gets room to keep going instead of being stopped out on
+         the first small wobble. Fresh, wider tiers arm at +5%, +10%,
          +15%, +20% and +40% — a runner is never sold at a fixed level
          below +60%.
-      3. Breakeven stop: OWNS the band below the trail arm — peak in
-         [+1%, +2%) locks +0.5% (calm-VIX: peak in [+2%, +3%) locks
-         +1%). Reachable again since Sep 23 2026: previously the trail
-         armed at the same peak as this trigger with a floor above
-         this lock, which made the branch (and its VIX-aware widening)
-         dead code. The legacy fixed trail (peak +3% → sell +2.5%) was
-         removed the same day — strictly dominated by the trail table.
-      4. Hard stop loss: composite-tiered -3%/-4%/-5% (-2% in BEAR mode)
+      3. Old fixed trailing: peak ≥ +3% → sell if falls to +2.5%
+         (kept as a fallback path; in practice #2 fires first since
+         it arms earlier at +1.0% and its floor is above +2.5% by then)
+      4. Breakeven stop: peak ≥ +1% (or +2% calm-VIX) → stop shifts
+         to +0.5% (or +1% calm-VIX)
+      5. Hard stop loss: composite-tiered -3%/-4%/-5% (-2% in BEAR mode)
     Plus:
-      5. Weak sector mid-day exit: if sector turns weak AND position
+      6. Weak sector mid-day exit: if sector turns weak AND position
          is at breakeven or better → exit to protect gains.
          If position is negative → hold (don't crystallise a loss).
-    (The Sep 21 end-of-day profit lock was removed Sep 23 2026 — see
-    the comment where EOD_LOCK_ET used to live in the config section.)
     """
     closed      = []
     base_stop   = get_stop_loss()   # -5% normal, -2% in BEAR mode — the ceiling
@@ -3245,10 +3117,6 @@ def check_profit_targets(positions: dict) -> list[str]:
     is_calm = current_vix is not None and current_vix < CALM_VIX_THRESHOLD
     be_trigger = BREAKEVEN_TRIGGER_CALM if is_calm else BREAKEVEN_TRIGGER
     be_stop    = BREAKEVEN_STOP_CALM    if is_calm else BREAKEVEN_STOP
-    # Sep 23 2026 — trail arm is VIX-aware like the breakeven trigger and
-    # always sits ONE band above it, so the breakeven stop governs peaks
-    # in [be_trigger, trail_arm) and the trail takes over beyond that.
-    trail_arm  = MICRO_TRAIL_ARM_PCT_CALM if is_calm else MICRO_TRAIL_ARM_PCT
 
     # ── Overnight-hold prioritisation (Sep 2026) ────────────────
     # Root cause: PLTR (bought Sep 1, held overnight) breached its own
@@ -3323,7 +3191,7 @@ def check_profit_targets(positions: dict) -> list[str]:
             if pnl_pct > prev_peak:
                 position_peaks[symbol] = pnl_pct
                 save_peaks()
-                if pnl_pct >= trail_arm:
+                if pnl_pct >= MICRO_TRAIL_ARM_PCT:
                     gap   = get_dynamic_trail_gap(pnl_pct)
                     floor = pnl_pct - gap
                     log.info(
@@ -3347,12 +3215,12 @@ def check_profit_targets(positions: dict) -> list[str]:
 
             # ── Standard exit rules ────────────────────────────
             # Priority order: hard ceiling > stop-loss-magnitude override >
-            # micro-trail > breakeven stop > hard stop loss
+            # micro-trail > old fixed trail > breakeven stop > hard stop loss
             #
             # Sep 2026 audit fix: the DYNAMIC_TRAIL branch below only checks
             # "has price fallen more than the trail gap below its peak" — it
             # has NO awareness of the position's own stop-loss tier. Once a
-            # position has EVER peaked >= the trail arm, its
+            # position has EVER peaked >= MICRO_TRAIL_ARM_PCT (1.0%), its
             # current_peak never resets down, so ANY subsequent crash — even
             # one that blows straight through the -3%/-4%/-5% composite tier
             # — gets caught and labelled "DYNAMIC_TRAIL" instead of the more
@@ -3379,24 +3247,24 @@ def check_profit_targets(positions: dict) -> list[str]:
                 entry_time = entry_signals.get(symbol, {}).get("entry_time")
                 minutes_held = (time.time() - entry_time) / 60 if entry_time else None
                 if minutes_held is None or minutes_held >= STOP_LOSS_ACTIVATION_MINUTES:
-                    peak_note = f", peaked {current_peak*100:+.2f}% earlier" if current_peak >= trail_arm else ""
+                    peak_note = f", peaked {current_peak*100:+.2f}% earlier" if current_peak >= MICRO_TRAIL_ARM_PCT else ""
                     reason = f"STOP_LOSS ({active_stop*100:.0f}%{' composite-tiered' if entry_composite is not None else ''}{peak_note})"
                 # else: falls through to noise-tolerance window below via the
                 # ordinary STOP_LOSS branch's own delay check — no action here,
                 # just don't claim it as DYNAMIC_TRAIL in the meantime either
-                elif current_peak < trail_arm:
+                elif current_peak < MICRO_TRAIL_ARM_PCT:
                     log.info(
                         f"  {symbol}: at {pnl_pct*100:+.2f}% (below {active_stop*100:.0f}% stop) but only "
                         f"{minutes_held:.1f}min held — stop-loss activates at {STOP_LOSS_ACTIVATION_MINUTES}min, holding"
                     )
-            elif current_peak >= trail_arm and pnl_pct <= (current_peak - get_dynamic_trail_gap(current_peak)):
+            elif current_peak >= MICRO_TRAIL_ARM_PCT and pnl_pct <= (current_peak - get_dynamic_trail_gap(current_peak)):
                 gap = get_dynamic_trail_gap(current_peak)
                 reason = (
                     f"DYNAMIC_TRAIL (peaked {current_peak*100:+.2f}%, "
                     f"gap {gap*100:.1f}% behind peak)"
                 )
-            # (Legacy fixed-trail branch removed Sep 23 2026 — see the
-            # comment at HARD_SELL_CEILING: strictly dominated, never firable.)
+            elif current_peak >= PEAK_TRIGGER and pnl_pct <= TRAIL_SELL:
+                reason = f"TRAILING (peaked {current_peak*100:+.2f}%)"
             elif current_peak >= be_trigger and pnl_pct <= be_stop:
                 reason = (
                     f"BREAKEVEN_STOP (peaked {current_peak*100:+.2f}%, "
@@ -3451,7 +3319,7 @@ def check_profit_targets(positions: dict) -> list[str]:
                             f"P&L {pnl_pct*100:+.2f}% below breakeven — holding"
                         )
 
-            # (End-of-day profit lock removed Sep 23 2026 — with the
+            # (End-of-day profit lock removed Sep 24 2026 — with the
             # -0.5% early-exit stop it produced an unintended daily-flat
             # system where only losers carried overnight. See the config
             # comment where EOD_LOCK_ET used to live.)
@@ -3482,7 +3350,7 @@ def check_profit_targets(positions: dict) -> list[str]:
                     # Remove from signal cache so it's not immediately re-bought
                     signal_cache = [s for s in signal_cache if s["symbol"] != symbol]
             else:
-                peak_str = f" (peak: {current_peak*100:+.2f}%)" if current_peak >= be_trigger else ""
+                peak_str = f" (peak: {current_peak*100:+.2f}%)" if current_peak >= PEAK_TRIGGER else ""
                 log.info(f"  {symbol}: {pnl_pct*100:+.2f}% P&L{peak_str} — holding")
 
         except Exception as e:
@@ -3504,31 +3372,11 @@ def deploy_from_cache(positions: dict, account):
     KELLY_PCT   = 0.10  # minimum-cash gate — aligned with new lowest tier (was 0.10, tiers now 10/13/16%)
     MAX_POS     = 10
     equity      = float(account.equity)
-    cash        = float(account.regt_buying_power or account.cash)  # intraday buying power (~2x cash on margin — see gross-exposure cap below)
+    cash        = float(account.regt_buying_power or account.cash)  # intraday buying power
     open_slots  = MAX_POS - len(positions)
-
-    # ── Gross-exposure cap (Sep 23 2026) ────────────────────────
-    # regt_buying_power is ~2x cash on a margin account, so sizing off
-    # it alone could quietly build up to ~160% of equity in positions
-    # (10 slots x 16% Kelly). Total position value is hard-capped at
-    # MAX_GROSS_EXPOSURE x equity. If market values can't be read,
-    # assume fully invested — fail closed on sizing rather than
-    # levering up blind.
-    try:
-        gross_exposure = sum(abs(float(p.market_value)) for p in positions.values())
-    except Exception:
-        gross_exposure = equity
-    exposure_headroom = equity * MAX_GROSS_EXPOSURE - gross_exposure
 
     if open_slots <= 0:
         log.info(f"All {MAX_POS} slots filled")
-        return
-
-    if exposure_headroom <= 0:
-        log.info(
-            f"Gross exposure ${gross_exposure:,.0f} at/above cap "
-            f"({MAX_GROSS_EXPOSURE*100:.0f}% of equity) — no new positions"
-        )
         return
 
     if cash < equity * KELLY_PCT:
@@ -3555,27 +3403,38 @@ def deploy_from_cache(positions: dict, account):
             log.info(f"  {sym}: closed this cycle — skipping redeploy (re-entry loop prevention)")
 
     if not available:
-        # Cache exhausted — emergency rescan max once per hour.
-        # Sep 23 2026 — UNIFIED on run_premarket_scan(). The inline
-        # duplicate scan that used to live here had drifted from the
-        # real one (its own TA-prefilter copy, no diversity picks, no
-        # immediate state persistence). One scan path now serves the
-        # morning window, the main loop's post-restart rescan, and this
-        # cache-exhausted case. run_premarket_scan no longer wipes warm
-        # caches (see that function), so a mid-day call re-uses every
-        # fundamentals/earnings/structural verdict still inside its TTL.
+        # Cache exhausted — emergency rescan max once per hour
         time_since = time.time() - last_rescan_time
         if time_since > 3600:  # 1 hour
-            log.info("Signal cache exhausted — running emergency rescan (1hr cooldown, unified scan path)")
+            log.info("Signal cache exhausted — running emergency rescan (1hr cooldown)")
             last_rescan_time = time.time()
-            run_premarket_scan()
-            available = [
-                s for s in signal_cache
-                if s["symbol"] not in positions and s["symbol"] not in closed_this_session
-            ]
-            if not available:
-                log.info("Emergency rescan found no deployable signals")
-                return
+            spy_chg = get_quote_change("SPY") or 0.0
+            universe = build_universe()
+            new_signals = []
+            skipped_ta  = 0
+            for symbol in universe:
+                if symbol in positions:
+                    continue
+                # ── TA pre-filter (Aug 24 fix) ─────────────────
+                # The emergency rescan was missing the same TA pre-filter
+                # the pre-market scan uses — calling Claude on every ticker
+                # in the universe unconditionally. Observed Aug 24: this
+                # took 7+ minutes mid-session (19:47:44 → 19:54:59) scoring
+                # ~40 tickers sequentially with no skip, well over the
+                # ~4min the optimised pre-market scan takes. Same fix:
+                # fetch cheap TA first, skip the paid Claude call entirely
+                # if taScore < 1.5 (clearly bearish / no signal).
+                ta = fetch_technicals(symbol)
+                if ta and ta.get("taScore", 0) < 1.5:
+                    skipped_ta += 1
+                    continue  # no sleep needed — skipping Claude call
+                result = compute_signal(symbol, spy_chg, prefetched_ta=ta)
+                if result and result["signal"] == "BUY" and result["confidence"] >= MIN_CONFIDENCE and result["composite"] >= MIN_COMPOSITE:
+                    new_signals.append(result)
+                time.sleep(3)
+            log.info(f"Emergency rescan: {skipped_ta} tickers skipped on weak TA, {len(new_signals)} signal(s) found")
+            signal_cache = sorted(new_signals, key=lambda x: x["confidence"], reverse=True)
+            available    = signal_cache
         else:
             log.info(f"Cache empty — next emergency rescan in {max(0,(3600-time_since)/60):.0f}min")
             return
@@ -3638,16 +3497,9 @@ def deploy_from_cache(positions: dict, account):
         if sector and sector in weak_sectors:
             override_used = False
             snap_check = fetch_intraday_snapshot(symbol)
-            # Sep 23 2026 — BOTH legs measured from TODAY'S OPEN. The
-            # stock was intraday-from-open but the sector was vs prior
-            # close (overnight gap included): an ETF that gapped -2% and
-            # traded flat intraday showed "+2pp outperformance" for a
-            # stock that also did nothing — exactly the "less bad ≠
-            # bucking the trend" confusion the override exists to avoid.
-            # If the sector's intraday number is unavailable, no override.
-            sector_pct = sector_intraday_changes.get(sector)
-            if snap_check and snap_check.get("open", 0) > 0 and sector_pct is not None:
+            if snap_check and snap_check.get("open", 0) > 0:
                 stock_pct_today = snap_check["price"] / snap_check["open"] - 1
+                sector_pct      = sector_changes.get(sector, 0.0)
                 outperformance  = stock_pct_today - sector_pct
                 composite  = candidate.get("composite", 0)
                 confidence = candidate.get("confidence", 0)
@@ -3671,7 +3523,7 @@ def deploy_from_cache(positions: dict, account):
         # ── Re-entry cooldown checks (Options 1, 3, 5) ────────
         # Fetch current live price for Option 3 price gate
         try:
-            r = HTTP.get(
+            r = requests.get(
                 f"https://data.alpaca.markets/v2/stocks/{symbol}/trades/latest",
                 headers={"APCA-API-KEY-ID": ALPACA_KEY, "APCA-API-SECRET-KEY": ALPACA_SECRET},
                 timeout=5,
@@ -3724,7 +3576,7 @@ def deploy_from_cache(positions: dict, account):
         else:
             kelly = 0.10
 
-        alloc  = min(equity * kelly, cash * 0.95, exposure_headroom)  # Sep 23: never levered past MAX_GROSS_EXPOSURE
+        alloc  = min(equity * kelly, cash * 0.95)
         qty    = int(alloc / live_price)
         if qty < 1:
             continue
@@ -3760,14 +3612,10 @@ def deploy_from_cache(positions: dict, account):
 
         if place_buy(symbol, qty, composite=composite):
             cash -= qty * live_price
-            exposure_headroom -= qty * live_price  # Sep 23: gross-exposure cap tracking
             if sector:
                 sector_counts[sector] = sector_counts.get(sector, 0) + 1  # same-cycle cap tracking
                 if sector in AI_CORRELATED_SECTORS:
                     ai_correlated_count += 1  # same-cycle AI-correlated cap tracking
-            if exposure_headroom <= 0:
-                log.info(f"  Gross-exposure cap ({MAX_GROSS_EXPOSURE*100:.0f}% of equity) reached — stopping deployment this cycle")
-                break
 
 # ══════════════════════════════════════════════════════════════
 # MAIN LOOP
@@ -3787,7 +3635,7 @@ def run():
     log.info("=" * 60)
     log.info("SIGNAL Trading Bot started")
     log.info(f"  Universe:       {len(CURATED_TICKERS)} curated + up to 24 dynamic (8+8+8) = 55 max")
-    log.info(f"  Scan timing:    Mon-Fri ~9:20am ET (dynamic) + unified emergency rescan (Sunday scan removed Sep 23)")
+    log.info(f"  Scan timing:    Sun 8pm ET / Mon-Fri 9:20am ET (dynamic) + restart rescan")
     log.info(f"  Position size:  Kelly 10-16% (confidence-based sizing, raised Aug 2026)")
     # (accurate profit-target line logged further below — trail-only, no fixed target)
     log.info(f"  Sector cap:     Max 2 positions per sector (backtest validated)")
@@ -3797,9 +3645,9 @@ def run():
     log.info(f"                  stop loss → 24hr cooldown + 2% price gate (escalating strikes)")
     log.info(f"  Max positions:  10 concurrent")
     log.info(f"  Profit target:  NONE — trail-only. Hard ceiling +{HARD_SELL_CEILING*100:.0f}% (sell immediately)")
-    log.info(f"  Trail arm:      +{MICRO_TRAIL_ARM_PCT*100:g}% peak (+{MICRO_TRAIL_ARM_PCT_CALM*100:g}% calm VIX<{CALM_VIX_THRESHOLD}) — breakeven owns the band below it; legacy fixed trail removed Sep 23")
     log.info(f"  Trail tiers:    " + " | ".join(f"peak>={t*100:g}%→{g*100:g}% behind" for t, g in DYNAMIC_TRAIL_TABLE))
-    log.info(f"  Breakeven:      calm(VIX<{CALM_VIX_THRESHOLD}) peak>={BREAKEVEN_TRIGGER_CALM*100:g}%→lock+{BREAKEVEN_STOP_CALM*100:g}% | else peak>={BREAKEVEN_TRIGGER*100:g}%→lock+{BREAKEVEN_STOP*100:g}%")
+    log.info(f"  Trailing:       peak >={PEAK_TRIGGER*100:.0f}% → sell at +{TRAIL_SELL*100:.0f}%")
+    log.info(f"  Breakeven:      calm(VIX<{CALM_VIX_THRESHOLD}) peak>={BREAKEVEN_TRIGGER_CALM*100:.0f}%→lock+{BREAKEVEN_STOP_CALM*100:.0f}% | else peak>={BREAKEVEN_TRIGGER*100:.0f}%→lock+{BREAKEVEN_STOP*100:.1f}%")
     log.info(f"  Stop loss:      -{abs(STOP_LOSS)*100:.0f}% ceiling")
     log.info(f"  TA/Fund weight: {TECH_WEIGHT}% / {FUND_WEIGHT}%")
     log.info(f"  Min confidence: {MIN_CONFIDENCE}%")
@@ -3809,7 +3657,7 @@ def run():
     log.info(f"  Entry window:   {FIRST_ENTRY_ET[0]:02d}:{FIRST_ENTRY_ET[1]:02d}–{LAST_ENTRY_ET[0]:02d}:{LAST_ENTRY_ET[1]:02d} ET (opening range forms first; nothing new late)")
     log.info(f"  Deploy check:   {'live TA + intraday RS re-validation before every buy' if REVALIDATE_AT_DEPLOY else 'OFF — buying on scan-time numbers'}; RS capped ±{INTRADAY_RS_MAX}, above-open required: {REQUIRE_ABOVE_OPEN}")
     log.info(f"  Overnight grace: stop-type exits on overnight holds deferred {OVERNIGHT_OPEN_GRACE_MINUTES}min after the open (unless loss > 2× tier)")
-    log.info(f"  Gross exposure: capped at {MAX_GROSS_EXPOSURE*100:.0f}% of equity (unlevered; EOD profit lock removed Sep 23)")
+    log.info(f"  EOD profit lock: REMOVED Sep 24 2026 — winners may hold overnight again")
     log.info(f"  Midday refresh: {'TA-only cache re-validation at %02d:%02d ET' % MIDDAY_TA_REFRESH_ET if MIDDAY_TA_REFRESH_ET else 'off'}")
     log.info(f"  Dynamic downside floor: tightens toward tier ceiling as loss deepens (mirrors trail, inverted)")
     log.info(f"  Max drawdown:   {MAX_DRAWDOWN*100:.0f}%")
