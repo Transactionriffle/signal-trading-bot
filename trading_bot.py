@@ -153,13 +153,13 @@ INTRADAY_RS_MAX = 0.75      # RS measured vs today's OPEN (not prior close), cap
 REQUIRE_ABOVE_OPEN = True   # only enter a name trading above its 9:30 open (positive intraday RS)
 OVERNIGHT_OPEN_GRACE_MINUTES = 5   # overnight holds: stop-type exits wait until 9:35 unless loss > 2× tier
 MIDDAY_TA_REFRESH_ET = (12, 0)     # one TA-only re-validation of the whole cache; set to None to disable
-# Sep 24 2026 — end-of-day profit lock REMOVED. Combined with the
-# -0.5% early-exit stop it had turned the bot into an unintended
-# daily-flat system: every profitable position was force-closed at
-# 15:55, so ONLY losers ever carried overnight, and those were then
-# liquidated by the early-exit stop shortly after the next open.
-# Winners can hold overnight again; loss-side overnight gap risk
-# remains handled by OVERNIGHT_OPEN_GRACE_MINUTES and the stop ladder.
+# Sep 24 2026: EOD profit lock REMOVED (was added Sep 21, forced-closed any
+# still-profitable position from 15:55 ET to the close). Removed on request
+# — winners may hold overnight again. The trade-off this reintroduces: a
+# position that peaks positive late in the session can give some or all of
+# it back overnight/on a gap, with nothing watching it between the close
+# and the next open (same underlying gap exposure as the Sep 11 writeup,
+# just on the profit side instead of the loss side).
 
 # Sep 11 2026: activation delay REMOVED (30 → 0). SLB on Sep 10 sold at
 # -1.71% at exactly minute 30 — the loss had already run well past every
@@ -1619,7 +1619,17 @@ def fetch_fundamental(symbol: str, ta: dict) -> dict | None:
         )
         response = safe_claude_call(
             model="claude-sonnet-4-5",
-            max_tokens=220,
+            # Sep 24 2026 fix: 220 was sized for the original single-fact
+            # prompt. Today's heavier prompt (3-quarter trend + earnings
+            # date + catalyst search) needs multiple web_search tool
+            # round-trips before Claude can write the final JSON — with
+            # only 220 tokens of budget, EVERY fundamentals call today
+            # (10/10 observed) ran out of room mid-tool-use and returned
+            # an empty final text block, which the parse-failure logging
+            # (Sep 22) correctly caught as "no JSON object found... raw
+            # text: ''" instead of silently vanishing. Raised to 800 to
+            # give the multi-step research room to actually finish.
+            max_tokens=800,
             tools=[{"type": "web_search_20250305", "name": "web_search"}],
             messages=[{"role": "user", "content": prompt}],
         )
@@ -3318,11 +3328,6 @@ def check_profit_targets(positions: dict) -> list[str]:
                             f"  {symbol}: sector '{sector}' weak but "
                             f"P&L {pnl_pct*100:+.2f}% below breakeven — holding"
                         )
-
-            # (End-of-day profit lock removed Sep 24 2026 — with the
-            # -0.5% early-exit stop it produced an unintended daily-flat
-            # system where only losers carried overnight. See the config
-            # comment where EOD_LOCK_ET used to live.)
 
             # ── Opening-print grace for OVERNIGHT holds (Sep 11 2026) ──
             # Not the 30-min grace on fresh entries (removed). This is the
