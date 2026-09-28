@@ -1615,7 +1615,22 @@ def fetch_fundamental(symbol: str, ta: dict) -> dict | None:
             "confidence; thin, mixed, stale, or conflicting information "
             "means lower confidence, even if fundScore itself is high. "
             "thesis — a one-sentence string citing the specific catalyst, "
-            "revenue growth %, P/E, or earnings date you found."
+            "revenue growth %, P/E, or earnings date you found. "
+            # Sep 25 2026 fix: even at max_tokens=800, TSM got cut off mid-
+            # research — Claude narrated "I need to search for more specific
+            # recent news..." as a text block and never returned to finish
+            # the JSON. Multi-round tool use (financials search + separate
+            # catalyst search) can consume more budget than expected. This
+            # instruction tells the model to prioritize FINISHING over
+            # exhaustive research: search efficiently, then always end with
+            # the JSON object using its best available information, even if
+            # some detail wasn't found — an approximate answer beats a cut-
+            # off narration with none.
+            "Work efficiently: search only as much as needed, then ALWAYS "
+            "end your response with the JSON object using the best "
+            "information you found, even if you could not confirm every "
+            "detail above — never end your response mid-research without "
+            "the JSON."
         )
         response = safe_claude_call(
             model="claude-sonnet-4-5",
@@ -1623,13 +1638,18 @@ def fetch_fundamental(symbol: str, ta: dict) -> dict | None:
             # prompt. Today's heavier prompt (3-quarter trend + earnings
             # date + catalyst search) needs multiple web_search tool
             # round-trips before Claude can write the final JSON — with
-            # only 220 tokens of budget, EVERY fundamentals call today
+            # only 220 tokens of budget, EVERY fundamentals call that day
             # (10/10 observed) ran out of room mid-tool-use and returned
             # an empty final text block, which the parse-failure logging
             # (Sep 22) correctly caught as "no JSON object found... raw
-            # text: ''" instead of silently vanishing. Raised to 800 to
-            # give the multi-step research room to actually finish.
-            max_tokens=800,
+            # text: ''" instead of silently vanishing. Raised to 800, which
+            # fixed the large majority of cases — but Sep 25 showed TSM
+            # still got cut off (mid-narration this time, not empty) at
+            # that level. Raised further to 1500 for real headroom on the
+            # rare ticker needing multiple search rounds, alongside the
+            # "always finish with JSON" instruction above as a second,
+            # independent safeguard against the same failure mode.
+            max_tokens=1500,
             tools=[{"type": "web_search_20250305", "name": "web_search"}],
             messages=[{"role": "user", "content": prompt}],
         )
