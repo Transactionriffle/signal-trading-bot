@@ -25,12 +25,11 @@ Architecture:
       so a runner is never sold at a fixed level below +60%) > old
       fixed trail (+3%→+2.5%, rarely reached first) > breakeven stop
       (VIX-aware: wider band when VIX<18) > composite-tiered stop
-      loss (-3%/-4%/-5% by entry conviction, dynamic downside
-      floor tightens as loss deepens) > weak-sector mid-day exit
-    → First 30 min after entry: full noise tolerance, nothing fires.
-      After that: ATR-scaled early-exit stop (hard-capped -0.5%) AND
-      the composite-tiered stop are both active — whichever is
-      tighter effectively governs for a position with zero validation
+      loss (-3%/-4%/-5% by entry conviction, widened a further -2%
+      for a strong-catalyst entry) > weak-sector mid-day exit
+    → Loss side: the composite-tiered stop is the ONLY loss-cutting
+      rule (early-exit ATR stop and dynamic downside floor removed
+      Sep 29 2026), active from the first cycle after entry
     → Held positions get re-evaluated (not ignored) on bearish/
       material-adverse news, and on a periodic stale-fundamentals
       recheck independent of news
@@ -130,6 +129,25 @@ TRAIL_SELL      =  0.025   # +2.5% sell if falls back here after peak (legacy fa
 # PROFIT side instead (trail-only, +1% arm, +60% ceiling) rather than
 # by squeezing the stop.
 STOP_LOSS       = -0.05    # -5%   hard stop ceiling (before breakeven activates)
+
+# ── Strong-catalyst sizing and stop tolerance (Sep 29 2026) ────────
+# A trade that qualified on a real, recent, positive catalyst (trial
+# data, confirmed M&A, a hard beat-and-raise, a major contract) is a
+# different kind of conviction from one that scraped past the gate on
+# routine financials. Those get two things together: more capital, and
+# more room to be wrong before being cut — a paired bet that a genuine
+# catalyst justifies both bigger size and more patience through noise.
+#
+# The trigger is a DEDICATED catalystStrength score (0-10) returned by
+# the fundamentals call, not fundScore itself: fundScore blends catalyst
+# with revenue trend/P/E/earnings date, and it sat at 8.0 on almost
+# every trade for weeks, so keying on it would have flagged nearly
+# everything as "strong catalyst".
+STRONG_CATALYST_MIN   = 7      # catalystStrength at/above this = strong catalyst
+CATALYST_KELLY_BONUS  = 0.04   # added to the normal Kelly tier (10/13/16% → 14/17/20%)
+CATALYST_KELLY_MAX    = 0.20   # hard cap on any single strong-catalyst allocation
+CATALYST_STOP_LOOSEN  = 0.02   # widens the composite-tier stop by this much (-3/-4/-5% → -5/-6/-7%)
+                               # never applied in BEAR mode — the -2% BEAR ceiling always wins
 # Sep 11 2026 — no fresh entries from the signal cache in the last part of
 # the session. The Sep 11 log showed the bot still trying to open a new
 # META position at 15:59 ET. A position opened that late gets no intraday
@@ -215,57 +233,12 @@ def get_dynamic_trail_gap(peak_pct: float) -> float:
             break
     return gap
 
-# ── Dynamic downside floor (Sep 2026) ────────────────────────────
-# Mirrors the dynamic trail concept, inverted: the trail widens its
-# gap as a GAIN grows, giving winners more room the further they run.
-# This does the opposite for LOSSES — the effective stop TIGHTENS
-# (moves closer to current price) the deeper a loss gets, rather than
-# giving the position the full remaining distance to its tier ceiling
-# (-3%/-4%/-5%) regardless of how the decline is behaving.
-#
-# Rationale (Sep 8 case): NVDA sat at -2.01% for over 3 hours, still
-# well inside its tier ceiling the whole time — the flat-tier approach
-# would let it ride the FULL remaining distance to -3%/-4%/-5% before
-# doing anything, treating "-0.5% and drifting" identically to "-2.5%
-# and accelerating." A trader reads the RATE and DEPTH of a decline as
-# informative, the same way the trail reads the SIZE of a peak as
-# informative — this generalises that same instinct to the downside,
-# independent of the systemic-derisk exception (which only applies
-# during a severe VIX + multi-sector event).
-#
-# Table is fraction-of-tier-consumed -> effective stop at that point.
-# E.g. tier=-4%: at -1% (25% of tier consumed) still get the full -4%
-# ceiling; at -2.5% (62.5% consumed) effective stop tightens to -3%;
-# beyond -3% it tightens further toward the tier itself. Keeps the
-# 30-minute activation delay untouched — this only changes WHAT the
-# stop level is once the delay has passed, not WHEN it can first fire.
-DYNAMIC_DOWNSIDE_TABLE = [
-    # (fraction_of_tier_consumed, effective_stop_as_fraction_of_tier)
-    (0.0,  1.00),   # 0-25% into the tier   → full tier ceiling, give it room
-    (0.25, 0.85),   # 25-50% into the tier  → tighten to 85% of tier
-    (0.50, 0.65),   # 50-75% into the tier  → tighten to 65% of tier
-    (0.75, 0.50),   # 75%+ into the tier    → tighten to 50% of tier — cut sooner
-                     #                          if it's already deep and not stabilising
-]
-
-def get_dynamic_downside_floor(pnl_pct: float, tier_stop: float) -> float:
-    """
-    Returns the EFFECTIVE stop for the current loss depth, tightening
-    progressively as pnl_pct approaches tier_stop (the tier ceiling,
-    e.g. -0.03/-0.04/-0.05). Both inputs are negative fractions.
-    Returns a value between tier_stop and 0 — always at least as tight
-    as (closer to zero than) the flat tier, never looser.
-    """
-    if tier_stop >= 0:
-        return tier_stop  # guard against misuse — tier stops are always negative
-    fraction_consumed = min(1.0, pnl_pct / tier_stop)  # both negative → ratio is positive, 0..1+
-    multiplier = DYNAMIC_DOWNSIDE_TABLE[0][1]
-    for threshold, table_mult in DYNAMIC_DOWNSIDE_TABLE:
-        if fraction_consumed >= threshold:
-            multiplier = table_mult
-        else:
-            break
-    return tier_stop * multiplier
+# ── Dynamic downside floor — REMOVED Sep 29 2026 ─────────────────
+# Used to tighten the effective stop as a loss deepened toward its
+# composite tier (e.g. a -4% tier cut at -2.6% once 65% of it was
+# consumed). Removed on request, together with the ATR early-exit stop:
+# the composite-tiered stop is now the single loss-side rule, so a
+# position is given its full tier distance before being cut.
 
 # ── VIX-aware breakeven — calm markets need more room before locking in ──
 # Rationale: in a low-VIX (<18) tape, stocks oscillate ±1% on pure noise.
@@ -1604,7 +1577,7 @@ def fetch_fundamental(symbol: str, ta: dict) -> dict | None:
             "this score, not an equal one. "
             "Weigh both the bull case AND the bear case before scoring. "
             "Respond with ONLY a single JSON object, no other text before or "
-            "after it, with exactly these four keys: "
+            "after it, with exactly these five keys: "
             "fundSignal — a string, one of BUY, SELL, or HOLD. "
             "fundScore — a number from -10 to +10. Weight a recent catalyst "
             "most heavily; the revenue-growth trend, P/E, and earnings-call "
@@ -1616,6 +1589,14 @@ def fetch_fundamental(symbol: str, ta: dict) -> dict | None:
             "means lower confidence, even if fundScore itself is high. "
             "thesis — a one-sentence string citing the specific catalyst, "
             "revenue growth %, P/E, or earnings date you found. "
+            "catalystStrength — a number from 0 to 10 rating ONLY the "
+            "strength of a POSITIVE catalyst found today or in the past 3 "
+            "days: 8-10 for a hard, verifiable, material event (trial or data "
+            "readout, confirmed M&A, earnings beat with raised guidance, major "
+            "contract); 4-7 for a real but softer one (an analyst upgrade or "
+            "price-target raise, a product launch, a competitor read-through); "
+            "0 if you found no catalyst, only routine news, or only negative "
+            "news. "
             # Sep 25 2026 fix: even at max_tokens=800, TSM got cut off mid-
             # research — Claude narrated "I need to search for more specific
             # recent news..." as a text block and never returned to finish
@@ -1665,6 +1646,10 @@ def fetch_fundamental(symbol: str, ta: dict) -> dict | None:
             return None
         result["fundScore"]  = max(-10, min(10, float(result.get("fundScore", 0))))
         result["confidence"] = max(0,   min(100, float(result.get("confidence", 50))))
+        try:
+            result["catalystStrength"] = max(0, min(10, float(result.get("catalystStrength", 0) or 0)))
+        except (TypeError, ValueError):
+            result["catalystStrength"] = 0.0   # malformed field → treat as no catalyst, never as strong
         fund_cache[symbol]   = (time.time(), result)
         return result
     except Exception as e:
@@ -1870,6 +1855,7 @@ def compute_signal(symbol: str, spy_chg: float = 0.0, prefetched_ta: dict | None
         "signal":     signal,
         "confidence": fund.get("confidence", 50),
         "thesis":     fund.get("thesis", ""),
+        "catalystStrength": fund.get("catalystStrength", 0),
         "ipo_mode":   ipo_mode,
         "atr_pct":    round(atr_pct, 4),   # adaptive profit target input
     }
@@ -2706,7 +2692,8 @@ def close_position(symbol: str, pnl_pct: float = 0.0, exit_reason: str = "") -> 
         log.error(f"Failed to close {symbol}: {e}")
         return False
 
-def place_buy(symbol: str, qty: int, composite: float | None = None) -> bool:
+def place_buy(symbol: str, qty: int, composite: float | None = None,
+              strong_catalyst: bool = False) -> bool:
     try:
         # ── Layer 1: Duplicate position guard ─────────────────
         # Prevents buying a ticker already held (NVDA ×3 bug Jun 23)
@@ -2761,7 +2748,10 @@ def place_buy(symbol: str, qty: int, composite: float | None = None) -> bool:
         # kept short since client_order_id has a 128-char limit).
         client_id = None
         if composite is not None:
-            client_id = f"c{round(composite*100):04d}_{int(time.time())}"[:48]
+            # "k" suffix marks a strong-catalyst entry, so the widened stop
+            # survives a redeploy the same way the composite does.
+            flag = "k" if strong_catalyst else ""
+            client_id = f"c{round(composite*100):04d}{flag}_{int(time.time())}"[:48]
 
         order = MarketOrderRequest(
             symbol=symbol, qty=qty,
@@ -2887,7 +2877,7 @@ def can_open_new_position() -> tuple[bool, str]:
 
     Fix (Sep 2026 audit): MAX_TRADES_DAY was previously folded into
     run_risk_checks(), which gates the ENTIRE cycle — hitting the daily
-    cap silently disabled check_profit_targets()/check_max_losing_hold()/
+    cap silently disabled check_profit_targets()/
     check_stale_holds() for every open position until midnight ET. A
     busy day (exactly when the cap is most likely to be hit) is exactly
     when continued stop-loss/trailing monitoring matters most. Split so
@@ -2944,113 +2934,37 @@ def get_durable_composite(symbol: str) -> float | None:
         # Most recent matching buy order
         matching.sort(key=lambda o: o.submitted_at or o.created_at, reverse=True)
         client_id = matching[0].client_order_id
-        composite_part = client_id.split("_")[0][1:]  # strip leading "c"
-        composite = int(composite_part) / 100
+        head = client_id.split("_")[0][1:]            # strip leading "c"
+        strong_catalyst = head.endswith("k")           # Sep 29 2026 catalyst flag
+        composite = int(head.rstrip("k")) / 100
         fund_cache[cache_key] = (time.time(), composite)
+        fund_cache[f"durable_catalyst_{symbol}"] = (time.time(), strong_catalyst)
         return composite
     except Exception as e:
         log.warning(f"Durable composite lookup failed for {symbol}: {e}")
         fund_cache[cache_key] = (time.time(), None)
         return None
 
+def get_durable_strong_catalyst(symbol: str) -> bool:
+    """Recovers the strong-catalyst flag from order history when the /tmp
+    entry_signals cache is gone (same fallback path as the composite).
+    Orders placed before Sep 29 2026 carry no flag → False (normal stop)."""
+    key = f"durable_catalyst_{symbol}"
+    if key not in fund_cache:
+        get_durable_composite(symbol)   # populates the flag as a side effect
+    cached = fund_cache.get(key)
+    return bool(cached[1]) if cached else False
+
 STALE_HOLD_HOURS       = 4        # re-check fundamentals if held longer than this
 STALE_HOLD_RECHECK_SECS = 3600    # don't re-check the SAME position more than once per hour
 last_staleness_check: dict = {}   # {symbol: timestamp of last re-check}
 
-# ── Never-touched-breakeven early exit (Sep 2026) ────────────────
-# ── Early-hold tight floor (Sep 2026, simplified) ────────────────
-# Root cause: real intraday bar data confirmed COST and PLTR were BOTH
-# 100% red — never once traded above entry — for their entire hold.
-# The original fix gated a tight ATR-scaled stop behind "has this
-# position EVER touched breakeven" — but that created two competing
-# clocks (a 30-min noise-tolerance delay on the composite stop, and a
-# separate "hours on probation since never green" clock), and since
-# the tight floor's ceiling (originally -2.5%) is always reached before
-# the loosest composite tier (-3%), the 30-min delay was effectively
-# dead code for any position that never went green — it never got the
-# chance to matter.
-#
-# Simplified to ONE clock: minutes since entry. For the first
-# STOP_LOSS_ACTIVATION_MINUTES, NOTHING fires — full noise tolerance
-# while the position settles in, whether it's touched green or not.
-# After the delay passes, BOTH the ATR-scaled early-exit stop (now
-# hard-capped at -0.5%, tightened further from -1.5%/-2.5% for a
-# faster, cheaper cut) and the composite-tiered stop (checked in
-# check_profit_targets(), with the dynamic downside floor already
-# layered on it) become active together — whichever threshold is
-# tighter for a given position effectively governs from that point on.
-def get_early_exit_stop(symbol: str) -> float:
-    """
-    ATR-scaled stop that becomes active once STOP_LOSS_ACTIVATION_MINUTES
-    has passed since entry — tighter than the composite-tiered stop,
-    designed to minimise loss impact on a position that's still shown
-    no sign of validating (never touched breakeven) once the initial
-    noise-tolerance grace period has elapsed.
-
-    Tightened further (Sep 2026): hard-capped at -0.5% regardless of
-    ATR. A position with zero validation after the grace period is cut
-    fast and cheap — this makes the early-exit stop meaningfully
-    tighter than the loosest composite tier (-3%) across the board,
-    not just for low-volatility names, closing the coherence gap where
-    the two rules previously fought each other on timing.
-    """
-    atr = entry_signals.get(symbol, {}).get("atr_pct", 0.02)
-    return -min(0.005, max(0.003, atr * 0.75))
-
-def check_max_losing_hold(positions: dict) -> list[str]:
-    """
-    Unified early-hold policy (Sep 2026): NOTHING fires in the first
-    STOP_LOSS_ACTIVATION_MINUTES of a position's life — full noise
-    tolerance while the position settles in, exactly like the composite
-    stop's original intent. After that window passes, the ATR-scaled
-    early-exit stop (get_early_exit_stop) becomes active ALONGSIDE the
-    composite-tiered stop in check_profit_targets() — whichever is
-    tighter effectively governs, since both are checked every cycle
-    from that point on.
-
-    This replaces the earlier (inverted) version where the tight
-    ATR-scaled stop fired ONLY during the first 30 minutes and then
-    handed off to the looser composite tier — which defeated the
-    purpose of the 30-minute grace period, since the tightest rule was
-    the one active exactly when we wanted maximum tolerance, and the
-    loosest rule took over once tolerance was no longer the goal.
-    """
-    closed = []
-    now    = time.time()
-
-    for symbol, pos in positions.items():
-        try:
-            pnl_pct = float(pos.unrealized_plpc)
-        except (AttributeError, TypeError, ValueError):
-            continue
-
-        if pnl_pct >= 0:
-            continue  # only a downside check — profit targets handled elsewhere
-
-        entry_time = entry_signals.get(symbol, {}).get("entry_time")
-        if entry_time is None:
-            continue  # legacy position, no entry timestamp — skip
-
-        minutes_held = (now - entry_time) / 60
-        if minutes_held < STOP_LOSS_ACTIVATION_MINUTES:
-            continue  # still inside the grace period — nothing fires yet, by design
-
-        early_stop = get_early_exit_stop(symbol)
-        # Same opening-print grace as check_profit_targets: an overnight hold
-        # isn't cut by the -0.5% early-exit stop on the 9:30 print unless it's
-        # already past 2× that level.
-        if in_opening_grace() and is_overnight_hold(pos) and pnl_pct > 2 * early_stop:
-            continue
-        if pnl_pct <= early_stop:
-            reason = (
-                f"EARLY_EXIT_STOP (ATR-scaled {early_stop*100:.1f}% stop hit at "
-                f"{minutes_held:.1f}min held — minimising loss, {pnl_pct*100:+.2f}%)"
-            )
-            if close_position(symbol, pnl_pct, reason):
-                closed.append(symbol)
-                log.warning(f"  [SELL] {symbol} exited — {reason}")
-
-    return closed
+# ── Early-exit ATR stop — REMOVED Sep 29 2026 ────────────────────
+# get_early_exit_stop() / check_max_losing_hold() used to cut any red
+# position at an ATR-scaled level hard-capped at -0.5%, which in practice
+# made -0.5% the real stop on most losers (MSFT, META, GOOG, TSM, NVDA).
+# Removed on request: the composite-tiered stop in check_profit_targets()
+# is now the single loss-side rule.
 
 def check_stale_holds(positions: dict) -> list[str]:
     """
@@ -3216,6 +3130,14 @@ def check_profit_targets(positions: dict) -> list[str]:
             else:
                 active_stop = base_stop      # no entry data anywhere, or BEAR mode
 
+            # Strong-catalyst entries get extra stop tolerance on top of the
+            # tier (Sep 29 2026) — never in BEAR mode, where -2% always wins.
+            strong_catalyst = entry_signals.get(symbol, {}).get("strong_catalyst")
+            if strong_catalyst is None:
+                strong_catalyst = get_durable_strong_catalyst(symbol)
+            if strong_catalyst and market_state != "BEAR":
+                active_stop -= CATALYST_STOP_LOOSEN
+
             # Update peak
             prev_peak = position_peaks.get(symbol, 0.0)
             if pnl_pct > prev_peak:
@@ -3278,7 +3200,8 @@ def check_profit_targets(positions: dict) -> list[str]:
                 minutes_held = (time.time() - entry_time) / 60 if entry_time else None
                 if minutes_held is None or minutes_held >= STOP_LOSS_ACTIVATION_MINUTES:
                     peak_note = f", peaked {current_peak*100:+.2f}% earlier" if current_peak >= MICRO_TRAIL_ARM_PCT else ""
-                    reason = f"STOP_LOSS ({active_stop*100:.0f}%{' composite-tiered' if entry_composite is not None else ''}{peak_note})"
+                    cat_note = " +catalyst tolerance" if (strong_catalyst and market_state != "BEAR") else ""
+                    reason = f"STOP_LOSS ({active_stop*100:.0f}%{' composite-tiered' if entry_composite is not None else ''}{cat_note}{peak_note})"
                 # else: falls through to noise-tolerance window below via the
                 # ordinary STOP_LOSS branch's own delay check — no action here,
                 # just don't claim it as DYNAMIC_TRAIL in the meantime either
@@ -3300,20 +3223,6 @@ def check_profit_targets(positions: dict) -> list[str]:
                     f"BREAKEVEN_STOP (peaked {current_peak*100:+.2f}%, "
                     f"locked +{be_stop*100:.1f}%{' calm-VIX' if is_calm else ''})"
                 )
-            elif current_peak < be_trigger and active_stop < pnl_pct < get_dynamic_downside_floor(pnl_pct, active_stop):
-                # ── Dynamic downside floor (Sep 2026) ───────────
-                # Position hasn't hit the flat tier ceiling yet, but HAS
-                # crossed the tightened floor for how deep it already is.
-                # Same activation delay applies — a position can't be cut
-                # by this any earlier than the flat stop could be.
-                entry_time = entry_signals.get(symbol, {}).get("entry_time")
-                minutes_held = (time.time() - entry_time) / 60 if entry_time else None
-                if minutes_held is not None and minutes_held >= STOP_LOSS_ACTIVATION_MINUTES:
-                    dyn_floor = get_dynamic_downside_floor(pnl_pct, active_stop)
-                    reason = (
-                        f"DYNAMIC_STOP ({pnl_pct*100:+.2f}% crossed tightened floor "
-                        f"{dyn_floor*100:.1f}% — tier ceiling was {active_stop*100:.0f}%)"
-                    )
 
             # ── Weak sector mid-day exit ───────────────────────
             # Normally only exits at breakeven or better — never crystallise
@@ -3358,7 +3267,7 @@ def check_profit_targets(positions: dict) -> list[str]:
             # wait until 9:35 — unless the loss is beyond 2× the tier,
             # which is a gap through the stop, not opening noise.
             if (reason and in_opening_grace() and is_overnight_hold(pos)
-                    and ("STOP_LOSS" in reason or "DYNAMIC_STOP" in reason)
+                    and "STOP_LOSS" in reason
                     and pnl_pct > 2 * active_stop):
                 log.info(
                     f"  {symbol}: {pnl_pct*100:+.2f}% on the opening print (overnight hold) — "
@@ -3601,6 +3510,16 @@ def deploy_from_cache(positions: dict, account):
         else:
             kelly = 0.10
 
+        # Strong catalyst → more capital (Sep 29 2026), capped
+        catalyst_strength = float(candidate.get("catalystStrength", 0) or 0)
+        strong_catalyst   = catalyst_strength >= STRONG_CATALYST_MIN
+        if strong_catalyst:
+            kelly = min(kelly + CATALYST_KELLY_BONUS, CATALYST_KELLY_MAX)
+            log.info(
+                f"  {symbol}: strong catalyst ({catalyst_strength:.0f}/10) — Kelly raised to "
+                f"{kelly*100:.0f}%, stop tier widened by {CATALYST_STOP_LOOSEN*100:.0f}%"
+            )
+
         alloc  = min(equity * kelly, cash * 0.95)
         qty    = int(alloc / live_price)
         if qty < 1:
@@ -3609,8 +3528,9 @@ def deploy_from_cache(positions: dict, account):
 
         # ATR-based profit target removed Sep 10 2026 — check_profit_targets()
         # no longer sells at a fixed level; the escalating trail governs
-        # the profit side. The ATR value itself is still needed: it's
-        # stored in entry_signals below for the early-exit stop.
+        # the profit side. ATR is still recorded in entry_signals below for
+        # the trade journal (its old consumer, the early-exit stop, was
+        # removed Sep 29 2026).
         # (Sep 11 fix: this lookup was dropped together with the target
         # block, which raised NameError on every deploy attempt for a full
         # session — the bot could sell but never buy.)
@@ -3631,11 +3551,13 @@ def deploy_from_cache(positions: dict, account):
             "kelly_pct":  kelly,
             "entry_price": live_price,
             "entry_time":  time.time(),  # Sep 2026 — enables staleness check in check_profit_targets
-            "atr_pct":     atr if atr and atr > 0 else 0.02,  # for the never-touched-breakeven early exit
+            "atr_pct":     atr if atr and atr > 0 else 0.02,  # journal only (early-exit stop removed)
+            "catalyst_strength": catalyst_strength,
+            "strong_catalyst":   strong_catalyst,  # read by check_profit_targets for the wider stop
         }
         save_entry_signals()
 
-        if place_buy(symbol, qty, composite=composite):
+        if place_buy(symbol, qty, composite=composite, strong_catalyst=strong_catalyst):
             cash -= qty * live_price
             if sector:
                 sector_counts[sector] = sector_counts.get(sector, 0) + 1  # same-cycle cap tracking
@@ -3684,12 +3606,12 @@ def run():
     log.info(f"  Overnight grace: stop-type exits on overnight holds deferred {OVERNIGHT_OPEN_GRACE_MINUTES}min after the open (unless loss > 2× tier)")
     log.info(f"  EOD profit lock: REMOVED Sep 24 2026 — winners may hold overnight again")
     log.info(f"  Midday refresh: {'TA-only cache re-validation at %02d:%02d ET' % MIDDAY_TA_REFRESH_ET if MIDDAY_TA_REFRESH_ET else 'off'}")
-    log.info(f"  Dynamic downside floor: tightens toward tier ceiling as loss deepens (mirrors trail, inverted)")
+    log.info(f"  Strong catalyst: catalystStrength>={STRONG_CATALYST_MIN}/10 → Kelly +{CATALYST_KELLY_BONUS*100:.0f}% (cap {CATALYST_KELLY_MAX*100:.0f}%), stop tier widened {CATALYST_STOP_LOOSEN*100:.0f}% (not in BEAR)")
     log.info(f"  Max drawdown:   {MAX_DRAWDOWN*100:.0f}%")
     log.info(f"  90-day audit:   Volume, TA alignment, win rate")
     log.info(f"  Held-position news review: bearish/material-adverse news on a HELD symbol re-runs fundamentals, can trigger early exit")
     log.info(f"  Stale-hold check: fundamentals re-checked after {STALE_HOLD_HOURS}hr hold, max 1x/hr per symbol")
-    log.info(f"  Early-hold policy: no grace period — ATR-scaled early-exit stop (hard-capped -0.5%) AND composite tier both active from entry")
+    log.info(f"  Loss side:      composite-tiered stop ONLY — early-exit ATR stop and dynamic downside floor removed Sep 29 2026")
     log.info(f"  Pause:          set PAUSED=true in Render")
     log.info("=" * 60)
 
@@ -3771,15 +3693,6 @@ def run():
 
             # Check exits
             closed = check_profit_targets(positions) if positions else []
-
-            # Force-exit positions that have never touched breakeven since
-            # entry, using an ATR-scaled loss-minimising stop — catches the
-            # COST/AMZN/PLTR pattern (real data showed these were 89-100%
-            # red for their entire hold, never once green)
-            if positions:
-                maxhold_closed = check_max_losing_hold(positions)
-                if maxhold_closed:
-                    closed.extend(maxhold_closed)
 
             # Re-check fundamentals on positions held beyond STALE_HOLD_HOURS
             # (independent of news — catches slow-building deterioration that
