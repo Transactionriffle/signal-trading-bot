@@ -97,6 +97,24 @@ ALPACA_BASE_URL = os.environ.get("ALPACA_BASE_URL", "https://paper-api.alpaca.ma
 ANTHROPIC_KEY   = os.environ["ANTHROPIC_API_KEY"]
 WORKER_URL      = os.environ.get("CLOUDFLARE_WORKER", "https://winter-cake-6aae.dimitridesplace-65f.workers.dev")
 TECH_WEIGHT     = int(os.environ.get("TECH_WEIGHT", "40"))
+# Sep 30 2026 — model split. The fundamentals call (multi-search research
+# plus judgement on catalyst/confidence) runs on Sonnet 5.5; the three
+# simple calls (earnings-date yes/no, structural-risk checklist, 1-token
+# credit probe) run on Haiku 4.5 at half Sonnet's token price. All four
+# previously ran on the legacy claude-sonnet-4-5 ($3/$15 per MTok).
+# Overridable in Render's Environment panel without a code change.
+# Do NOT roll back to claude-sonnet-4-5: it is being retired, and once
+# retired every call to it returns an error (no automatic fallback).
+# A still-supported alternative for comparison is claude-opus-5-5.
+FUNDAMENTALS_MODEL = os.environ.get("FUNDAMENTALS_MODEL", "claude-sonnet-5-5")
+LOOKUP_MODEL       = os.environ.get("LOOKUP_MODEL", "claude-haiku-4-5-20251001")
+# $ per million tokens (input, output) — used only for the usage-log cost
+# estimate below; excludes web-search fees, which are billed per search.
+MODEL_PRICES = {
+    "claude-sonnet-5-5":         (2.0, 10.0),
+    "claude-haiku-4-5-20251001": (1.0, 5.0),
+    "claude-opus-5-5":           (4.0, 20.0),
+}
 FUND_WEIGHT     = 100 - TECH_WEIGHT
 MIN_CONFIDENCE  = int(os.environ.get("MIN_CONFIDENCE", "85"))  # Sep 15 2026: rolled back from 87 (Sep 11) to 85. (Originally raised from 80% — filters weak signals like NFLX (82%))
 
@@ -1304,7 +1322,8 @@ def probe_credit_recovery():
     last_credit_probe_time = now
     try:
         safe_claude_call(
-            model="claude-sonnet-4-5",
+            purpose="credit-probe",
+            model=LOOKUP_MODEL,
             max_tokens=1,
             messages=[{"role": "user", "content": "ping"}],
         )
@@ -1312,7 +1331,37 @@ def probe_credit_recovery():
     except Exception:
         log.info(f"⏳ Credit-recovery probe: still exhausted, retrying in {CREDIT_PROBE_INTERVAL_SECONDS//60}min")
 
-def safe_claude_call(**kwargs):
+claude_usage_today: dict = {"date": "", "calls": 0, "in": 0, "out": 0, "searches": 0, "cost": 0.0}
+
+def _log_claude_usage(response, model: str, purpose: str):
+    """Sep 30 2026: one log line per Claude call with exact token counts
+    and web searches (read from the response's own `usage` field), plus a
+    running daily total — so per-scan cost is measured, not estimated."""
+    u        = getattr(response, "usage", None)
+    in_t     = getattr(u, "input_tokens", 0) or 0
+    out_t    = getattr(u, "output_tokens", 0) or 0
+    stu      = getattr(u, "server_tool_use", None)
+    searches = getattr(stu, "web_search_requests", None)
+    if searches is None:   # fallback: count server tool-use blocks in the content
+        searches = sum(1 for b in (getattr(response, "content", None) or [])
+                       if getattr(b, "type", "") == "server_tool_use")
+    p_in, p_out = MODEL_PRICES.get(model, (0.0, 0.0))
+    cost = in_t / 1e6 * p_in + out_t / 1e6 * p_out
+
+    t   = claude_usage_today
+    day = datetime.now(ET).strftime("%Y-%m-%d")
+    if t["date"] != day:
+        t.update({"date": day, "calls": 0, "in": 0, "out": 0, "searches": 0, "cost": 0.0})
+    t["calls"] += 1; t["in"] += in_t; t["out"] += out_t
+    t["searches"] += searches; t["cost"] += cost
+    log.info(
+        f"  🧾 Claude [{purpose}] {model}: in {in_t:,} / out {out_t:,} tok, "
+        f"{searches} search(es), ~${cost:.4f} | today: {t['calls']} calls, "
+        f"in {t['in']:,} / out {t['out']:,} tok, {t['searches']} searches, "
+        f"~${t['cost']:.2f} token cost (excl. search fees)"
+    )
+
+def safe_claude_call(purpose: str = "claude", **kwargs):
     """
     Thin wrapper around ai_client.messages.create() that detects
     Anthropic credit exhaustion specifically (vs a generic transient
@@ -1329,6 +1378,10 @@ def safe_claude_call(**kwargs):
     global api_credit_exhausted
     try:
         response = ai_client.messages.create(**kwargs)
+        try:
+            _log_claude_usage(response, kwargs.get("model", "?"), purpose)
+        except Exception as ue:   # logging must never break a trading call
+            log.warning(f"Claude usage logging failed: {ue}")
         if api_credit_exhausted:
             api_credit_exhausted = False  # recovered — clear the flag
             log.info("✅ Anthropic API credit restored — resuming normal operation")
@@ -1614,7 +1667,8 @@ def fetch_fundamental(symbol: str, ta: dict) -> dict | None:
             "the JSON."
         )
         response = safe_claude_call(
-            model="claude-sonnet-4-5",
+            purpose=f"fundamentals:{symbol}",
+            model=FUNDAMENTALS_MODEL,
             # Sep 24 2026 fix: 220 was sized for the original single-fact
             # prompt. Today's heavier prompt (3-quarter trend + earnings
             # date + catalyst search) needs multiple web_search tool
@@ -1630,19 +1684,18 @@ def fetch_fundamental(symbol: str, ta: dict) -> dict | None:
             # rare ticker needing multiple search rounds, alongside the
             # "always finish with JSON" instruction above as a second,
             # independent safeguard against the same failure mode.
-            max_tokens=1500,
+            # Sep 30 2026: 1500 → 4000 for Sonnet 5.5. Adaptive thinking is
+            # on by default on that model and can't be fully disabled, and
+            # thinking tokens count toward max_tokens — 1500 left too little
+            # room for thinking + several searches + the JSON. This is a cap,
+            # not a charge: only tokens actually generated are billed (see
+            # the 🧾 usage log line for each call).
+            max_tokens=4000,
             tools=[{"type": "web_search_20250305", "name": "web_search"}],
             messages=[{"role": "user", "content": prompt}],
         )
-        text = next((b.text for b in response.content if hasattr(b, "text")), "")
-        si, ei = text.find("{"), text.rfind("}")
-        if si == -1:
-            log.warning(f"Fundamental fetch for {symbol}: no JSON object found in response — raw text: {text[:300]!r}")
-            return None
-        try:
-            result = json.loads(text[si:ei+1])
-        except json.JSONDecodeError as je:
-            log.warning(f"Fundamental fetch for {symbol}: malformed JSON ({je}) — raw text: {text[si:ei+1][:300]!r}")
+        result = extract_json_response(response, symbol, "Fundamental fetch")
+        if result is None:
             return None
         result["fundScore"]  = max(-10, min(10, float(result.get("fundScore", 0))))
         result["confidence"] = max(0,   min(100, float(result.get("confidence", 50))))
@@ -1677,17 +1730,22 @@ def check_earnings_proximity(symbol: str, today: str) -> tuple[bool, str]:
             "Set earnings_within_3_days to true only if earnings are confirmed within 3 calendar days."
         )
         response = safe_claude_call(
-            model="claude-sonnet-4-5",
-            max_tokens=60,
+            purpose=f"earnings:{symbol}",
+            model=LOOKUP_MODEL,
+            # Sep 30 2026: 60 → 400. With web search, 60 tokens barely fits
+            # the JSON on its own, let alone a sentence before it. Cap only.
+            max_tokens=400,
             tools=[{"type": "web_search_20250305", "name": "web_search"}],
             messages=[{"role": "user", "content": prompt}],
         )
-        text = next((b.text for b in response.content if hasattr(b, "text")), "")
-        si, ei = text.find("{"), text.rfind("}")
-        if si == -1:
-            fund_cache[cache_key] = (time.time(), (False, ""))
+        result = extract_json_response(response, symbol, "Earnings check")
+        if result is None:
+            # Sep 30 2026: a failed parse used to be CACHED as "no earnings"
+            # for 24h — failing open silently for a whole day. Still fails
+            # open for this one call (blocking every ticker on a parse error
+            # would halt trading), but is no longer cached, so the next scan
+            # retries instead of trusting a non-answer.
             return False, ""
-        result = json.loads(text[si:ei+1])
         has_earnings = bool(result.get("earnings_within_3_days", False))
         earnings_date = result.get("earnings_date") or ""
         fund_cache[cache_key] = (time.time(), (has_earnings, earnings_date))
@@ -1740,17 +1798,15 @@ def check_structural_risk(symbol: str, today: str) -> tuple[bool, str]:
             "short reason (under 10 words)."
         )
         response = safe_claude_call(
-            model="claude-sonnet-4-5",
-            max_tokens=80,
+            purpose=f"structural:{symbol}",
+            model=LOOKUP_MODEL,
+            max_tokens=400,   # Sep 30 2026: 80 → 400, same reason as the earnings check (cap only)
             tools=[{"type": "web_search_20250305", "name": "web_search"}],
             messages=[{"role": "user", "content": prompt}],
         )
-        text = next((b.text for b in response.content if hasattr(b, "text")), "")
-        si, ei = text.find("{"), text.rfind("}")
-        if si == -1:
-            fund_cache[cache_key] = (time.time(), (False, ""))
-            return False, ""
-        result = json.loads(text[si:ei+1])
+        result = extract_json_response(response, symbol, "Structural risk check")
+        if result is None:
+            return False, ""   # not cached — see the earnings check note
         has_risk = bool(result.get("structural_risk", False))
         reason   = result.get("reason") or ""
         if has_risk:
@@ -1760,6 +1816,37 @@ def check_structural_risk(symbol: str, today: str) -> tuple[bool, str]:
     except Exception as e:
         log.warning(f"Structural risk check failed for {symbol}: {e}")
         return False, ""
+
+def extract_json_response(response, symbol: str, purpose: str) -> dict | None:
+    """
+    Sep 30 2026 fix. Every Claude call used to parse ONLY the first text
+    block: next(b.text for b in response.content if hasattr(b, "text")).
+    With web search, Claude often writes a short text ("I need to search
+    for more recent news...") BEFORE a search and the JSON in a LATER text
+    block — so TSM (Sep 25), META and ISRG (Sep 28) were logged as "no JSON
+    found" with exactly that preamble as the raw text; the JSON may well
+    have been there. This reads every text block, newest first, and returns
+    the first one that parses. It also flags a real token cutoff
+    (stop_reason == "max_tokens") so the two failure modes are distinguishable.
+    Thinking blocks are skipped (type != "text"), which matters on Sonnet
+    5.5 where adaptive thinking is on by default.
+    """
+    blocks = [b.text for b in (getattr(response, "content", None) or [])
+              if getattr(b, "type", "") == "text" and getattr(b, "text", None)]
+    for t in reversed(blocks):
+        si, ei = t.find("{"), t.rfind("}")
+        if si != -1 and ei > si:
+            try:
+                return json.loads(t[si:ei+1])
+            except json.JSONDecodeError:
+                continue
+    joined = " | ".join(blocks)
+    cut = " — CUT OFF at max_tokens" if getattr(response, "stop_reason", "") == "max_tokens" else ""
+    log.warning(
+        f"{purpose} for {symbol}: no parseable JSON in {len(blocks)} text block(s){cut} "
+        f"— raw text: {joined[:300]!r}"
+    )
+    return None
 
 def compute_signal(symbol: str, spy_chg: float = 0.0, prefetched_ta: dict | None = None) -> dict | None:
     # Skip known ETFs
@@ -3591,6 +3678,7 @@ def run():
     log.info(f"  Breakeven:      calm(VIX<{CALM_VIX_THRESHOLD}) peak>={BREAKEVEN_TRIGGER_CALM*100:.0f}%→lock+{BREAKEVEN_STOP_CALM*100:.0f}% | else peak>={BREAKEVEN_TRIGGER*100:.0f}%→lock+{BREAKEVEN_STOP*100:.1f}%")
     log.info(f"  Stop loss:      -{abs(STOP_LOSS)*100:.0f}% ceiling")
     log.info(f"  TA/Fund weight: {TECH_WEIGHT}% / {FUND_WEIGHT}%")
+    log.info(f"  Claude models:  fundamentals={FUNDAMENTALS_MODEL} | earnings/structural/probe={LOOKUP_MODEL}")
     log.info(f"  Min confidence: {MIN_CONFIDENCE}%")
     log.info(f"  Min composite:  {MIN_COMPOSITE} (3.0 → 4.0 Jul 29 review; briefly 4.2 Sep 11, rolled back Sep 15)")
     log.info(f"  Stop loss:      tiered by entry composite — <4.5: -3% | 4.5-6.0: -4% | 6.0+: -5%")
