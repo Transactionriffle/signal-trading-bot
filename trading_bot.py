@@ -5,7 +5,7 @@ Architecture:
   Pre-market scan (Sunday 8pm ET, or dynamic ~9:20am ET weekdays):
     → Build up to 55-ticker universe (37 curated + up to 24 dynamic:
       8 movers + 8 trade-count-active + 8 five-day-momentum)
-    → TA pre-filter (skip Claude entirely if taScore < 1.5)
+    → Every ticker gets a fundamentals call (TA pre-filter removed Sep 30 2026)
     → Run fundamental scan (Claude + web search) on surviving tickers
     → Hard vetoes applied before scoring: ETF/leveraged-product,
       SPAC/blank-check, general structural-risk (recent IPO, pending
@@ -2065,18 +2065,15 @@ def run_premarket_scan():
             continue
         seen_symbols.add(symbol)
 
-        # ── TA pre-filter — skip Claude if TA is clearly bearish ──
-        # Saves ~12 minutes by avoiding Claude calls on obvious non-signals
-        # Fetch technicals first (fast — Cloudflare Worker, <1s)
+        # Sep 30 2026: TA pre-filter (skip Claude if taScore < 1.5) REMOVED
+        # on request. It blocked fundamentals analysis on 24 of 39 tickers
+        # on Sep 30 — including names that went on to big multi-day moves
+        # on real catalysts (VKTX, AMD, CRWD on Sep 23 were all filtered at
+        # taScore 0.5). Every ticker now gets a fundamentals call; taScore
+        # still counts in the composite, it just no longer decides whether
+        # the fundamentals are looked at. Cost: ~2.5-3x more Claude calls
+        # per scan, and a longer scan (see ESTIMATED_SCAN_MINUTES).
         ta = fetch_technicals(symbol)
-        if ta:
-            ta_score = ta.get("taScore", 0)
-            # Skip Claude if TA score is weak (below all MAs, bearish MACD)
-            # Threshold 1.5 means: some positive technical signal required
-            # At 82% live win rate this filter should be additive not subtractive
-            if ta_score < 1.5:
-                log.info(f"  {symbol}: taScore={ta_score:.1f} — TA too weak, skipping Claude")
-                continue  # no sleep needed — skipping Claude call
 
         result = compute_signal(symbol, spy_chg, prefetched_ta=ta)
         if result:
@@ -2154,9 +2151,9 @@ def should_run_premarket_scan() -> bool:
     Scan windows:
     - Sunday 8pm-10pm ET  → Monday preparation
     - Mon-Fri: dynamic start = 9:30am minus scan duration minus buffer
-      Scan duration estimate: ~8 min (TA pre-filter + sleep 3s on 55 tickers)
-      Buffer: 10 min safety margin
-      → Scan starts at ~9:12am ET, finishes just before market open
+      Scan duration estimate: ~14 min (every ticker scored by Claude —
+      TA pre-filter removed Sep 30 2026) + 6 min buffer
+      → Scan starts at ~9:10am ET, finishes just before market open
 
     This ensures signals are as fresh as possible at 9:30am open.
     Old approach (6am scan) left cache stale for 3+ hours.
@@ -2174,12 +2171,17 @@ def should_run_premarket_scan() -> bool:
     day    = now_et.weekday()  # 0=Mon, 6=Sun
 
     # ── Scan duration config ───────────────────────────────────
-    ESTIMATED_SCAN_MINUTES = 4    # measured Jul 2 — TA pre-filter + sleep(3s) = ~4min actual
+    # Sep 30 2026: raised 4 → 14 with the TA pre-filter removed. Measured
+    # Sep 30: 14 Claude-scored tickers took ~4m47s (~20s each). Scoring all
+    # ~39-40 tickers ≈ 13-14 min. The scan is synchronous — if it ran past
+    # 9:30 nothing else (including exits on overnight holds) runs until it
+    # finishes — so the start moves earlier instead of eating the buffer.
+    ESTIMATED_SCAN_MINUTES = 14
     BUFFER_MINUTES         = 6    # safety margin before open
-    TOTAL_LEAD_MINUTES     = ESTIMATED_SCAN_MINUTES + BUFFER_MINUTES  # 10 min
+    TOTAL_LEAD_MINUTES     = ESTIMATED_SCAN_MINUTES + BUFFER_MINUTES  # 20 min
 
     # Market open = 9:30am ET
-    # Scan should start at: 9:30 - 10 min = 9:20am ET
+    # Scan should start at: 9:30 - 20 min = 9:10am ET
     market_open_minutes   = 9 * 60 + 30          # 570
     scan_start_minutes    = market_open_minutes - TOTAL_LEAD_MINUTES  # 560 = 9:20am
     now_minutes           = hour * 60 + minute
@@ -3345,28 +3347,20 @@ def deploy_from_cache(positions: dict, account):
             spy_chg = get_quote_change("SPY") or 0.0
             universe = build_universe()
             new_signals = []
-            skipped_ta  = 0
             for symbol in universe:
                 if symbol in positions:
                     continue
-                # ── TA pre-filter (Aug 24 fix) ─────────────────
-                # The emergency rescan was missing the same TA pre-filter
-                # the pre-market scan uses — calling Claude on every ticker
-                # in the universe unconditionally. Observed Aug 24: this
-                # took 7+ minutes mid-session (19:47:44 → 19:54:59) scoring
-                # ~40 tickers sequentially with no skip, well over the
-                # ~4min the optimised pre-market scan takes. Same fix:
-                # fetch cheap TA first, skip the paid Claude call entirely
-                # if taScore < 1.5 (clearly bearish / no signal).
+                # Sep 30 2026: TA pre-filter removed here too (same change as
+                # run_premarket_scan). Note: this rescan runs mid-session and
+                # is synchronous — scoring the full universe takes ~13-14 min
+                # (Aug 24 saw 7+ min for ~40 tickers under an older, lighter
+                # prompt), during which no exits are checked.
                 ta = fetch_technicals(symbol)
-                if ta and ta.get("taScore", 0) < 1.5:
-                    skipped_ta += 1
-                    continue  # no sleep needed — skipping Claude call
                 result = compute_signal(symbol, spy_chg, prefetched_ta=ta)
                 if result and result["signal"] == "BUY" and result["confidence"] >= MIN_CONFIDENCE and result["composite"] >= MIN_COMPOSITE:
                     new_signals.append(result)
                 time.sleep(3)
-            log.info(f"Emergency rescan: {skipped_ta} tickers skipped on weak TA, {len(new_signals)} signal(s) found")
+            log.info(f"Emergency rescan: {len(new_signals)} signal(s) found")
             signal_cache = sorted(new_signals, key=lambda x: x["confidence"], reverse=True)
             available    = signal_cache
         else:
