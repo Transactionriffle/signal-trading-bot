@@ -197,15 +197,6 @@ MIDDAY_TA_REFRESH_ET = (12, 0)     # one TA-only re-validation of the whole cach
 # and the next open (same underlying gap exposure as the Sep 11 writeup,
 # just on the profit side instead of the loss side).
 
-# Sep 11 2026: activation delay REMOVED (30 → 0). SLB on Sep 10 sold at
-# -1.71% at exactly minute 30 — the loss had already run well past every
-# stop level before anything was allowed to act. Stops now fire from
-# the first monitoring cycle after entry. Left as a constant (0) so
-# every gate below stays wired and it can be re-enabled by one edit.
-STOP_LOSS_ACTIVATION_MINUTES = 0   # composite-tiered stop loss fires immediately (was 30min after
-                                     # this many minutes held — avoids cutting a
-                                     # fresh position on opening-print/spread noise
-                                     # before the thesis has had time to develop
 BREAKEVEN_TRIGGER = 0.01   # +1%   once hit, stop shifts to +0.5% (default / high-VIX)
 BREAKEVEN_STOP    = 0.005  # +0.5% minimum locked-in gain after breakeven (default / high-VIX)
 
@@ -356,16 +347,14 @@ CURATED_TICKERS = [
     "CRWD",   # $120B — cybersecurity market leader
     "SPOT",   # $80B — profitability inflection, subscriber growth
     # NFLX removed — Jun 15 trade hit -4%, weak signal (composite 2.50, min threshold)
-    "CPRX",   # $10B  — Catalyst Pharmaceuticals, rare disease portfolio
-              #          (Firdapse, Agamree, Fycompa), +24% revenue YoY,
-              #          +45.9% EPS growth, profitable (not binary-catalyst
-              #          dependent like NUVL was) — replaces NUVL Aug 21 2026
+    # CPRX removed Oct 1 2026 — acquired by Angelini Pharma, delisted Jul 15 2026
+    # (Alpaca feed frozen since Jul 14; flagged by the structural-risk check)
     "DECK",   # $22B  — UGG/HOKA, consistent earnings beats (mid-cap)
     "IOT",    # $19B  — Samsara, Connected Operations platform, 30% ARR growth,
               #          3rd consecutive GAAP profitable quarter, composite 7.90 Jul 1
               #          Physical switching costs + AI monetisation upside
               #          Next earnings: Sep 3, 2026
-]  # 37 tickers
+]  # 35 tickers (CPRX removed Oct 1 2026)
 
 # Sector breakdown:
 # Semis: 5 (14%) | Tech: 4 (11%) | Financials: 5 (14%)
@@ -713,6 +702,17 @@ JOURNAL_FILE = "/tmp/trade_journal.json"
 # ══════════════════════════════════════════════════════════════
 # NEWS WEBSOCKET LAYER
 # ══════════════════════════════════════════════════════════════
+
+_last_logged: dict = {}
+
+def log_every(key: str, seconds: int, msg: str):
+    """Oct 1 2026: log a status line at most once per `seconds` for the given
+    key. Used for messages that were repeating identically every 60s cycle
+    (e.g. "Market closed — sleeping" ~1,000 times a night)."""
+    now = time.time()
+    if now - _last_logged.get(key, 0) >= seconds:
+        _last_logged[key] = now
+        log.info(msg)
 
 def classify_news(headline: str, summary: str) -> str:
     """
@@ -1452,7 +1452,6 @@ def get_vix_level() -> float | None:
         closes = chart.get("indicators", {}).get("quote", [{}])[0].get("close", [])
         closes = [c for c in closes if c is not None]
         if closes:
-            log.info(f"VIX level: {closes[-1]:.1f}")
             last_vix_value = closes[-1]
             last_vix_time  = time.time()
             return closes[-1]
@@ -1792,15 +1791,23 @@ def check_structural_risk(symbol: str, today: str) -> tuple[bool, str]:
             "fundamentals; (4) did it recently do a reverse stock split; (5) was "
             "trading recently halted for volatility (LULD circuit breaker); (6) is it "
             "a thinly-traded foreign ADR with very low US daily volume. "
-            'Return ONLY this JSON with NO other text: '
+            # Oct 1 2026: Haiku ignored the old "Return ONLY this JSON" line —
+            # after searching it wrote a long point-by-point analysis of all
+            # six criteria and hit the token cap on ~20 large caps before
+            # reaching the JSON. The instruction is now explicit about what
+            # NOT to write, and repeated as the last thing it reads.
+            "Search as needed, then reply with ONLY one JSON object and nothing "
+            "else: no analysis, no explanation, no list of the criteria, no "
+            "text before or after it. Format: "
             '{"structural_risk":false,"reason":""} '
             "Set structural_risk to true if ANY of the above applies, and give a "
-            "short reason (under 10 words)."
+            "short reason (under 10 words). Your entire reply must be that single "
+            "JSON object."
         )
         response = safe_claude_call(
             purpose=f"structural:{symbol}",
             model=LOOKUP_MODEL,
-            max_tokens=400,   # Sep 30 2026: 80 → 400, same reason as the earnings check (cap only)
+            max_tokens=1500,  # Oct 1 2026: 400 → 1500 — ~20 cut-offs at 400 on Oct 1 (cap only, billed on use)
             tools=[{"type": "web_search_20250305", "name": "web_search"}],
             messages=[{"role": "user", "content": prompt}],
         )
@@ -1836,10 +1843,17 @@ def extract_json_response(response, symbol: str, purpose: str) -> dict | None:
     for t in reversed(blocks):
         si, ei = t.find("{"), t.rfind("}")
         if si != -1 and ei > si:
+            candidate = t[si:ei+1]
             try:
-                return json.loads(t[si:ei+1])
+                return json.loads(candidate)
             except json.JSONDecodeError:
-                continue
+                # Oct 1 2026: ABBV's answer was discarded because Claude wrote
+                # "Parkinson\'s" — \' is not a valid JSON escape. Un-escape
+                # apostrophes and try once more before giving up on this block.
+                try:
+                    return json.loads(candidate.replace("\\'", "'"))
+                except json.JSONDecodeError:
+                    continue
     joined = " | ".join(blocks)
     cut = " — CUT OFF at max_tokens" if getattr(response, "stop_reason", "") == "max_tokens" else ""
     log.warning(
@@ -1847,6 +1861,28 @@ def extract_json_response(response, symbol: str, purpose: str) -> dict | None:
         f"— raw text: {joined[:300]!r}"
     )
     return None
+
+def log_scored_ticker(symbol: str, result: dict | None):
+    """Oct 1 2026: one line per ticker scored in a scan, pass or fail, so a
+    miss (e.g. CAT at 3.84 / 66%) can be broken down afterwards. Previously
+    only qualifying names and RS-adjusted composites were printed, and the
+    ta/fund split was never logged at scan time."""
+    if result is None:
+        log.info(f"  {symbol}: not scored (blocked or failed — see the line above)")
+        return
+    reasons = []
+    if result["signal"] != "BUY":
+        reasons.append(f"signal {result['signal']}")
+    if result["composite"] < MIN_COMPOSITE:
+        reasons.append(f"composite < {MIN_COMPOSITE}")
+    if result["confidence"] < MIN_CONFIDENCE:
+        reasons.append(f"confidence < {MIN_CONFIDENCE}%")
+    verdict = "QUALIFIES" if not reasons else "fails: " + ", ".join(reasons)
+    log.info(
+        f"  {symbol}: ta {result['taScore']:.1f} | fund {result['fundScore']:.1f} | "
+        f"conf {result['confidence']:.0f}% | catalyst {float(result.get('catalystStrength', 0) or 0):.0f}/10 | "
+        f"composite {result['composite']:.2f} — {verdict}"
+    )
 
 def compute_signal(symbol: str, spy_chg: float = 0.0, prefetched_ta: dict | None = None) -> dict | None:
     # Skip known ETFs
@@ -2163,6 +2199,7 @@ def run_premarket_scan():
         ta = fetch_technicals(symbol)
 
         result = compute_signal(symbol, spy_chg, prefetched_ta=ta)
+        log_scored_ticker(symbol, result)
         if result:
             all_scored.append(result)
             if result["signal"] == "BUY" and result["confidence"] >= MIN_CONFIDENCE and result["composite"] >= MIN_COMPOSITE:
@@ -3280,25 +3317,13 @@ def check_profit_targets(positions: dict) -> list[str]:
             if pnl_pct >= HARD_SELL_CEILING:
                 reason = f"HARD_CEILING (+{HARD_SELL_CEILING*100:.0f}% reached — forced exit, no trail)"
             elif pnl_pct <= active_stop:
-                # Loss has reached stop-loss-tier magnitude — always label
-                # it STOP_LOSS for accurate attribution, even if this
-                # position peaked positive earlier in its life. Still
-                # respects the same activation delay as the dedicated
-                # STOP_LOSS branch further below.
-                entry_time = entry_signals.get(symbol, {}).get("entry_time")
-                minutes_held = (time.time() - entry_time) / 60 if entry_time else None
-                if minutes_held is None or minutes_held >= STOP_LOSS_ACTIVATION_MINUTES:
-                    peak_note = f", peaked {current_peak*100:+.2f}% earlier" if current_peak >= MICRO_TRAIL_ARM_PCT else ""
-                    cat_note = " +catalyst tolerance" if (strong_catalyst and market_state != "BEAR") else ""
-                    reason = f"STOP_LOSS ({active_stop*100:.0f}%{' composite-tiered' if entry_composite is not None else ''}{cat_note}{peak_note})"
-                # else: falls through to noise-tolerance window below via the
-                # ordinary STOP_LOSS branch's own delay check — no action here,
-                # just don't claim it as DYNAMIC_TRAIL in the meantime either
-                elif current_peak < MICRO_TRAIL_ARM_PCT:
-                    log.info(
-                        f"  {symbol}: at {pnl_pct*100:+.2f}% (below {active_stop*100:.0f}% stop) but only "
-                        f"{minutes_held:.1f}min held — stop-loss activates at {STOP_LOSS_ACTIVATION_MINUTES}min, holding"
-                    )
+                # Loss has reached the stop tier — always labelled STOP_LOSS
+                # for accurate attribution, even if it peaked positive earlier.
+                # (The 30-min activation delay this used to check was set to 0
+                # on Sep 11 and its dead branch/log removed Oct 1 2026.)
+                peak_note = f", peaked {current_peak*100:+.2f}% earlier" if current_peak >= MICRO_TRAIL_ARM_PCT else ""
+                cat_note = " +catalyst tolerance" if (strong_catalyst and market_state != "BEAR") else ""
+                reason = f"STOP_LOSS ({active_stop*100:.0f}%{' composite-tiered' if entry_composite is not None else ''}{cat_note}{peak_note})"
             elif current_peak >= MICRO_TRAIL_ARM_PCT and pnl_pct <= (current_peak - get_dynamic_trail_gap(current_peak)):
                 gap = get_dynamic_trail_gap(current_peak)
                 reason = (
@@ -3444,6 +3469,7 @@ def deploy_from_cache(positions: dict, account):
                 # prompt), during which no exits are checked.
                 ta = fetch_technicals(symbol)
                 result = compute_signal(symbol, spy_chg, prefetched_ta=ta)
+                log_scored_ticker(symbol, result)
                 if result and result["signal"] == "BUY" and result["confidence"] >= MIN_CONFIDENCE and result["composite"] >= MIN_COMPOSITE:
                     new_signals.append(result)
                 time.sleep(3)
@@ -3451,7 +3477,7 @@ def deploy_from_cache(positions: dict, account):
             signal_cache = sorted(new_signals, key=lambda x: x["confidence"], reverse=True)
             available    = signal_cache
         else:
-            log.info(f"Cache empty — next emergency rescan in {max(0,(3600-time_since)/60):.0f}min")
+            log_every("cache_empty", 900, f"Cache empty — next emergency rescan in {max(0,(3600-time_since)/60):.0f}min")
             return
 
     to_buy = available[:open_slots]
@@ -3663,37 +3689,33 @@ def run():
     log.info("=" * 60)
     log.info("SIGNAL Trading Bot started")
     log.info(f"  Universe:       {len(CURATED_TICKERS)} curated + up to 24 dynamic (8+8+8) = 55 max")
-    log.info(f"  Scan timing:    Sun 8pm ET / Mon-Fri 9:20am ET (dynamic) + restart rescan")
-    log.info(f"  Position size:  Kelly 10-16% (confidence-based sizing, raised Aug 2026)")
+    log.info(f"  Scan timing:    Sun 8pm ET / Mon-Fri 9:10am ET + restart rescan")
+    log.info(f"  Position size:  Kelly 10-16% by confidence (+{CATALYST_KELLY_BONUS*100:.0f}% strong catalyst, cap {CATALYST_KELLY_MAX*100:.0f}%)")
     # (accurate profit-target line logged further below — trail-only, no fixed target)
-    log.info(f"  Sector cap:     Max 2 positions per sector (backtest validated)")
+    log.info(f"  Sector cap:     Max {MAX_SECTOR_POSITIONS} positions per sector")
     log.info(f"  AI concentration cap: Max {MAX_AI_CORRELATED_POSITIONS} combined across semis/tech/software/cyber")
     log.info(f"  Systemic de-risk: VIX≥{SYSTEMIC_DERISK_VIX} + {SYSTEMIC_DERISK_MIN_WEAK_SECTORS}+ weak sectors → blocks new buys, allows early loss-cutting")
     log.info(f"  Re-entry rules: +60% ceiling exit → 4hr cooldown + 2% price gate")
     log.info(f"                  stop loss → 24hr cooldown + 2% price gate (escalating strikes)")
     log.info(f"  Max positions:  10 concurrent")
-    log.info(f"  Profit target:  NONE — trail-only. Hard ceiling +{HARD_SELL_CEILING*100:.0f}% (sell immediately)")
+    log.info(f"  Hard ceiling:   +{HARD_SELL_CEILING*100:.0f}% (sell immediately)")
     log.info(f"  Trail tiers:    " + " | ".join(f"peak>={t*100:g}%→{g*100:g}% behind" for t, g in DYNAMIC_TRAIL_TABLE))
-    log.info(f"  Trailing:       peak >={PEAK_TRIGGER*100:.0f}% → sell at +{TRAIL_SELL*100:.0f}%")
+    log.info(f"  Fixed trail:    peak >={PEAK_TRIGGER*100:.1f}% → sell at +{TRAIL_SELL*100:.1f}% (backstop)")
     log.info(f"  Breakeven:      calm(VIX<{CALM_VIX_THRESHOLD}) peak>={BREAKEVEN_TRIGGER_CALM*100:.0f}%→lock+{BREAKEVEN_STOP_CALM*100:.0f}% | else peak>={BREAKEVEN_TRIGGER*100:.0f}%→lock+{BREAKEVEN_STOP*100:.1f}%")
-    log.info(f"  Stop loss:      -{abs(STOP_LOSS)*100:.0f}% ceiling")
     log.info(f"  TA/Fund weight: {TECH_WEIGHT}% / {FUND_WEIGHT}%")
     log.info(f"  Claude models:  fundamentals={FUNDAMENTALS_MODEL} | earnings/structural/probe={LOOKUP_MODEL}")
     log.info(f"  Min confidence: {MIN_CONFIDENCE}%")
-    log.info(f"  Min composite:  {MIN_COMPOSITE} (3.0 → 4.0 Jul 29 review; briefly 4.2 Sep 11, rolled back Sep 15)")
-    log.info(f"  Stop loss:      tiered by entry composite — <4.5: -3% | 4.5-6.0: -4% | 6.0+: -5%")
-    log.info(f"  Stop loss delay: NONE — stops active from first cycle after entry (30min grace removed Sep 11)")
+    log.info(f"  Min composite:  {MIN_COMPOSITE}")
+    log.info(f"  Stop loss:      tiered by entry composite — <4.5: -3% | 4.5-6.0: -4% | 6.0+: -5% (BEAR: -2%), only loss-side rule")
     log.info(f"  Entry window:   {FIRST_ENTRY_ET[0]:02d}:{FIRST_ENTRY_ET[1]:02d}–{LAST_ENTRY_ET[0]:02d}:{LAST_ENTRY_ET[1]:02d} ET (opening range forms first; nothing new late)")
     log.info(f"  Deploy check:   {'live TA + intraday RS re-validation before every buy' if REVALIDATE_AT_DEPLOY else 'OFF — buying on scan-time numbers'}; RS capped ±{INTRADAY_RS_MAX}, above-open required: {REQUIRE_ABOVE_OPEN}")
     log.info(f"  Overnight grace: stop-type exits on overnight holds deferred {OVERNIGHT_OPEN_GRACE_MINUTES}min after the open (unless loss > 2× tier)")
-    log.info(f"  EOD profit lock: REMOVED Sep 24 2026 — winners may hold overnight again")
     log.info(f"  Midday refresh: {'TA-only cache re-validation at %02d:%02d ET' % MIDDAY_TA_REFRESH_ET if MIDDAY_TA_REFRESH_ET else 'off'}")
-    log.info(f"  Strong catalyst: catalystStrength>={STRONG_CATALYST_MIN}/10 → Kelly +{CATALYST_KELLY_BONUS*100:.0f}% (cap {CATALYST_KELLY_MAX*100:.0f}%), stop tier widened {CATALYST_STOP_LOOSEN*100:.0f}% (not in BEAR)")
+    log.info(f"  Strong catalyst: catalystStrength>={STRONG_CATALYST_MIN}/10 → stop tier widened {CATALYST_STOP_LOOSEN*100:.0f}% (not in BEAR)")
     log.info(f"  Max drawdown:   {MAX_DRAWDOWN*100:.0f}%")
     log.info(f"  90-day audit:   Volume, TA alignment, win rate")
     log.info(f"  Held-position news review: bearish/material-adverse news on a HELD symbol re-runs fundamentals, can trigger early exit")
     log.info(f"  Stale-hold check: fundamentals re-checked after {STALE_HOLD_HOURS}hr hold, max 1x/hr per symbol")
-    log.info(f"  Loss side:      composite-tiered stop ONLY — early-exit ATR stop and dynamic downside floor removed Sep 29 2026")
     log.info(f"  Pause:          set PAUSED=true in Render")
     log.info("=" * 60)
 
@@ -3737,7 +3759,7 @@ def run():
 
             # ── Market closed — sleep ──────────────────────────
             if not is_market_open():
-                log.info(f"Market closed ({now_et.strftime('%H:%M ET')}) — sleeping")
+                log_every("market_closed", 3600, f"Market closed ({now_et.strftime('%H:%M ET')}) — sleeping (logged hourly)")
                 time.sleep(SCAN_INTERVAL)
                 continue
 
@@ -3820,13 +3842,13 @@ def run():
                     log.info(f"  {cannot_open_reason} — new entries blocked, monitoring continues normally")
             elif before_entry_window:
                 if open_slots > 0 and signal_cache:
-                    log.info(
+                    log_every("opening_range", 900,
                         f"  Opening range forming — no new entries before "
                         f"{FIRST_ENTRY_ET[0]:02d}:{FIRST_ENTRY_ET[1]:02d} ET; exits keep running"
                     )
             elif past_entry_cutoff:
                 if open_slots > 0 and signal_cache:
-                    log.info(
+                    log_every("entry_cutoff", 900,
                         f"  Past {LAST_ENTRY_ET[0]:02d}:{LAST_ENTRY_ET[1]:02d} ET entry cutoff — "
                         f"no new entries this late in the session; exits/trailing keep running"
                     )
@@ -3841,7 +3863,7 @@ def run():
                         last_rescan_time = time.time()
                         run_premarket_scan()
                     else:
-                        log.info(
+                        log_every("cache_empty", 900,
                             f"  {open_slots} slot(s) available but signal cache is empty — "
                             f"next emergency rescan in {max(0,(3600-time_since_rescan)/60):.0f}min. "
                             f"News WebSocket active for breaking events."
