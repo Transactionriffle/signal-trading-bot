@@ -1017,7 +1017,7 @@ def process_news_queue(positions: dict, account) -> bool:
 
         result = compute_signal(symbol, spy_chg)
 
-        if result and result["signal"] == "BUY" and result["confidence"] >= MIN_CONFIDENCE and result["composite"] >= MIN_COMPOSITE:
+        if passes_gates(result):
             log.info(
                 f"📰 NEWS BUY [{sentiment}] {symbol}: "
                 f"composite={result['composite']:.2f}, confidence={result['confidence']}% "
@@ -1033,8 +1033,9 @@ def process_news_queue(positions: dict, account) -> bool:
             traded = True
         elif sentiment == "BULLISH" and result:
             log.info(
-                f"📰 {symbol} news bullish but below threshold "
-                f"(composite={result['composite']:.2f}, confidence={result['confidence']}%)"
+                f"📰 {symbol} news bullish but not buyable "
+                f"(composite={result['composite']:.2f}, confidence={result['confidence']}%"
+                f"{', BLOCKED by ' + result['blocked_reason'] if result.get('blocked_reason') else ''})"
             )
         else:
             log.info(f"📰 {symbol} news scored HOLD/SELL — no action")
@@ -1862,6 +1863,18 @@ def extract_json_response(response, symbol: str, purpose: str) -> dict | None:
     )
     return None
 
+def passes_gates(result: dict | None) -> bool:
+    """All buy rules in one place, applied after every check has run:
+    BUY signal, composite and confidence gates, and no structural/earnings
+    veto. Used by the pre-market scan, the emergency rescan and news buys."""
+    return bool(
+        result
+        and result["signal"] == "BUY"
+        and result["confidence"] >= MIN_CONFIDENCE
+        and result["composite"] >= MIN_COMPOSITE
+        and not result.get("blocked_reason")
+    )
+
 def log_scored_ticker(symbol: str, result: dict | None):
     """Oct 1 2026: one line per ticker scored in a scan, pass or fail, so a
     miss (e.g. CAT at 3.84 / 66%) can be broken down afterwards. Previously
@@ -1877,6 +1890,8 @@ def log_scored_ticker(symbol: str, result: dict | None):
         reasons.append(f"composite < {MIN_COMPOSITE}")
     if result["confidence"] < MIN_CONFIDENCE:
         reasons.append(f"confidence < {MIN_CONFIDENCE}%")
+    if result.get("blocked_reason"):
+        reasons.append("BLOCKED by " + result["blocked_reason"])
     verdict = "QUALIFIES" if not reasons else "fails: " + ", ".join(reasons)
     log.info(
         f"  {symbol}: ta {result['taScore']:.1f} | fund {result['fundScore']:.1f} | "
@@ -1903,15 +1918,15 @@ def compute_signal(symbol: str, spy_chg: float = 0.0, prefetched_ta: dict | None
     if is_likely_spac(symbol):
         return None
 
-    # Generalized structural risk check — catches the WIDER category the
-    # SPAC check only partially covers (recent IPO/thin float, pending M&A
-    # deal-odds pricing, reverse split, recent volatility halt, thinly-
-    # traded ADR, SPAC units/rights/warrants the name-check might miss).
-    # One Claude call, cached 24h, same cost profile as the earnings check.
+    # Oct 1 2026: checks are no longer sequential gates. Structural risk and
+    # earnings proximity used to `return None` BEFORE the fundamentals call,
+    # so a flagged ticker never had its catalyst researched or logged (AMD,
+    # CRWD, FDX, HON on Oct 1; META's earnings day on Sep 25). Now every
+    # check runs, the full result is built and logged, and the SAME vetoes
+    # are applied once all checks are complete (see blocked_reason below).
+    # ETF/SPAC name checks stay up front: they identify instruments with no
+    # business to research, not a business risk to weigh.
     today_str = datetime.now(ET).strftime("%Y-%m-%d")
-    has_structural_risk, risk_reason = check_structural_risk(symbol, today_str)
-    if has_structural_risk:
-        return None
 
     # Use prefetched TA if provided (avoids double-fetching during pre-market scan)
     ta = prefetched_ta if prefetched_ta is not None else fetch_technicals(symbol)
@@ -1926,19 +1941,19 @@ def compute_signal(symbol: str, spy_chg: float = 0.0, prefetched_ta: dict | None
               "pct1d":0,"pct5d":0,"volRatio":1}
         ipo_mode = True
 
-    # ── Earnings proximity check — applies to ALL tickers (curated + dynamic) ──
-    today_str = datetime.now(ET).strftime("%Y-%m-%d")
-    has_earnings, earnings_date = check_earnings_proximity(symbol, today_str)
-    if has_earnings:
-        log.warning(
-            f"  {symbol}: earnings within 3 days ({earnings_date}) — "
-            f"skipping to avoid pre-earnings selloff risk"
-        )
-        return None
-
     fund = fetch_fundamental(symbol, ta)
     if not fund:
-        return None
+        return None   # no fundamentals answer → nothing to score
+
+    # Structural risk + earnings proximity: both always run now (cached 24h),
+    # and are recorded on the result instead of stopping the scoring early.
+    has_structural_risk, risk_reason = check_structural_risk(symbol, today_str)
+    has_earnings, earnings_date      = check_earnings_proximity(symbol, today_str)
+    blocks = []
+    if has_structural_risk:
+        blocks.append(f"structural risk ({risk_reason or 'unspecified'})")
+    if has_earnings:
+        blocks.append(f"earnings within 3 days ({earnings_date or 'date n/a'})")
 
     ta_score   = ta.get("taScore", 0)
     fund_score = fund.get("fundScore", 0)
@@ -1979,6 +1994,9 @@ def compute_signal(symbol: str, spy_chg: float = 0.0, prefetched_ta: dict | None
         "confidence": fund.get("confidence", 50),
         "thesis":     fund.get("thesis", ""),
         "catalystStrength": fund.get("catalystStrength", 0),
+        "structural_risk":  has_structural_risk,
+        "earnings_soon":    has_earnings,
+        "blocked_reason":   "; ".join(blocks),   # non-empty = vetoed (same rules as before)
         "ipo_mode":   ipo_mode,
         "atr_pct":    round(atr_pct, 4),   # adaptive profit target input
     }
@@ -2202,7 +2220,7 @@ def run_premarket_scan():
         log_scored_ticker(symbol, result)
         if result:
             all_scored.append(result)
-            if result["signal"] == "BUY" and result["confidence"] >= MIN_CONFIDENCE and result["composite"] >= MIN_COMPOSITE:
+            if passes_gates(result):
                 candidates.append(result)
                 ipo_tag = " [IPO]" if result.get("ipo_mode") else ""
                 log.info(
@@ -2234,7 +2252,7 @@ def run_premarket_scan():
         if sector not in cached_sectors:
             sector_best = sorted(
                 [r for r in all_scored if SECTOR_MAP.get(r["symbol"]) == sector
-                 and r["signal"] != "SELL"],
+                 and r["signal"] != "SELL" and not r.get("blocked_reason")],
                 key=lambda x: x["composite"], reverse=True
             )
             if sector_best:
@@ -3470,7 +3488,7 @@ def deploy_from_cache(positions: dict, account):
                 ta = fetch_technicals(symbol)
                 result = compute_signal(symbol, spy_chg, prefetched_ta=ta)
                 log_scored_ticker(symbol, result)
-                if result and result["signal"] == "BUY" and result["confidence"] >= MIN_CONFIDENCE and result["composite"] >= MIN_COMPOSITE:
+                if passes_gates(result):
                     new_signals.append(result)
                 time.sleep(3)
             log.info(f"Emergency rescan: {len(new_signals)} signal(s) found")
