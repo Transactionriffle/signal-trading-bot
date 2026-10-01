@@ -54,7 +54,7 @@ Environment variables (set in Render):
     CLOUDFLARE_WORKER
     TECH_WEIGHT            (default: 40 — 40% TA / 60% fundamental)
     MIN_CONFIDENCE         (default: 85)
-    MIN_COMPOSITE          (default: 4.0)
+    MIN_COMPOSITE          (default: 3.4)
     MAX_TRADES_PER_DAY     (default: 10)
     MAX_DRAWDOWN_PCT       (default: 0.15)
     PAUSED                 (set "true" to halt instantly)
@@ -124,7 +124,7 @@ MIN_CONFIDENCE  = int(os.environ.get("MIN_CONFIDENCE", "85"))  # Sep 15 2026: ro
 # marginal (3.0-4.0) entry was negative expected value at that risk/reward.
 # Raising the floor cuts trade count but concentrates capital in the
 # higher-conviction setups the composite score is actually meant to find.
-MIN_COMPOSITE   = float(os.environ.get("MIN_COMPOSITE", "4.0"))  # Sep 15 2026: rolled back from 4.2 (Sep 11) to 4.0 (raised from 3.0 in the Jul 29 review)
+MIN_COMPOSITE   = float(os.environ.get("MIN_COMPOSITE", "3.4"))  # Oct 1 2026: 4.0 → 3.4 (Sonnet 5.5 scores more conservatively; best Oct 1 composites were 3.84-3.94)
 MAX_TRADES_DAY  = int(os.environ.get("MAX_TRADES_PER_DAY", "10"))
 MAX_DRAWDOWN    = float(os.environ.get("MAX_DRAWDOWN_PCT", "0.15"))
 SCAN_INTERVAL   = 60
