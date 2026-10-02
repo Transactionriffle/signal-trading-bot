@@ -11,7 +11,7 @@ Architecture:
       SPAC/blank-check, general structural-risk (recent IPO, pending
       M&A, reverse split, halted, thin ADR), earnings within 3 days
     → Cache ranked BUY list (composite >= MIN_COMPOSITE, confidence
-      >= MIN_CONFIDENCE) with scores; persisted to disk so a mid-day
+      folded into composite) with scores; persisted to disk so a mid-day
       redeploy doesn't trigger a wasted re-scan
     → Deploy capital at market open from cached list
 
@@ -53,7 +53,6 @@ Environment variables (set in Render):
     ALPACA_BASE_URL        (default: https://paper-api.alpaca.markets)
     CLOUDFLARE_WORKER
     TECH_WEIGHT            (default: 40 — 40% TA / 60% fundamental)
-    MIN_CONFIDENCE         (default: 85)
     MIN_COMPOSITE          (default: 3.4)
     MAX_TRADES_PER_DAY     (default: 10)
     MAX_DRAWDOWN_PCT       (default: 0.15)
@@ -116,7 +115,6 @@ MODEL_PRICES = {
     "claude-opus-5-5":           (4.0, 20.0),
 }
 FUND_WEIGHT     = 100 - TECH_WEIGHT
-MIN_CONFIDENCE  = int(os.environ.get("MIN_CONFIDENCE", "85"))  # Sep 15 2026: rolled back from 87 (Sep 11) to 85. (Originally raised from 80% — filters weak signals like NFLX (82%))
 
 # Raised from 3.0 → 4.0 (Jul 29 review). Rationale: realised trades were
 # clustering at +0.3-0.5% wins vs -5% stop losses — a ratio that needs a
@@ -187,6 +185,21 @@ FIRST_ENTRY_ET  = (9, 45)  # no new cache entries before this — let the openin
 REVALIDATE_AT_DEPLOY = True # re-fetch TA + intraday RS and re-test the gates before every buy
 INTRADAY_RS_MAX = 0.75      # RS measured vs today's OPEN (not prior close), capped ±0.75 — tilts, never decides
 REQUIRE_ABOVE_OPEN = True   # only enter a name trading above its 9:30 open (positive intraday RS)
+# Oct 1 2026 — VWAP entry rule. Only enter a name trading ABOVE today's
+# volume-weighted average price: buyers have paid up on average and are in
+# control. Read from the same Alpaca snapshot the deploy check already
+# fetches (dailyBar.vw), so no extra API call. A name below VWAP is a
+# "skip this cycle" (stays cached), exactly like the above-open rule.
+REQUIRE_ABOVE_VWAP = True
+
+def confidence_adjusted_fund(fund_score: float, confidence: float) -> float:
+    """Oct 1 2026: confidence is no longer a separate gate. It discounts the
+    fundamentals score inside the composite instead — a fundScore of 8 at
+    70% confidence counts as 5.6. Shaky evidence is scaled down rather than
+    vetoed outright, and the composite becomes the single score gate.
+    (Previously: an 85% confidence gate on top of the composite, which
+    blocked every ticker on Oct 1 under Sonnet 5.5's lower confidence.)"""
+    return fund_score * max(0.0, min(100.0, confidence)) / 100.0
 OVERNIGHT_OPEN_GRACE_MINUTES = 5   # overnight holds: stop-type exits wait until 9:35 unless loss > 2× tier
 MIDDAY_TA_REFRESH_ET = (12, 0)     # one TA-only re-validation of the whole cache; set to None to disable
 # Sep 24 2026: EOD profit lock REMOVED (was added Sep 21, forced-closed any
@@ -270,7 +283,6 @@ SECTOR_WEAK     = -0.015
 # stock has to be unambiguously strong on its own merits to justify it.
 SECTOR_OUTPERFORM_OVERRIDE   = 0.03   # stock must beat its sector's % move by this much (3pp) to override
 SECTOR_OVERRIDE_MIN_COMPOSITE_BONUS  = 1.0  # composite must clear MIN_COMPOSITE + this much
-SECTOR_OVERRIDE_MIN_CONFIDENCE_BONUS = 5    # confidence must clear MIN_CONFIDENCE + this much (percentage points)
 SECTOR_ETFS     = {
     "tech": "XLK", "healthcare": "XLV", "financials": "XLF",
     "energy": "XLE", "utilities": "XLU", "consumer": "XLY",
@@ -1865,12 +1877,12 @@ def extract_json_response(response, symbol: str, purpose: str) -> dict | None:
 
 def passes_gates(result: dict | None) -> bool:
     """All buy rules in one place, applied after every check has run:
-    BUY signal, composite and confidence gates, and no structural/earnings
-    veto. Used by the pre-market scan, the emergency rescan and news buys."""
+    BUY signal, composite gate (confidence is already inside the composite
+    since Oct 1 2026), and no structural/earnings veto. Used by the
+    pre-market scan, the emergency rescan and news buys."""
     return bool(
         result
         and result["signal"] == "BUY"
-        and result["confidence"] >= MIN_CONFIDENCE
         and result["composite"] >= MIN_COMPOSITE
         and not result.get("blocked_reason")
     )
@@ -1888,8 +1900,6 @@ def log_scored_ticker(symbol: str, result: dict | None):
         reasons.append(f"signal {result['signal']}")
     if result["composite"] < MIN_COMPOSITE:
         reasons.append(f"composite < {MIN_COMPOSITE}")
-    if result["confidence"] < MIN_CONFIDENCE:
-        reasons.append(f"confidence < {MIN_CONFIDENCE}%")
     if result.get("blocked_reason"):
         reasons.append("BLOCKED by " + result["blocked_reason"])
     verdict = "QUALIFIES" if not reasons else "fails: " + ", ".join(reasons)
@@ -1957,7 +1967,8 @@ def compute_signal(symbol: str, spy_chg: float = 0.0, prefetched_ta: dict | None
 
     ta_score   = ta.get("taScore", 0)
     fund_score = fund.get("fundScore", 0)
-    composite  = ta_score * (TECH_WEIGHT / 100) + fund_score * (FUND_WEIGHT / 100)
+    fund_adj   = confidence_adjusted_fund(fund_score, fund.get("confidence", 50))
+    composite  = ta_score * (TECH_WEIGHT / 100) + fund_adj * (FUND_WEIGHT / 100)
 
     # Relative strength vs SPY
     stock_pct = ta.get("pct1d", 0) / 100
@@ -2243,7 +2254,6 @@ def run_premarket_scan():
     # than a normal entry (85%/4.0) — DIVERSITY_MIN_CONFIDENCE (75%) and
     # DIVERSITY_MIN_COMPOSITE (1.5) — so a sector gap can still be filled,
     # but never with a trade Claude scored as a coin flip.
-    DIVERSITY_MIN_CONFIDENCE = 75   # below MIN_CONFIDENCE (85) on purpose — a real floor, not a bypass
     DIVERSITY_MIN_COMPOSITE  = 1.5  # unchanged from the original diversity floor
     DIVERSITY_SECTORS = ["financials", "healthcare", "energy", "industrials", "consumer"]
     cached_sectors = {SECTOR_MAP.get(c["symbol"]) for c in candidates}
@@ -2257,23 +2267,21 @@ def run_premarket_scan():
             )
             if sector_best:
                 best = sector_best[0]
-                if (best["composite"] >= DIVERSITY_MIN_COMPOSITE
-                        and best["confidence"] >= DIVERSITY_MIN_CONFIDENCE):
+                if best["composite"] >= DIVERSITY_MIN_COMPOSITE:
                     candidates.append(best)
                     log.info(
                         f"  📊 DIVERSITY {best['symbol']} ({sector}): composite={best['composite']:.2f}, "
                         f"confidence={best['confidence']}% — added for sector diversity "
-                        f"(diversity floor: {DIVERSITY_MIN_COMPOSITE} / {DIVERSITY_MIN_CONFIDENCE}%)"
+                        f"(diversity floor: composite {DIVERSITY_MIN_COMPOSITE})"
                     )
                 else:
                     log.info(
                         f"  📊 {sector}: no qualifying signal — best was {best['symbol']} "
                         f"composite={best['composite']:.2f}, confidence={best['confidence']}% "
-                        f"(diversity floor: {DIVERSITY_MIN_COMPOSITE} / {DIVERSITY_MIN_CONFIDENCE}%, "
-                        f"normal gates: {MIN_COMPOSITE} / {MIN_CONFIDENCE}%) — NOT added"
+                        f"(diversity floor: composite {DIVERSITY_MIN_COMPOSITE}, normal gate: {MIN_COMPOSITE}) — NOT added"
                     )
 
-    candidates.sort(key=lambda x: x["confidence"], reverse=True)
+    candidates.sort(key=lambda x: x["composite"], reverse=True)
     signal_cache      = candidates
     signal_cache_time = time.time()
     signal_cache_date = today
@@ -2655,12 +2663,13 @@ def in_opening_grace() -> bool:
     return (9 * 60 + 30) <= mins < (9 * 60 + 30 + OVERNIGHT_OPEN_GRACE_MINUTES)
 
 def fetch_intraday_snapshot(symbol: str) -> dict | None:
-    """Live price + today's open for symbol and SPY from Alpaca's snapshot
-    endpoint. Returns {price, open, spy_price, spy_open} or None."""
+    """Live price + today's open (and today's VWAP) for symbol and SPY from
+    Alpaca's snapshot endpoint. Returns {price, open, spy_price, spy_open,
+    vwap} or None. vwap is optional (0 if missing) and never fails the call."""
     try:
         r = requests.get(
             "https://data.alpaca.markets/v2/stocks/snapshots",
-            params={"symbols": f"{symbol},SPY"},
+            params={"symbols": f"{symbol},SPY", "feed": "sip"},  # consolidated tape → VWAP of all US trades
             headers={"APCA-API-KEY-ID": ALPACA_KEY, "APCA-API-SECRET-KEY": ALPACA_SECRET},
             timeout=5,
         )
@@ -2674,7 +2683,10 @@ def fetch_intraday_snapshot(symbol: str) -> dict | None:
             "spy_price": float(spy.get("latestTrade", {}).get("p", 0) or 0),
             "spy_open":  float(spy.get("dailyBar", {}).get("o", 0) or 0),
         }
-        return out if all(v > 0 for v in out.values()) else None
+        if not all(v > 0 for v in out.values()):
+            return None
+        out["vwap"] = float(sym.get("dailyBar", {}).get("vw", 0) or 0)   # today's VWAP so far
+        return out
     except Exception as e:
         log.warning(f"  {symbol}: intraday snapshot failed: {e}")
         return None
@@ -2731,19 +2743,27 @@ def revalidate_candidate(candidate: dict) -> tuple[str, dict | None, str]:
         live_price = snap["price"]
         if REQUIRE_ABOVE_OPEN and stock_pct <= 0:
             return "skip", None, f"trading below its open ({stock_pct*100:+.2f}%) — {rs_label}"
+        vwap = snap.get("vwap", 0)
+        if REQUIRE_ABOVE_VWAP and vwap > 0 and live_price <= vwap:
+            return "skip", None, (
+                f"below VWAP (${live_price:.2f} ≤ ${vwap:.2f}, {(live_price/vwap-1)*100:+.2f}%) — "
+                f"sellers in control today"
+            )
+        vwap_note = f", price ${live_price:.2f} vs VWAP ${vwap:.2f} ({(live_price/vwap-1)*100:+.2f}%)" if vwap > 0 else ", VWAP n/a"
     else:
+        vwap_note = ""
         rs_boost, rs_label = 0.0, "intraday RS unavailable (snapshot failed) — treated as neutral"
         live_price = ta.get("price", candidate.get("price", 0))
 
     fund_score = candidate.get("fundScore", 0)
-    composite  = ta_score * (TECH_WEIGHT / 100) + fund_score * (FUND_WEIGHT / 100) + rs_boost
+    fund_adj   = confidence_adjusted_fund(fund_score, candidate.get("confidence", 50))
+    composite  = ta_score * (TECH_WEIGHT / 100) + fund_adj * (FUND_WEIGHT / 100) + rs_boost
     if composite < MIN_COMPOSITE:
         return "drop", None, (
             f"fresh composite {composite:.2f} < {MIN_COMPOSITE} "
-            f"(scan had {candidate.get('composite', 0):.2f}; ta {ta_score:.1f}, fund {fund_score:.1f}, {rs_label})"
+            f"(scan had {candidate.get('composite', 0):.2f}; ta {ta_score:.1f}, fund {fund_score:.1f} "
+            f"× conf {candidate.get('confidence', 50):.0f}% = {fund_adj:.2f}, {rs_label})"
         )
-    if candidate.get("confidence", 0) < MIN_CONFIDENCE:
-        return "drop", None, f"confidence {candidate.get('confidence')}% < {MIN_CONFIDENCE}%"
 
     atr_raw = ta.get("atr14", 0) or ta.get("atr", 0)
     price_for_atr = ta.get("price", 0) or live_price
@@ -2759,7 +2779,8 @@ def revalidate_candidate(candidate: dict) -> tuple[str, dict | None, str]:
     })
     return "ok", fresh, (
         f"revalidated: composite {candidate.get('composite', 0):.2f} → {composite:.2f} "
-        f"(ta {ta_score:.1f}, fund {fund_score:.1f}, {rs_label})"
+        f"(ta {ta_score:.1f}, fund {fund_score:.1f} × conf {candidate.get('confidence', 50):.0f}% "
+        f"= {fund_adj:.2f}, {rs_label}{vwap_note})"
     )
 
 def refresh_cache_ta():
@@ -3492,7 +3513,7 @@ def deploy_from_cache(positions: dict, account):
                     new_signals.append(result)
                 time.sleep(3)
             log.info(f"Emergency rescan: {len(new_signals)} signal(s) found")
-            signal_cache = sorted(new_signals, key=lambda x: x["confidence"], reverse=True)
+            signal_cache = sorted(new_signals, key=lambda x: x["composite"], reverse=True)
             available    = signal_cache
         else:
             log_every("cache_empty", 900, f"Cache empty — next emergency rescan in {max(0,(3600-time_since)/60):.0f}min")
@@ -3563,8 +3584,7 @@ def deploy_from_cache(positions: dict, account):
                 composite  = candidate.get("composite", 0)
                 confidence = candidate.get("confidence", 0)
                 if (outperformance >= SECTOR_OUTPERFORM_OVERRIDE
-                        and composite  >= MIN_COMPOSITE + SECTOR_OVERRIDE_MIN_COMPOSITE_BONUS
-                        and confidence >= MIN_CONFIDENCE + SECTOR_OVERRIDE_MIN_CONFIDENCE_BONUS):
+                        and composite  >= MIN_COMPOSITE + SECTOR_OVERRIDE_MIN_COMPOSITE_BONUS):
                     override_used = True
                     log.info(
                         f"  {symbol}: sector '{sector}' weak ({sector_pct*100:+.2f}%) but stock "
@@ -3628,7 +3648,7 @@ def deploy_from_cache(positions: dict, account):
         # Marginal (composite < 4.5)                          → 10% Kelly (was 8%)
         composite  = candidate.get("composite", 0)
         confidence = candidate.get("confidence", 85)
-        if composite >= 6.0 and confidence >= 90:
+        if composite >= 6.0:           # confidence is inside the composite (Oct 1 2026)
             kelly = 0.16
         elif composite >= 4.5:
             kelly = 0.13
@@ -3722,11 +3742,11 @@ def run():
     log.info(f"  Breakeven:      calm(VIX<{CALM_VIX_THRESHOLD}) peak>={BREAKEVEN_TRIGGER_CALM*100:.0f}%→lock+{BREAKEVEN_STOP_CALM*100:.0f}% | else peak>={BREAKEVEN_TRIGGER*100:.0f}%→lock+{BREAKEVEN_STOP*100:.1f}%")
     log.info(f"  TA/Fund weight: {TECH_WEIGHT}% / {FUND_WEIGHT}%")
     log.info(f"  Claude models:  fundamentals={FUNDAMENTALS_MODEL} | earnings/structural/probe={LOOKUP_MODEL}")
-    log.info(f"  Min confidence: {MIN_CONFIDENCE}%")
+    log.info(f"  Confidence:     folded into composite (fundScore × confidence/100) — no separate gate")
     log.info(f"  Min composite:  {MIN_COMPOSITE}")
     log.info(f"  Stop loss:      tiered by entry composite — <4.5: -3% | 4.5-6.0: -4% | 6.0+: -5% (BEAR: -2%), only loss-side rule")
     log.info(f"  Entry window:   {FIRST_ENTRY_ET[0]:02d}:{FIRST_ENTRY_ET[1]:02d}–{LAST_ENTRY_ET[0]:02d}:{LAST_ENTRY_ET[1]:02d} ET (opening range forms first; nothing new late)")
-    log.info(f"  Deploy check:   {'live TA + intraday RS re-validation before every buy' if REVALIDATE_AT_DEPLOY else 'OFF — buying on scan-time numbers'}; RS capped ±{INTRADAY_RS_MAX}, above-open required: {REQUIRE_ABOVE_OPEN}")
+    log.info(f"  Deploy check:   {'live TA + intraday RS re-validation before every buy' if REVALIDATE_AT_DEPLOY else 'OFF — buying on scan-time numbers'}; RS capped ±{INTRADAY_RS_MAX}, above-open required: {REQUIRE_ABOVE_OPEN}, above-VWAP required: {REQUIRE_ABOVE_VWAP}")
     log.info(f"  Overnight grace: stop-type exits on overnight holds deferred {OVERNIGHT_OPEN_GRACE_MINUTES}min after the open (unless loss > 2× tier)")
     log.info(f"  Midday refresh: {'TA-only cache re-validation at %02d:%02d ET' % MIDDAY_TA_REFRESH_ET if MIDDAY_TA_REFRESH_ET else 'off'}")
     log.info(f"  Strong catalyst: catalystStrength>={STRONG_CATALYST_MIN}/10 → stop tier widened {CATALYST_STOP_LOOSEN*100:.0f}% (not in BEAR)")
