@@ -1787,6 +1787,9 @@ def check_structural_risk(symbol: str, today: str) -> tuple[bool, str]:
     Returns (has_structural_risk, reason).
     Cached 24h per symbol — same TTL as the earnings check.
     """
+    # Oct 2 2026: criterion (3) now explicitly excludes the BUYER in a deal.
+    # Haiku had been blocking acquirers (AMD — World Labs, CRWD — SGNL) as if
+    # they were takeover targets; only a target trades on deal odds.
     cache_key = f"structural_risk_{symbol}"
     if cache_key in fund_cache:
         cached_time, cached_result = fund_cache[cache_key]
@@ -1799,9 +1802,11 @@ def check_structural_risk(symbol: str, today: str) -> tuple[bool, str]:
             "reason its current price may NOT reflect normal business fundamentals? "
             "Specifically check: (1) is it a SPAC, blank-check company, or a SPAC "
             "unit/right/warrant; (2) did it IPO within the last 180 days with a very "
-            "small public float; (3) is it currently the target of an announced-but-"
-            "not-closed M&A deal, trading on deal-completion odds rather than "
-            "fundamentals; (4) did it recently do a reverse stock split; (5) was "
+            "small public float; (3) is THIS company the TARGET being acquired in an "
+            "announced-but-not-closed M&A deal, so its price trades on deal-completion "
+            "odds rather than fundamentals — if this company is the BUYER/acquirer in "
+            "a deal, that does NOT count as structural risk and must not be flagged; "
+            "(4) did it recently do a reverse stock split; (5) was "
             "trading recently halted for volatility (LULD circuit breaker); (6) is it "
             "a thinly-traded foreign ADR with very low US daily volume. "
             # Oct 1 2026: Haiku ignored the old "Return ONLY this JSON" line —
@@ -2001,6 +2006,7 @@ def compute_signal(symbol: str, spy_chg: float = 0.0, prefetched_ta: dict | None
         "taScore":    ta_score,
         "fundScore":  fund_score,
         "composite":  composite_adj,
+        "rs_premarket": rs_boost,   # carried into the buy-time composite (Oct 2 2026)
         "signal":     signal,
         "confidence": fund.get("confidence", 50),
         "thesis":     fund.get("thesis", ""),
@@ -2757,12 +2763,20 @@ def revalidate_candidate(candidate: dict) -> tuple[str, dict | None, str]:
 
     fund_score = candidate.get("fundScore", 0)
     fund_adj   = confidence_adjusted_fund(fund_score, candidate.get("confidence", 50))
-    composite  = ta_score * (TECH_WEIGHT / 100) + fund_adj * (FUND_WEIGHT / 100) + rs_boost
+    # Oct 2 2026: the pre-market relative-strength bonus/penalty from the scan
+    # (±1.5, vs yesterday's close) is now KEPT at buy time, added to the live
+    # intraday bonus (±0.75, vs today's open). Previously (Sep 11 fix) it was
+    # discarded here and replaced by the live one — IOT on Oct 2 lost its +1.5
+    # between 9:15 and 9:45 and missed the 3.4 gate by 0.08. Trade-off: the
+    # pre-market read is on thin trading and can be noisy, and a pre-market
+    # PENALTY now also carries through to the buy decision.
+    rs_pre     = float(candidate.get("rs_premarket", 0) or 0)
+    composite  = ta_score * (TECH_WEIGHT / 100) + fund_adj * (FUND_WEIGHT / 100) + rs_pre + rs_boost
     if composite < MIN_COMPOSITE:
         return "drop", None, (
             f"fresh composite {composite:.2f} < {MIN_COMPOSITE} "
             f"(scan had {candidate.get('composite', 0):.2f}; ta {ta_score:.1f}, fund {fund_score:.1f} "
-            f"× conf {candidate.get('confidence', 50):.0f}% = {fund_adj:.2f}, {rs_label})"
+            f"× conf {candidate.get('confidence', 50):.0f}% = {fund_adj:.2f}, pre-market RS {rs_pre:+.2f}, {rs_label})"
         )
 
     atr_raw = ta.get("atr14", 0) or ta.get("atr", 0)
@@ -2780,7 +2794,7 @@ def revalidate_candidate(candidate: dict) -> tuple[str, dict | None, str]:
     return "ok", fresh, (
         f"revalidated: composite {candidate.get('composite', 0):.2f} → {composite:.2f} "
         f"(ta {ta_score:.1f}, fund {fund_score:.1f} × conf {candidate.get('confidence', 50):.0f}% "
-        f"= {fund_adj:.2f}, {rs_label}{vwap_note})"
+        f"= {fund_adj:.2f}, pre-market RS {rs_pre:+.2f}, {rs_label}{vwap_note})"
     )
 
 def refresh_cache_ta():
