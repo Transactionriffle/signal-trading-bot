@@ -8,8 +8,9 @@ Architecture:
     → Every ticker gets a fundamentals call (TA pre-filter removed Sep 30 2026)
     → Run fundamental scan (Claude + web search) on surviving tickers
     → Hard vetoes applied before scoring: ETF/leveraged-product,
-      SPAC/blank-check, general structural-risk (recent IPO, pending
-      M&A, reverse split, halted, thin ADR), earnings within 3 days
+      SPAC/blank-check, general structural-risk (recent IPO, reverse
+      split, halted, thin ADR — pending M&A removed Oct 4 2026), earnings
+      within 3 days
     → Cache ranked BUY list (composite >= MIN_COMPOSITE, confidence
       folded into composite) with scores; persisted to disk so a mid-day
       redeploy doesn't trigger a wasted re-scan
@@ -148,7 +149,8 @@ STOP_LOSS       = -0.05    # -5%   hard stop ceiling (before breakeven activates
 
 # ── Strong-catalyst sizing and stop tolerance (Sep 29 2026) ────────
 # A trade that qualified on a real, recent, positive catalyst (trial
-# data, confirmed M&A, a hard beat-and-raise, a major contract) is a
+# data, a hard beat-and-raise, a major contract, or being the TARGET of a
+# confirmed acquisition — M&A for the buyer does not count, Oct 4 2026) is a
 # different kind of conviction from one that scraped past the gate on
 # routine financials. Those get two things together: more capital, and
 # more room to be wrong before being cut — a paired bet that a genuine
@@ -1633,16 +1635,18 @@ def fetch_fundamental(symbol: str, ta: dict) -> dict | None:
             "itself should push fundScore higher. "
             "Separately, search specifically for any news, catalyst, or "
             "event affecting this stock TODAY or in the past 3 days — "
-            "trial/data results, analyst upgrades/downgrades or price-target "
-            "changes, competitor news with a read-through to this stock, "
-            "product launches, M&A, or regulatory developments. If you find "
+            "trial/data results, regulatory approvals (e.g. FDA approval of a "
+            "new drug), major customer contracts, product launches, analyst "
+            "upgrades/downgrades or price-target changes, competitor news with "
+            "a read-through to this stock, M&A, or other regulatory "
+            "developments. If you find "
             "one, factor its direction and magnitude into fundScore "
             "explicitly, weighting it MORE heavily than the revenue-trend "
             "and earnings-date factors above — it is the dominant input to "
             "this score, not an equal one. "
             "Weigh both the bull case AND the bear case before scoring. "
             "Respond with ONLY a single JSON object, no other text before or "
-            "after it, with exactly these five keys: "
+            "after it, with exactly these six keys: "
             "fundSignal — a string, one of BUY, SELL, or HOLD. "
             "fundScore — a number from -10 to +10. Weight a recent catalyst "
             "most heavily; the revenue-growth trend, P/E, and earnings-call "
@@ -1656,12 +1660,40 @@ def fetch_fundamental(symbol: str, ta: dict) -> dict | None:
             "revenue growth %, P/E, or earnings date you found. "
             "catalystStrength — a number from 0 to 10 rating ONLY the "
             "strength of a POSITIVE catalyst found today or in the past 3 "
-            "days: 8-10 for a hard, verifiable, material event (trial or data "
-            "readout, confirmed M&A, earnings beat with raised guidance, major "
-            "contract); 4-7 for a real but softer one (an analyst upgrade or "
-            "price-target raise, a product launch, a competitor read-through); "
-            "0 if you found no catalyst, only routine news, or only negative "
-            "news. "
+            # Oct 4 2026: catalyst types spelled out on request. Hard,
+            # verifiable, company-changing events score 8-10; analyst actions
+            # are capped at 5 (on request) — never "strong" (7+), so an upgrade
+            # alone never triggers the larger size and wider stop; ordinary
+            # launches 4-6.
+            "days. Score 8-10 for a hard, verifiable, material event: "
+            "(a) REGULATORY APPROVAL — for a biotech or pharmaceutical company, "
+            "FDA (or equivalent) approval of a new drug; "
+            "(b) MAJOR CUSTOMER CONTRACT — a massive, multi-year contract with "
+            "a flagship customer, such as a large defense contract or a major "
+            "cloud-computing deal; "
+            "(c) BREAKTHROUGH PRODUCT LAUNCH — a highly anticipated product or "
+            "technology that disrupts its industry or significantly opens a new "
+            "total addressable market (TAM); "
+            "(d) a trial or data readout, an earnings beat with raised guidance, "
+            "or a confirmed deal for THIS company to be acquired. "
+            "Score at most 5 for an ANALYST UPGRADE — a prominent Wall Street "
+            "firm upgrading the stock from Hold (or equivalent) to Buy, or "
+            "significantly raising its price target; never score an analyst "
+            "action above 5, and use 0-3 for routine notes or small target "
+            "tweaks. "
+            "Score 4-6 for an ordinary product launch or a competitor "
+            "read-through. Score 0 if you found no catalyst, only routine news, "
+            "or only negative news. "
+            # Oct 4 2026: M&A re-added as a catalyst ONLY when this company is
+            # the acquisition TARGET (where the takeover premium lands); an
+            # acquirer gets no credit, since its shares often fall on the news.
+            # (Oct 2 had removed M&A entirely; the structural check no longer
+            # vetoes targets either, so a confirmed target can now be bought.)
+            "M&A counts toward catalystStrength ONLY if THIS company is the one "
+            "being acquired (the target); if this company is the buyer/acquirer, "
+            "rate that M&A news 0. "
+            "earningsDate — the date of this company's next earnings call as a "
+            "string in YYYY-MM-DD format, or null if you could not find it. "
             # Sep 25 2026 fix: even at max_tokens=800, TSM got cut off mid-
             # research — Claude narrated "I need to search for more specific
             # recent news..." as a text block and never returned to finish
@@ -1715,56 +1747,74 @@ def fetch_fundamental(symbol: str, ta: dict) -> dict | None:
             result["catalystStrength"] = max(0, min(10, float(result.get("catalystStrength", 0) or 0)))
         except (TypeError, ValueError):
             result["catalystStrength"] = 0.0   # malformed field → treat as no catalyst, never as strong
+        # Oct 2 2026: next earnings date now comes from this same call (the
+        # prompt already asked Claude to find it) instead of a separate
+        # Haiku + web-search lookup per ticker. Invalid/missing → None.
+        ed = result.get("earningsDate")
+        try:
+            result["earningsDate"] = datetime.strptime(str(ed)[:10], "%Y-%m-%d").strftime("%Y-%m-%d") if ed else None
+        except ValueError:
+            result["earningsDate"] = None
         fund_cache[symbol]   = (time.time(), result)
         return result
     except Exception as e:
         log.warning(f"Fundamental fetch failed for {symbol}: {e}")
         return None
 
-def check_earnings_proximity(symbol: str, today: str) -> tuple[bool, str]:
-    """
-    Checks if a ticker has earnings within 3 days using Claude web search.
-    Returns (has_earnings_soon, earnings_date_or_empty).
-    Uses a separate lightweight cache to avoid repeated checks.
-    """
-    # Lightweight earnings cache — 24 hours
-    cache_key = f"earnings_{symbol}"
-    if cache_key in fund_cache:
-        cached_time, cached_result = fund_cache[cache_key]
-        if time.time() - cached_time < 86400:
-            return cached_result
-
-    try:
-        prompt = (
-            f"Does {symbol} have earnings announcement within the next 3 days from {today}? "
-            "Return ONLY this JSON with NO other text: "
-            '{"earnings_within_3_days":false,"earnings_date":null} '
-            "Set earnings_within_3_days to true only if earnings are confirmed within 3 calendar days."
-        )
-        response = safe_claude_call(
-            purpose=f"earnings:{symbol}",
-            model=LOOKUP_MODEL,
-            # Sep 30 2026: 60 → 400. With web search, 60 tokens barely fits
-            # the JSON on its own, let alone a sentence before it. Cap only.
-            max_tokens=400,
-            tools=[{"type": "web_search_20250305", "name": "web_search"}],
-            messages=[{"role": "user", "content": prompt}],
-        )
-        result = extract_json_response(response, symbol, "Earnings check")
-        if result is None:
-            # Sep 30 2026: a failed parse used to be CACHED as "no earnings"
-            # for 24h — failing open silently for a whole day. Still fails
-            # open for this one call (blocking every ticker on a parse error
-            # would halt trading), but is no longer cached, so the next scan
-            # retries instead of trusting a non-answer.
-            return False, ""
-        has_earnings = bool(result.get("earnings_within_3_days", False))
-        earnings_date = result.get("earnings_date") or ""
-        fund_cache[cache_key] = (time.time(), (has_earnings, earnings_date))
-        return has_earnings, earnings_date
-    except Exception as e:
-        log.warning(f"Earnings check failed for {symbol}: {e}")
+def earnings_within_3_days(fund: dict) -> tuple[bool, str]:
+    """Oct 2 2026: replaces check_earnings_proximity(), which ran a separate
+    Haiku + web-search call per ticker to find a date the fundamentals call
+    had already been asked for. Same rule as before: block if the next
+    earnings call is today or within the next 3 calendar days. A missing or
+    unreadable date fails open, exactly as the old lookup did."""
+    ed = fund.get("earningsDate")
+    if not ed:
         return False, ""
+    try:
+        days = (datetime.strptime(ed, "%Y-%m-%d").date() - datetime.now(ET).date()).days
+    except ValueError:
+        return False, ""
+    return (0 <= days <= 3), ed
+
+# Oct 2 2026 — structural-risk results now live in their own cache, saved
+# to disk, instead of fund_cache (which is wiped at the start of every
+# pre-market scan, so the old 24h TTL was really "once per scan"). SPAC
+# status, IPO date, splits, ADR liquidity change rarely; at ~6 searches and
+# ~40K input tokens per ticker this check cost more than the fundamentals
+# call. A CLEAN result is reused for 7 days; a FLAGGED result for only 1
+# day, so a false flag (AMD/CRWD-style) is re-checked tomorrow instead of
+# blocking the ticker for a week. Failed parses are never cached.
+STRUCTURAL_CACHE_FILE = "/tmp/structural_cache_v2.json"   # v2 (Oct 4 2026): fresh start — v1 held M&A-based flags
+STRUCTURAL_TTL_CLEAN   = 7 * 86400
+STRUCTURAL_TTL_FLAGGED = 1 * 86400
+structural_cache: dict = {}   # {symbol: [epoch, has_risk, reason]}
+
+def load_structural_cache():
+    global structural_cache
+    try:
+        with open(STRUCTURAL_CACHE_FILE) as f:
+            structural_cache = json.load(f)
+        log.info(f"Restored structural-risk cache for {len(structural_cache)} ticker(s)")
+    except FileNotFoundError:
+        structural_cache = {}
+    except Exception as e:
+        log.warning(f"Failed to load structural cache: {e}"); structural_cache = {}
+
+def save_structural_cache():
+    try:
+        with open(STRUCTURAL_CACHE_FILE, "w") as f:
+            json.dump(structural_cache, f)
+    except Exception as e:
+        log.warning(f"Failed to save structural cache: {e}")
+
+def cached_structural(symbol: str):
+    """(has_risk, reason) if a still-valid cached result exists, else None."""
+    hit = structural_cache.get(symbol)
+    if not hit:
+        return None
+    ts, has_risk, reason = hit
+    ttl = STRUCTURAL_TTL_FLAGGED if has_risk else STRUCTURAL_TTL_CLEAN
+    return (has_risk, reason) if time.time() - ts < ttl else None
 
 def check_structural_risk(symbol: str, today: str) -> tuple[bool, str]:
     """
@@ -1777,24 +1827,24 @@ def check_structural_risk(symbol: str, today: str) -> tuple[bool, str]:
     blend. The SPAC name-check (is_likely_spac) fixed that ONE case, but
     the same failure mode applies to a wider category: any instrument
     where price action is decoupled from normal operating fundamentals
-    (recent IPO with thin float, pending/announced M&A trading on deal
-    odds, reverse stock split, recently halted, SPAC unit/right/warrant,
+    (recent IPO with thin float, reverse stock split, recently halted,
+    SPAC unit/right/warrant,
     thinly-traded ADR). Rather than add a new special-case filter each
     time one of these bites, this asks Claude directly and treats any
     "yes" as a hard veto — independent of composite score, same pattern
     as check_earnings_proximity but for structural rather than timing risk.
 
     Returns (has_structural_risk, reason).
-    Cached 24h per symbol — same TTL as the earnings check.
+    Cached 7 days when clean, 1 day when flagged (see structural_cache).
     """
-    # Oct 2 2026: criterion (3) now explicitly excludes the BUYER in a deal.
-    # Haiku had been blocking acquirers (AMD — World Labs, CRWD — SGNL) as if
-    # they were takeover targets; only a target trades on deal odds.
-    cache_key = f"structural_risk_{symbol}"
-    if cache_key in fund_cache:
-        cached_time, cached_result = fund_cache[cache_key]
-        if time.time() - cached_time < 86400:
-            return cached_result
+    # Oct 4 2026: the pending-M&A criterion is REMOVED on request (it had been
+    # narrowed to targets-only on Oct 2 after Haiku blocked acquirers like AMD
+    # and CRWD). A takeover target is no longer vetoed. Known trade-off: after
+    # an announcement a target usually trades just under the offer price —
+    # small capped upside, and a sharp drop if the deal breaks.
+    hit = cached_structural(symbol)
+    if hit is not None:
+        return hit
 
     try:
         prompt = (
@@ -1802,13 +1852,11 @@ def check_structural_risk(symbol: str, today: str) -> tuple[bool, str]:
             "reason its current price may NOT reflect normal business fundamentals? "
             "Specifically check: (1) is it a SPAC, blank-check company, or a SPAC "
             "unit/right/warrant; (2) did it IPO within the last 180 days with a very "
-            "small public float; (3) is THIS company the TARGET being acquired in an "
-            "announced-but-not-closed M&A deal, so its price trades on deal-completion "
-            "odds rather than fundamentals — if this company is the BUYER/acquirer in "
-            "a deal, that does NOT count as structural risk and must not be flagged; "
-            "(4) did it recently do a reverse stock split; (5) was "
-            "trading recently halted for volatility (LULD circuit breaker); (6) is it "
-            "a thinly-traded foreign ADR with very low US daily volume. "
+            "small public float; (3) did it recently do a reverse stock split; (4) was "
+            "trading recently halted for volatility (LULD circuit breaker); (5) is it "
+            "a thinly-traded foreign ADR with very low US daily volume. Mergers and "
+            "acquisitions are NOT structural risk here, whether this company is the "
+            "buyer or the target — do not flag them. "
             # Oct 1 2026: Haiku ignored the old "Return ONLY this JSON" line —
             # after searching it wrote a long point-by-point analysis of all
             # six criteria and hit the token cap on ~20 large caps before
@@ -1831,12 +1879,13 @@ def check_structural_risk(symbol: str, today: str) -> tuple[bool, str]:
         )
         result = extract_json_response(response, symbol, "Structural risk check")
         if result is None:
-            return False, ""   # not cached — see the earnings check note
+            return False, ""   # failed parse — fail open for this call, not cached
         has_risk = bool(result.get("structural_risk", False))
         reason   = result.get("reason") or ""
         if has_risk:
             log.warning(f"  {symbol}: structural risk flagged — {reason} — blocking")
-        fund_cache[cache_key] = (time.time(), (has_risk, reason))
+        structural_cache[symbol] = [time.time(), has_risk, reason]
+        save_structural_cache()
         return has_risk, reason
     except Exception as e:
         log.warning(f"Structural risk check failed for {symbol}: {e}")
@@ -1960,10 +2009,11 @@ def compute_signal(symbol: str, spy_chg: float = 0.0, prefetched_ta: dict | None
     if not fund:
         return None   # no fundamentals answer → nothing to score
 
-    # Structural risk + earnings proximity: both always run now (cached 24h),
+    # Structural risk + earnings proximity: both always run now (structural
+    # cached 7 days if clean / 1 day if flagged; earnings read from `fund`),
     # and are recorded on the result instead of stopping the scoring early.
     has_structural_risk, risk_reason = check_structural_risk(symbol, today_str)
-    has_earnings, earnings_date      = check_earnings_proximity(symbol, today_str)
+    has_earnings, earnings_date      = earnings_within_3_days(fund)
     blocks = []
     if has_structural_risk:
         blocks.append(f"structural risk ({risk_reason or 'unspecified'})")
@@ -2235,6 +2285,7 @@ def run_premarket_scan():
 
         result = compute_signal(symbol, spy_chg, prefetched_ta=ta)
         log_scored_ticker(symbol, result)
+        quick_exit_check()   # Oct 2 2026: keep managing open positions during a mid-session scan
         if result:
             all_scored.append(result)
             if passes_gates(result):
@@ -2905,9 +2956,9 @@ def place_buy(symbol: str, qty: int, composite: float | None = None,
         # cycle and cached the result (24h TTL) — re-check the cache here
         # as a defense-in-depth backstop without paying for a second
         # Claude+web-search call per trade.
-        cached = fund_cache.get(f"structural_risk_{symbol}")
-        if cached and cached[1][0]:
-            log.warning(f"[SKIP] {symbol} structural risk ({cached[1][1]}) — blocked at buy time")
+        cached = cached_structural(symbol)
+        if cached and cached[0]:
+            log.warning(f"[SKIP] {symbol} structural risk ({cached[1]}) — blocked at buy time")
             return False
 
         # ── Durable composite storage (Aug 24 fix) ──────────────
@@ -3200,7 +3251,54 @@ def check_stale_holds(positions: dict) -> list[str]:
 
     return closed
 
-def check_profit_targets(positions: dict) -> list[str]:
+FAST_EXIT_INTERVAL = 10          # seconds between lightweight exit checks (Oct 2 2026)
+_last_fast_check: float = 0.0
+_mkt_open_cache: list = [0.0, False]   # [epoch, is_open] — avoids a clock API call every 10s
+
+def _market_open_cached() -> bool:
+    if time.time() - _mkt_open_cache[0] > 60:
+        _mkt_open_cache[0] = time.time(); _mkt_open_cache[1] = is_market_open()
+    return _mkt_open_cache[1]
+
+def quick_exit_check():
+    """
+    Oct 2 2026. Price-only exit check on open positions — no Claude calls.
+    Root causes: (1) exits were evaluated once per 60s cycle, so KOD on
+    Sep 29 slid from +1.02% to +0.12% past its +0.86% trail floor between
+    two checks; (2) mid-session rescans are synchronous and ran ~13-14 min
+    with NO exit checks at all. Called every FAST_EXIT_INTERVAL seconds
+    while the main loop waits, and between tickers during any scan/rescan.
+    Everything runs on the main thread, so there is no risk of two threads
+    selling the same position. Throttled to once per FAST_EXIT_INTERVAL.
+    """
+    global _last_fast_check
+    if time.time() - _last_fast_check < FAST_EXIT_INTERVAL:
+        return
+    _last_fast_check = time.time()
+    try:
+        if not _market_open_cached():
+            return
+        positions = get_positions()
+        if not positions:
+            return
+        closed = check_profit_targets(positions, quiet=True)
+        if closed:
+            held_symbols.difference_update(closed)
+    except Exception as e:
+        log.warning(f"Quick exit check failed: {e}")
+
+def fast_exit_wait(total_seconds: float):
+    """Replaces the plain sleep at the end of each market-hours cycle:
+    waits the same total time, running quick_exit_check() every 10s."""
+    end = time.time() + total_seconds
+    while True:
+        remaining = end - time.time()
+        if remaining <= 0:
+            return
+        time.sleep(min(FAST_EXIT_INTERVAL, remaining))
+        quick_exit_check()
+
+def check_profit_targets(positions: dict, quiet: bool = False) -> list[str]:
     """
     Exit rules — no Claude calls needed.
     Priority order (first match wins):
@@ -3273,7 +3371,8 @@ def check_profit_targets(positions: dict) -> list[str]:
     )
     overnight_symbols = [sym for sym, pos in ordered_positions if _is_overnight_hold(pos)]
     if overnight_symbols:
-        log.info(f"  Overnight-held positions checked first this cycle: {overnight_symbols}")
+        if not quiet:
+            log.info(f"  Overnight-held positions checked first this cycle: {overnight_symbols}")
 
     for symbol, pos in ordered_positions:
         try:
@@ -3452,7 +3551,8 @@ def check_profit_targets(positions: dict) -> list[str]:
                     signal_cache = [s for s in signal_cache if s["symbol"] != symbol]
             else:
                 peak_str = f" (peak: {current_peak*100:+.2f}%)" if current_peak >= PEAK_TRIGGER else ""
-                log.info(f"  {symbol}: {pnl_pct*100:+.2f}% P&L{peak_str} — holding")
+                if not quiet:   # the 10s quick checks stay silent unless something happens
+                    log.info(f"  {symbol}: {pnl_pct*100:+.2f}% P&L{peak_str} — holding")
 
         except Exception as e:
             log.warning(f"  Error checking {symbol}: {e}")
@@ -3515,14 +3615,13 @@ def deploy_from_cache(positions: dict, account):
             for symbol in universe:
                 if symbol in positions:
                     continue
-                # Sep 30 2026: TA pre-filter removed here too (same change as
-                # run_premarket_scan). Note: this rescan runs mid-session and
-                # is synchronous — scoring the full universe takes ~13-14 min
-                # (Aug 24 saw 7+ min for ~40 tickers under an older, lighter
-                # prompt), during which no exits are checked.
+                # Sep 30 2026: TA pre-filter removed here too. This rescan is
+                # synchronous (~13-14 min for the full universe); since Oct 2
+                # 2026 open positions get a quick exit check between tickers.
                 ta = fetch_technicals(symbol)
                 result = compute_signal(symbol, spy_chg, prefetched_ta=ta)
                 log_scored_ticker(symbol, result)
+                quick_exit_check()
                 if passes_gates(result):
                     new_signals.append(result)
                 time.sleep(3)
@@ -3732,6 +3831,7 @@ def run():
     load_peaks()
     load_cooldowns()     # restore stop-loss/profit cooldowns after restart
     load_entry_signals()  # restore entry snapshots for signal-attribution analysis
+    load_structural_cache()  # 7-day structural-risk results (Oct 2 2026)
     load_scan_state()     # restore today's scan cache — prevents a redeploy from
                            # triggering a wasted re-scan if one already ran today
     # (early-hold tight floor no longer needs separate persisted state —
@@ -3750,12 +3850,13 @@ def run():
     log.info(f"  Re-entry rules: +60% ceiling exit → 4hr cooldown + 2% price gate")
     log.info(f"                  stop loss → 24hr cooldown + 2% price gate (escalating strikes)")
     log.info(f"  Max positions:  10 concurrent")
+    log.info(f"  Exit checks:    every {FAST_EXIT_INTERVAL}s between 60s cycles, and between tickers during scans/rescans")
     log.info(f"  Hard ceiling:   +{HARD_SELL_CEILING*100:.0f}% (sell immediately)")
     log.info(f"  Trail tiers:    " + " | ".join(f"peak>={t*100:g}%→{g*100:g}% behind" for t, g in DYNAMIC_TRAIL_TABLE))
     log.info(f"  Fixed trail:    peak >={PEAK_TRIGGER*100:.1f}% → sell at +{TRAIL_SELL*100:.1f}% (backstop)")
     log.info(f"  Breakeven:      calm(VIX<{CALM_VIX_THRESHOLD}) peak>={BREAKEVEN_TRIGGER_CALM*100:.0f}%→lock+{BREAKEVEN_STOP_CALM*100:.0f}% | else peak>={BREAKEVEN_TRIGGER*100:.0f}%→lock+{BREAKEVEN_STOP*100:.1f}%")
     log.info(f"  TA/Fund weight: {TECH_WEIGHT}% / {FUND_WEIGHT}%")
-    log.info(f"  Claude models:  fundamentals={FUNDAMENTALS_MODEL} | earnings/structural/probe={LOOKUP_MODEL}")
+    log.info(f"  Claude models:  fundamentals={FUNDAMENTALS_MODEL} (incl. earnings date) | structural/probe={LOOKUP_MODEL}")
     log.info(f"  Confidence:     folded into composite (fundScore × confidence/100) — no separate gate")
     log.info(f"  Min composite:  {MIN_COMPOSITE}")
     log.info(f"  Stop loss:      tiered by entry composite — <4.5: -3% | 4.5-6.0: -4% | 6.0+: -5% (BEAR: -2%), only loss-side rule")
@@ -3941,7 +4042,7 @@ def run():
         except Exception as e:
             log.error(f"Unexpected error: {e}", exc_info=True)
 
-        time.sleep(SCAN_INTERVAL)
+        fast_exit_wait(SCAN_INTERVAL)   # Oct 2 2026: exits checked every 10s between full cycles
 
 
 if __name__ == "__main__":
