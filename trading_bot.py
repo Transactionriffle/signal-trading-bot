@@ -123,6 +123,7 @@ FUND_WEIGHT     = 100 - TECH_WEIGHT
 # marginal (3.0-4.0) entry was negative expected value at that risk/reward.
 # Raising the floor cuts trade count but concentrates capital in the
 # higher-conviction setups the composite score is actually meant to find.
+MIN_FUND_SCORE  = float(os.environ.get("MIN_FUND_SCORE", "5.2"))  # Oct 7 2026: raw fundScore floor (before the confidence discount) on every entry path — V was bought Oct 6 on fund 2.3 carried by TA
 MIN_COMPOSITE   = float(os.environ.get("MIN_COMPOSITE", "3.4"))  # Oct 1 2026: 4.0 → 3.4 (Sonnet 5.5 scores more conservatively; best Oct 1 composites were 3.84-3.94)
 MAX_TRADES_DAY  = int(os.environ.get("MAX_TRADES_PER_DAY", "10"))
 MAX_DRAWDOWN    = float(os.environ.get("MAX_DRAWDOWN_PCT", "0.15"))
@@ -204,6 +205,13 @@ def confidence_adjusted_fund(fund_score: float, confidence: float) -> float:
     return fund_score * max(0.0, min(100.0, confidence)) / 100.0
 OVERNIGHT_OPEN_GRACE_MINUTES = 5   # overnight holds: stop-type exits wait until 9:35 unless loss > 2× tier
 MIDDAY_TA_REFRESH_ET = (12, 0)     # one TA-only re-validation of the whole cache; set to None to disable
+# Oct 7 2026: EOD PROFIT LOCK (narrower than the removed Sep 21 version).
+# From 15:58 ET until the 16:00 close, any position whose TOTAL unrealised
+# P&L (unrealized_plpc, not intraday) is above +0.5% is sold. Positions at
+# or below +0.5% (including losers) still hold overnight under normal rules.
+EOD_PROFIT_LOCK_ET  = (15, 58)
+EOD_PROFIT_LOCK_MIN = 0.005        # +0.5%
+MARKET_CLOSE_ET     = (16, 0)
 # Sep 24 2026: EOD profit lock REMOVED (was added Sep 21, forced-closed any
 # still-profitable position from 15:55 ET to the close). Removed on request
 # — winners may hold overnight again. The trade-off this reintroduces: a
@@ -1938,6 +1946,7 @@ def passes_gates(result: dict | None) -> bool:
         result
         and result["signal"] == "BUY"
         and result["composite"] >= MIN_COMPOSITE
+        and float(result.get("fundScore", 0) or 0) >= MIN_FUND_SCORE
         and not result.get("blocked_reason")
     )
 
@@ -1954,6 +1963,8 @@ def log_scored_ticker(symbol: str, result: dict | None):
         reasons.append(f"signal {result['signal']}")
     if result["composite"] < MIN_COMPOSITE:
         reasons.append(f"composite < {MIN_COMPOSITE}")
+    if float(result.get("fundScore", 0) or 0) < MIN_FUND_SCORE:
+        reasons.append(f"fund < {MIN_FUND_SCORE}")
     if result.get("blocked_reason"):
         reasons.append("BLOCKED by " + result["blocked_reason"])
     verdict = "QUALIFIES" if not reasons else "fails: " + ", ".join(reasons)
@@ -2297,46 +2308,10 @@ def run_premarket_scan():
                 )
         time.sleep(3)   # Tier 1 = 50 RPM (1 req/1.2s min). sleep(3) = 4x safety margin. Was 20s.
 
-    # ── Sector diversity — own floor, not a full bypass (Sep 16 2026) ──
-    # History: originally bypassed both gates entirely (composite >= 1.5,
-    # no confidence check) — Sep 11 log showed CVX (5.10 composite / 78%
-    # confidence) and BAC (3.90 / 75%) both added while MIN_CONFIDENCE was
-    # 85%. That got fully disabled on Sep 11 (visibility-only — never
-    # added anything). CVX went on to close +0.22% as a DYNAMIC_TRAIL win,
-    # but one winning trade at 78% confidence doesn't validate skipping
-    # confidence checks entirely — the trades that would have failed
-    # below the old 75% floor were never observed, so the full-bypass
-    # era can't be judged as "working" from a single visible outcome.
-    # Landing here deliberately: a real but LOWER bar for diversity picks
-    # than a normal entry (85%/4.0) — DIVERSITY_MIN_CONFIDENCE (75%) and
-    # DIVERSITY_MIN_COMPOSITE (1.5) — so a sector gap can still be filled,
-    # but never with a trade Claude scored as a coin flip.
-    DIVERSITY_MIN_COMPOSITE  = 1.5  # unchanged from the original diversity floor
-    DIVERSITY_SECTORS = ["financials", "healthcare", "energy", "industrials", "consumer"]
-    cached_sectors = {SECTOR_MAP.get(c["symbol"]) for c in candidates}
-
-    for sector in DIVERSITY_SECTORS:
-        if sector not in cached_sectors:
-            sector_best = sorted(
-                [r for r in all_scored if SECTOR_MAP.get(r["symbol"]) == sector
-                 and r["signal"] != "SELL" and not r.get("blocked_reason")],
-                key=lambda x: x["composite"], reverse=True
-            )
-            if sector_best:
-                best = sector_best[0]
-                if best["composite"] >= DIVERSITY_MIN_COMPOSITE:
-                    candidates.append(best)
-                    log.info(
-                        f"  📊 DIVERSITY {best['symbol']} ({sector}): composite={best['composite']:.2f}, "
-                        f"confidence={best['confidence']}% — added for sector diversity "
-                        f"(diversity floor: composite {DIVERSITY_MIN_COMPOSITE})"
-                    )
-                else:
-                    log.info(
-                        f"  📊 {sector}: no qualifying signal — best was {best['symbol']} "
-                        f"composite={best['composite']:.2f}, confidence={best['confidence']}% "
-                        f"(diversity floor: composite {DIVERSITY_MIN_COMPOSITE}, normal gate: {MIN_COMPOSITE}) — NOT added"
-                    )
+    # Oct 7 2026: sector-diversity rule REMOVED on request. It added the best
+    # name in any uncovered sector at a 1.5 composite floor (V and GEV on
+    # Oct 6), letting weak-fundamentals names into the cache. Only names that
+    # pass every gate are cached now.
 
     candidates.sort(key=lambda x: x["composite"], reverse=True)
     signal_cache      = candidates
@@ -2584,7 +2559,7 @@ def register_reentry_cooldown(symbol: str, exit_reason: str, exit_price: float):
     global signal_cache
     signal_cache = [s for s in signal_cache if s["symbol"] != symbol]
 
-    if "HARD_CEILING" in exit_reason or "PROFIT_TARGET" in exit_reason:
+    if "HARD_CEILING" in exit_reason or "PROFIT_TARGET" in exit_reason or "EOD_PROFIT_LOCK" in exit_reason:
         reentry_cooldown[symbol] = {
             "type":       "profit",
             "time":       now,
@@ -2713,6 +2688,24 @@ def is_overnight_hold(pos) -> bool:
     except (AttributeError, TypeError, ValueError):
         return False
 
+def in_eod_profit_window() -> bool:
+    """True from EOD_PROFIT_LOCK_ET (15:58) up to the 16:00 ET close."""
+    n = datetime.now(ET)
+    mins = n.hour * 60 + n.minute
+    return (EOD_PROFIT_LOCK_ET[0] * 60 + EOD_PROFIT_LOCK_ET[1]) <= mins < (MARKET_CLOSE_ET[0] * 60 + MARKET_CLOSE_ET[1])
+
+def in_regular_session_clock() -> bool:
+    """Wall-clock check (ET, weekdays) for 9:30 <= now < 16:00. Used as a hard
+    guard on exit orders: the cached Alpaca clock can still say 'open' for up
+    to 60s after the bell (Oct 7: AMD trail fired at 16:00:15 and a market
+    sell was queued for the next open). Early-close days are still covered
+    by the Alpaca clock check that runs alongside this one."""
+    n = datetime.now(ET)
+    if n.weekday() >= 5:
+        return False
+    mins = n.hour * 60 + n.minute
+    return (9 * 60 + 30) <= mins < (MARKET_CLOSE_ET[0] * 60 + MARKET_CLOSE_ET[1])
+
 def in_opening_grace() -> bool:
     """True during the first OVERNIGHT_OPEN_GRACE_MINUTES after 9:30 ET."""
     n = datetime.now(ET)
@@ -2813,6 +2806,8 @@ def revalidate_candidate(candidate: dict) -> tuple[str, dict | None, str]:
         live_price = ta.get("price", candidate.get("price", 0))
 
     fund_score = candidate.get("fundScore", 0)
+    if float(fund_score or 0) < MIN_FUND_SCORE:
+        return "drop", None, f"fund score {float(fund_score or 0):.1f} < {MIN_FUND_SCORE} minimum"
     fund_adj   = confidence_adjusted_fund(fund_score, candidate.get("confidence", 50))
     # Oct 2 2026: the pre-market relative-strength bonus/penalty from the scan
     # (±1.5, vs yesterday's close) is now KEPT at buy time, added to the live
@@ -3324,6 +3319,10 @@ def check_profit_targets(positions: dict, quiet: bool = False) -> list[str]:
          If position is negative → hold (don't crystallise a loss).
     """
     closed      = []
+    if not in_regular_session_clock():
+        # Never send exit orders outside 9:30-16:00 ET — they would queue
+        # as market orders for the next open (see in_regular_session_clock).
+        return closed
     base_stop   = get_stop_loss()   # -5% normal, -2% in BEAR mode — the ceiling
     global signal_cache  # declared once here — was previously declared twice, nested
                           # inside conditional blocks below, which is a SyntaxError in
@@ -3523,6 +3522,15 @@ def check_profit_targets(positions: dict, quiet: bool = False) -> list[str]:
                             f"  {symbol}: sector '{sector}' weak but "
                             f"P&L {pnl_pct*100:+.2f}% below breakeven — holding"
                         )
+
+            # ── EOD profit lock (Oct 7 2026) ───────────────────
+            # 15:58-16:00 ET: sell anything with total unrealised P&L
+            # above +0.5% rather than carry it overnight.
+            if not reason and in_eod_profit_window() and pnl_pct > EOD_PROFIT_LOCK_MIN:
+                reason = (
+                    f"EOD_PROFIT_LOCK ({pnl_pct*100:+.2f}% > +{EOD_PROFIT_LOCK_MIN*100:.1f}% "
+                    f"at {EOD_PROFIT_LOCK_ET[0]}:{EOD_PROFIT_LOCK_ET[1]:02d} ET)"
+                )
 
             # ── Opening-print grace for OVERNIGHT holds (Sep 11 2026) ──
             # Not the 30-min grace on fresh entries (removed). This is the
@@ -3862,13 +3870,14 @@ def run():
     log.info(f"  Stop loss:      tiered by entry composite — <4.5: -3% | 4.5-6.0: -4% | 6.0+: -5% (BEAR: -2%), only loss-side rule")
     log.info(f"  Entry window:   {FIRST_ENTRY_ET[0]:02d}:{FIRST_ENTRY_ET[1]:02d}–{LAST_ENTRY_ET[0]:02d}:{LAST_ENTRY_ET[1]:02d} ET (opening range forms first; nothing new late)")
     log.info(f"  Deploy check:   {'live TA + intraday RS re-validation before every buy' if REVALIDATE_AT_DEPLOY else 'OFF — buying on scan-time numbers'}; RS capped ±{INTRADAY_RS_MAX}, above-open required: {REQUIRE_ABOVE_OPEN}, above-VWAP required: {REQUIRE_ABOVE_VWAP}")
+    log.info(f"  EOD profit lock: from {EOD_PROFIT_LOCK_ET[0]}:{EOD_PROFIT_LOCK_ET[1]:02d} ET, sell positions with total P&L > +{EOD_PROFIT_LOCK_MIN*100:.1f}%; no exit orders outside 9:30-16:00 ET")
     log.info(f"  Overnight grace: stop-type exits on overnight holds deferred {OVERNIGHT_OPEN_GRACE_MINUTES}min after the open (unless loss > 2× tier)")
     log.info(f"  Midday refresh: {'TA-only cache re-validation at %02d:%02d ET' % MIDDAY_TA_REFRESH_ET if MIDDAY_TA_REFRESH_ET else 'off'}")
     log.info(f"  Strong catalyst: catalystStrength>={STRONG_CATALYST_MIN}/10 → stop tier widened {CATALYST_STOP_LOOSEN*100:.0f}% (not in BEAR)")
     log.info(f"  Max drawdown:   {MAX_DRAWDOWN*100:.0f}%")
     log.info(f"  90-day audit:   Volume, TA alignment, win rate")
     log.info(f"  Held-position news review: bearish/material-adverse news on a HELD symbol re-runs fundamentals, can trigger early exit")
-    log.info(f"  Stale-hold check: fundamentals re-checked after {STALE_HOLD_HOURS}hr hold, max 1x/hr per symbol")
+    log.info(f"  Entry gates: composite ≥ {MIN_COMPOSITE}, fund score ≥ {MIN_FUND_SCORE}; no sector-diversity adds; no periodic stale-hold re-check")
     log.info(f"  Pause:          set PAUSED=true in Render")
     log.info("=" * 60)
 
@@ -3951,13 +3960,11 @@ def run():
             # Check exits
             closed = check_profit_targets(positions) if positions else []
 
-            # Re-check fundamentals on positions held beyond STALE_HOLD_HOURS
-            # (independent of news — catches slow-building deterioration that
-            # never crosses the news WebSocket's keyword filters)
-            if positions:
-                stale_closed = check_stale_holds(positions)
-                if stale_closed:
-                    closed.extend(stale_closed)
+            # Oct 7 2026: periodic stale-hold fundamentals re-check REMOVED on
+            # request (one Claude call per held name per hour; it only ever
+            # exited on an outright SELL). check_stale_holds() is left defined
+            # but no longer called. Bearish news on a held name still triggers
+            # a fundamentals review via the news path.
 
             if closed:
                 time.sleep(3)
