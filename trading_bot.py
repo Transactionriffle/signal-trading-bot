@@ -4,7 +4,7 @@ SIGNAL Trading Bot
 Architecture:
   Pre-market scan (Sunday 8pm ET, or dynamic ~9:20am ET weekdays):
     → Build up to 55-ticker universe (37 curated + up to 24 dynamic:
-      8 movers + 8 trade-count-active + 8 five-day-momentum)
+      8 movers + 8 trade-count ≥4,000 + 8 five-day-momentum, scored 9:31-9:35 ET)
     → Every ticker gets a fundamentals call (TA pre-filter removed Sep 30 2026)
     → Run fundamental scan (Claude + web search) on surviving tickers
     → Hard vetoes applied before scoring: ETF/leveraged-product,
@@ -184,6 +184,16 @@ LAST_ENTRY_ET   = (15, 30) # (hour, minute) ET — no new cache entries at or af
 # 4.2 gate) swung MU 5.90→4.40, AMD 5.50→4.00 on pre-market noise.
 # Fundamentals (60%) don't change intraday and stay pre-market; the
 # TA/RS 40% is now recomputed LIVE at the moment of deployment.
+# Oct 12 2026: two-stage morning scan.
+#   9:10 ET  — curated tickers, pre-market (unchanged timing; ~6-7 min)
+#   9:31 ET  — dynamic universe (movers / trade-count / momentum) built from
+#              regular-session data and scored, HARD deadline 9:35 ET
+SCAN_START_ET           = (9, 10)  # curated pre-market scan start
+SCAN_WINDOW_MINUTES     = 20       # curated scan may start 9:10-9:29 ET
+DYNAMIC_SCAN_ET         = (9, 31)  # dynamic-universe scan start
+DYNAMIC_SCAN_DEADLINE_ET = (9, 35) # stop scoring dynamic tickers at this time, whatever is left
+DYNAMIC_SCAN_CALL_MARGIN_SECS = 12  # no new ticker starts within 12s of the deadline
+MOST_ACTIVE_MIN_TRADES  = 4000     # Source 2 threshold (was 50,000 — never filled at scan time)
 FIRST_ENTRY_ET  = (9, 45)  # no new cache entries before this — let the opening range form
 REVALIDATE_AT_DEPLOY = True # re-fetch TA + intraday RS and re-test the gates before every buy
 INTRADAY_RS_MAX = 0.75      # RS measured vs today's OPEN (not prior close), capped ±0.75 — tilts, never decides
@@ -1635,10 +1645,23 @@ def fetch_fundamental(symbol: str, ta: dict) -> dict | None:
             f"Do not ask a clarifying question; this is a one-shot automated "
             f"call with no one able to answer follow-ups. "
             "Find the most recent figures AND the trend over the past 3 "
-            "quarters for revenue growth %, profit margin %, and P/E ratio "
+            "quarters for revenue growth % and profit margin % "
             "or any other relevant fundamentals — a positive trend should "
             "push fundScore higher, weighted by its magnitude; a negative "
-            "trend should push it lower the same way. Also find the date of "
+            "trend should push it lower the same way. "
+            # Oct 10 2026: valuation made explicit on request — LOWER P/E is
+            # better. Previously "P/E ratio" sat in the trend list with no
+            # definition or direction, and theses mixed trailing GAAP vs
+            # forward P/E day to day (ABBV ~18.7x vs ~124 on Oct 6/7).
+            "Also find the FORWARD P/E (next 12 months) and compare it with "
+            "this stock's own 5-year average forward P/E and its sector "
+            "median. The LOWER the P/E relative to those benchmarks, the "
+            "better: a P/E well below them pushes fundScore up, a P/E well "
+            "above them pushes it down, and a P/E near them leaves it "
+            "unchanged. Cap this valuation effect at about 1.5 points either "
+            "way so a catalyst still dominates. If forward P/E is not "
+            "meaningful (negative or no earnings), treat valuation as "
+            "neutral. Also find the date of "
             "this company's next earnings call — if it is today, that "
             "itself should push fundScore higher. "
             "Separately, search specifically for any news, catalyst, or "
@@ -1657,15 +1680,17 @@ def fetch_fundamental(symbol: str, ta: dict) -> dict | None:
             "after it, with exactly these six keys: "
             "fundSignal — a string, one of BUY, SELL, or HOLD. "
             "fundScore — a number from -10 to +10. Weight a recent catalyst "
-            "most heavily; the revenue-growth trend, P/E, and earnings-call "
-            "timing next; not a default or round number. "
+            "most heavily; the revenue-growth trend, forward P/E (lower is "
+            "better, capped at about 1.5 points), and earnings-call timing "
+            "next; not a default or round number. "
             "confidence — a number from 0 to 100. This must reflect how "
             "strong and clear the evidence behind the fundScore actually is "
             "— a clear catalyst plus supporting fundamentals data means high "
             "confidence; thin, mixed, stale, or conflicting information "
             "means lower confidence, even if fundScore itself is high. "
             "thesis — a one-sentence string citing the specific catalyst, "
-            "revenue growth %, P/E, or earnings date you found. "
+            "revenue growth %, forward P/E versus its 5-year average and "
+            "sector median, or earnings date you found. "
             "catalystStrength — a number from 0 to 10 rating ONLY the "
             "strength of a POSITIVE catalyst found today or in the past 3 "
             # Oct 4 2026: catalyst types spelled out on request. Hard,
@@ -2083,7 +2108,7 @@ def compute_signal(symbol: str, spy_chg: float = 0.0, prefetched_ta: dict | None
 # PRE-MARKET SCAN
 # ══════════════════════════════════════════════════════════════
 
-def build_universe() -> list[str]:
+def build_universe(dynamic_only: bool = False) -> list[str]:
     """
     Curated tickers + dynamic universe from 3 sources:
 
@@ -2103,6 +2128,7 @@ def build_universe() -> list[str]:
                tickers from a broader watchlist of $5B+ market cap stocks.
     """
     symbols = set(CURATED_TICKERS)
+    dynamic_order: list[str] = []   # Oct 12 2026: keeps curated first, then dynamic in source order
     added   = 0
     headers = {"APCA-API-KEY-ID": ALPACA_KEY, "APCA-API-SECRET-KEY": ALPACA_SECRET}
     DATA_URL = "https://data.alpaca.markets/v1beta1"
@@ -2121,21 +2147,24 @@ def build_universe() -> list[str]:
                 sym = g.get("symbol", "")
                 pct = g.get("percent_change", 0)
                 px  = g.get("price", 0)
+                # Oct 12 2026: min-3%-gain gate REMOVED on request — the
+                # fund/TA scoring decides; only the $15 penny filter stays.
                 if (sym.isalpha() and len(sym) <= 5
                         and sym not in ETF_EXCLUSIONS
                         and sym not in symbols
                         and px >= 15           # no penny stocks
-                        and pct >= 3.0         # min 3% gain — filters penny stock noise
                         and added < 8):
                     symbols.add(sym)
+                    dynamic_order.append(sym)
                     added += 1
             log.info(f"  Source 1 (movers): {added} tickers added")
     except Exception as e:
         log.warning(f"Movers fetch failed: {e}")
 
     # ── Source 2: Most active by TRADE COUNT ───────────────────
-    # Trade count = institutional interest proxy (many orders = algos/funds)
-    # Much better than volume for quality screening
+    # Oct 12 2026: re-added at MOST_ACTIVE_MIN_TRADES = 4,000 (was 50,000,
+    # which almost never filled — at 9:31 even AAPL had ~22k trades). Price
+    # check now one batched snapshot call instead of one call per symbol.
     s2_added = 0
     try:
         r = requests.get(
@@ -2146,28 +2175,29 @@ def build_universe() -> list[str]:
         )
         if r.ok:
             actives = r.json().get("most_actives", [])
-            for a in actives:
-                sym   = a.get("symbol", "")
-                count = a.get("trade_count", 0)
-                if (sym.isalpha() and len(sym) <= 5
-                        and sym not in ETF_EXCLUSIONS
-                        and sym not in symbols
-                        and count >= 50000     # min 50k trades = real institutional interest
-                        and s2_added < 8):
-                    # Quick price check — skip penny stocks
-                    try:
-                        snap = requests.get(
-                            f"{DATA_URL}/stocks/{sym}/snapshot",
-                            headers=headers, timeout=5
-                        )
-                        if snap.ok:
-                            px = snap.json().get("latestTrade", {}).get("p", 0)
-                            if px >= 15:
-                                symbols.add(sym)
-                                s2_added += 1
-                    except Exception:
-                        pass
-            log.info(f"  Source 2 (trade-count): {s2_added} tickers added")
+            picks = [a.get("symbol", "") for a in actives
+                     if a.get("symbol", "").isalpha() and len(a.get("symbol", "")) <= 5
+                     and a.get("symbol", "") not in ETF_EXCLUSIONS
+                     and a.get("symbol", "") not in symbols
+                     and a.get("trade_count", 0) >= MOST_ACTIVE_MIN_TRADES]
+            prices = {}
+            if picks:
+                snap = requests.get(
+                    "https://data.alpaca.markets/v2/stocks/snapshots",
+                    headers=headers, params={"symbols": ",".join(picks), "feed": "sip"},
+                    timeout=10
+                )
+                if snap.ok:
+                    for sym, d in (snap.json() or {}).items():
+                        prices[sym] = ((d or {}).get("latestTrade") or {}).get("p", 0)
+            for sym in picks:
+                if s2_added >= 8:
+                    break
+                if prices.get(sym, 0) >= 15:   # no penny stocks
+                    symbols.add(sym)
+                    dynamic_order.append(sym)
+                    s2_added += 1
+            log.info(f"  Source 2 (trade-count ≥{MOST_ACTIVE_MIN_TRADES:,}): {s2_added} tickers added")
     except Exception as e:
         log.warning(f"Most-actives fetch failed: {e}")
 
@@ -2177,72 +2207,97 @@ def build_universe() -> list[str]:
     # IOT, SNOW, NET, DDOG, SHOP, ZS, PANW, HUBS, MSTR, ARM etc.
     # Claude scores these well when they're moving — they just need
     # to enter the universe first.
+    # Oct 12 2026: widened beyond tech/SaaS/fintech/chips on request —
+    # consumer staples, consumer, payments, healthcare and mega-caps added
+    # (Oct 12: SHOP/REGN/CRM/KO/PG/AXP led while the tech-heavy universe
+    # sold off, and none of them could enter). SQ → XYZ (Block's ticker).
     MOMENTUM_WATCHLIST = [
         # Enterprise SaaS / Cybersecurity
         "IOT","SNOW","NET","DDOG","ZS","PANW","HUBS","GTLB","BILL","MDB",
         # Fintech
-        "SQ","AFRM","COIN","HOOD",
+        "XYZ","AFRM","COIN","HOOD",
         # Semiconductors (mid-cap)
         "ARM","MRVL","QCOM","ON","SMCI",
         # Healthcare / Biotech
         "MRNA","BNTX","INCY","ACAD","RARE",
+        "REGN","AMGN","VRTX","GILD","MRK","JNJ","PFE","ABT","TMO","BSX","SYK","MDT",
         # Energy (mid-cap)
         "DVN","HAL","MPC","VLO",
         # Consumer / Retail
         "SHOP","ABNB","UBER","LYFT","DASH",
+        "SBUX","NKE","HD","LOW","TJX","BKNG",
+        # Consumer staples
+        "PG","KO","PEP","PM","MDLZ","CL",
+        # Payments
+        "AXP","PYPL","COF",
+        # Mega-caps
+        "AAPL","TSLA","ORCL","CRM","ADBE",
         # Industrials / Defence
         "HEI","AXON","TDG","LDOS",
     ]
     s3_added = 0
     try:
-        # Fetch 5-day bars for watchlist in one call
+        # Fetch ~8 days of daily bars for the whole watchlist in one call
         watch_syms = [s for s in MOMENTUM_WATCHLIST if s not in symbols and s not in ETF_EXCLUSIONS]
         if watch_syms:
             r = requests.get(
                 f"{DATA_URL}/stocks/bars",
                 headers=headers,
                 params={
-                    "symbols": ",".join(watch_syms[:40]),
+                    "symbols": ",".join(watch_syms),
                     "timeframe": "1Day",
-                    "limit": 5 * len(watch_syms[:40]),
+                    "limit": 10000,
                     "start": (datetime.now(ET) - timedelta(days=8)).strftime("%Y-%m-%d"),
                 },
                 timeout=15
             )
             if r.ok:
                 bars = r.json().get("bars", {})
+                ranked = []
                 for sym, sym_bars in bars.items():
                     if len(sym_bars) < 3:
                         continue
-                    # 5-day return
                     first_close = sym_bars[0].get("c", 0)
                     last_close  = sym_bars[-1].get("c", 0)
                     if first_close <= 0 or last_close < 10:
                         continue
-                    ret_5d = (last_close - first_close) / first_close
-                    # Volume check — above-average volume in last 2 days
-                    recent_vols = [b.get("v", 0) for b in sym_bars[-2:]]
-                    avg_vol     = sum(b.get("v", 0) for b in sym_bars) / len(sym_bars)
-                    vol_surge   = avg_vol > 0 and (sum(recent_vols)/len(recent_vols)) > avg_vol * 0.8
-                    # Add if up 3%+ over 5 days with decent volume
-                    if ret_5d >= 0.03 and vol_surge and sym not in symbols and s3_added < 8:
-                        symbols.add(sym)
-                        s3_added += 1
-                        log.info(f"  Source 3 (momentum): {sym} +{ret_5d*100:.1f}% 5d → added")
+                    ranked.append(((last_close - first_close) / first_close, sym))
+                # Oct 12 2026: the +3% 5-day gate is REMOVED on request (the
+                # fund/TA scoring decides). The 8 slots go to the strongest
+                # 5-day performers of the watchlist — ranking, not a minimum.
+                for ret_5d, sym in sorted(ranked, reverse=True):
+                    if s3_added >= 8:
+                        break
+                    if sym in symbols:
+                        continue
+                    symbols.add(sym)
+                    dynamic_order.append(sym)
+                    s3_added += 1
+                    log.info(f"  Source 3 (momentum): {sym} {ret_5d*100:+.1f}% 5d → added")
         log.info(f"  Source 3 (5-day momentum): {s3_added} tickers added")
     except Exception as e:
         log.warning(f"Momentum scan failed: {e}")
 
     total_dynamic = len(symbols) - len(CURATED_TICKERS)
-    clean = [s for s in symbols if s.isalpha() and len(s) <= 5 and s not in ETF_EXCLUSIONS]
+    if dynamic_only:
+        dyn = [s for s in dict.fromkeys(dynamic_order)
+               if s.isalpha() and len(s) <= 5 and s not in ETF_EXCLUSIONS]
+        log.info(f"Dynamic universe: {len(dyn)} tickers "
+                 f"[{added} movers, {s2_added} trade-active, {s3_added} momentum]")
+        return dyn[:24]
+
+    # Oct 12 2026: ordered (curated first) — previously built from an unordered
+    # set and cut at 55, which could silently drop curated tickers.
+    ordered = list(dict.fromkeys(list(CURATED_TICKERS) + dynamic_order))
+    clean = [s for s in ordered if s.isalpha() and len(s) <= 5 and s not in ETF_EXCLUSIONS]
     log.info(
         f"Universe: {len(clean)} tickers "
         f"({len(CURATED_TICKERS)} curated + {total_dynamic} dynamic "
         f"[{added} movers, {s2_added} trade-active, {s3_added} momentum])"
     )
-    return clean[:55]  # max 55 — allow headroom for all 3 sources
+    return clean[:len(CURATED_TICKERS) + 24]  # curated + up to 8+8+8 dynamic
 
-def run_premarket_scan():
+def run_premarket_scan(include_dynamic: bool = False):
     """
     Full universe scan — runs pre-market (Sunday 8pm or Monday 6am ET).
     Results cached for the trading day. Zero Claude calls during market hours
@@ -2264,7 +2319,11 @@ def run_premarket_scan():
     log.info("=" * 60)
     log.info("PRE-MARKET SCAN STARTING")
     log.info(f"  Time: {now_et.strftime('%A %Y-%m-%d %H:%M ET')}")
-    log.info(f"  Universe: {len(CURATED_TICKERS)} curated + up to 24 dynamic (8+8+8) = max 55 tickers")
+    if include_dynamic:
+        log.info(f"  Universe: {len(CURATED_TICKERS)} curated + up to 24 dynamic (8+8+8) = max {len(CURATED_TICKERS)+24} tickers")
+    else:
+        log.info(f"  Universe: {len(CURATED_TICKERS)} curated (dynamic universe is scored at "
+                 f"{DYNAMIC_SCAN_ET[0]}:{DYNAMIC_SCAN_ET[1]:02d} ET)")
     log.info("=" * 60)
 
     # Clear yesterday's cache
@@ -2273,7 +2332,10 @@ def run_premarket_scan():
     # Assess market state for RS calculation
     spy_chg = get_quote_change("SPY") or 0.0
 
-    universe   = build_universe()
+    # Oct 12 2026: the scheduled scan scores curated tickers only; the dynamic
+    # universe is built and scored at 9:31 from regular-session data
+    # (run_dynamic_scan). The emergency mid-session rescan still uses both.
+    universe   = build_universe() if include_dynamic else list(CURATED_TICKERS)
     candidates = []
     seen_symbols = set()  # deduplicate — LLY can appear in both curated and dynamic
     all_scored   = []     # track all scored results for diversity fallback
@@ -2325,6 +2387,68 @@ def run_premarket_scan():
         log.info(f"  #{candidates.index(c)+1} {c['symbol']}: {c['composite']:.2f} composite, {c['confidence']}% confidence")
     log.info("=" * 60)
 
+dynamic_scan_date = ""   # in-memory; the 9:31-9:35 window prevents re-runs after it
+
+def should_run_dynamic_scan() -> bool:
+    """True once per weekday between DYNAMIC_SCAN_ET (9:31) and the deadline."""
+    n = datetime.now(ET)
+    if n.weekday() >= 5 or dynamic_scan_date == n.strftime("%Y-%m-%d") or api_credit_exhausted:
+        return False
+    mins  = n.hour * 60 + n.minute
+    start = DYNAMIC_SCAN_ET[0] * 60 + DYNAMIC_SCAN_ET[1]
+    end   = DYNAMIC_SCAN_DEADLINE_ET[0] * 60 + DYNAMIC_SCAN_DEADLINE_ET[1]
+    return start <= mins < end
+
+def run_dynamic_scan():
+    """
+    Oct 12 2026. Build the dynamic universe from regular-session data at 9:31
+    ET and score it, stopping hard at DYNAMIC_SCAN_DEADLINE_ET (9:35). Names
+    that pass every gate are merged into today's signal cache. Sequential,
+    no sleep between tickers (~7s per Sonnet call, so ~24 tickers take ~3 min);
+    anything not scored by the deadline is skipped and logged. Open positions
+    keep their exit checks between tickers.
+    """
+    global signal_cache, signal_cache_time, signal_cache_date, dynamic_scan_date
+    now_et   = datetime.now(ET)
+    today    = now_et.strftime("%Y-%m-%d")
+    dynamic_scan_date = today
+    deadline = now_et.replace(hour=DYNAMIC_SCAN_DEADLINE_ET[0], minute=DYNAMIC_SCAN_DEADLINE_ET[1],
+                              second=0, microsecond=0)
+    log.info("=" * 60)
+    log.info(f"DYNAMIC UNIVERSE SCAN STARTING — deadline "
+             f"{DYNAMIC_SCAN_DEADLINE_ET[0]}:{DYNAMIC_SCAN_DEADLINE_ET[1]:02d} ET")
+    already = {c["symbol"] for c in signal_cache}
+    tickers = [t for t in build_universe(dynamic_only=True) if t not in already]
+    spy_chg = get_quote_change("SPY") or 0.0
+    scored, added_syms, skipped = 0, [], []
+    for i, symbol in enumerate(tickers):
+        # Don't start a call that would run past the deadline (~7-10s each)
+        if datetime.now(ET) >= deadline - timedelta(seconds=DYNAMIC_SCAN_CALL_MARGIN_SECS):
+            skipped = tickers[i:]
+            break
+        ta = fetch_technicals(symbol)
+        result = compute_signal(symbol, spy_chg, prefetched_ta=ta)
+        log_scored_ticker(symbol, result)
+        scored += 1
+        quick_exit_check()
+        if result and passes_gates(result):
+            signal_cache = [s for s in signal_cache if s["symbol"] != symbol] + [result]
+            added_syms.append(symbol)
+            log.info(f"  ✅ {symbol}: composite={result['composite']:.2f}, "
+                     f"confidence={result['confidence']}% — {result['thesis']}")
+        if api_credit_exhausted:
+            skipped = tickers[i + 1:]
+            break
+    signal_cache.sort(key=lambda x: x["composite"], reverse=True)
+    signal_cache_time = time.time()
+    if not signal_cache_date:
+        signal_cache_date = today
+    save_scan_state()
+    log.info(f"DYNAMIC SCAN COMPLETE at {datetime.now(ET).strftime('%H:%M:%S')} ET — "
+             f"{scored}/{len(tickers)} scored, {len(added_syms)} added {added_syms}"
+             + (f", {len(skipped)} not scored before the deadline {skipped}" if skipped else ""))
+    log.info("=" * 60)
+
 def should_run_premarket_scan() -> bool:
     """
     Returns True ONLY in designated pre-market windows.
@@ -2365,7 +2489,10 @@ def should_run_premarket_scan() -> bool:
     # Market open = 9:30am ET
     # Scan should start at: 9:30 - 20 min = 9:10am ET
     market_open_minutes   = 9 * 60 + 30          # 570
-    scan_start_minutes    = market_open_minutes - TOTAL_LEAD_MINUTES  # 560 = 9:20am
+    # Oct 12 2026: curated tickers only, 9:10-9:29 ET pre-market. The dynamic
+    # universe moved to its own 9:31 scan (should_run_dynamic_scan).
+    scan_start_minutes    = SCAN_START_ET[0] * 60 + SCAN_START_ET[1]   # 9:10
+    scan_window_end       = min(scan_start_minutes + SCAN_WINDOW_MINUTES, market_open_minutes)  # 9:30
     now_minutes           = hour * 60 + minute
 
     # ── Step 1: Time gate ──────────────────────────────────────
@@ -2375,17 +2502,19 @@ def should_run_premarket_scan() -> bool:
     if day == 6 and 20 <= hour < 22:
         in_window = True
 
-    # Weekday: dynamic window from scan_start_minutes to 9:29am
+    # Weekday: 9:10 ET up to the open. A restart after the window with no
+    # scan today is covered by the emergency mid-session rescan.
     elif 0 <= day <= 4:
-        market_open = (hour == 9 and minute >= 30) or hour >= 10
-        if not market_open and now_minutes >= scan_start_minutes:
+        if scan_start_minutes <= now_minutes < scan_window_end:
             in_window = True
 
     if not in_window:
         return False
 
     # ── Step 2: Already scanned today — don't repeat ──────────
-    if signal_cache_date == today and signal_cache:
+    # Oct 12 2026: date only (was: date AND non-empty cache) — a scan that
+    # found 0 signals must not re-run every cycle until 9:30.
+    if signal_cache_date == today:
         return False
 
     # In window + cache stale → scan
@@ -3849,7 +3978,9 @@ def run():
     log.info("=" * 60)
     log.info("SIGNAL Trading Bot started")
     log.info(f"  Universe:       {len(CURATED_TICKERS)} curated + up to 24 dynamic (8+8+8) = 55 max")
-    log.info(f"  Scan timing:    Sun 8pm ET / Mon-Fri 9:10am ET + restart rescan")
+    log.info(f"  Scan timing:    Sun 8pm ET / Mon-Fri {SCAN_START_ET[0]}:{SCAN_START_ET[1]:02d} ET curated, "
+             f"{DYNAMIC_SCAN_ET[0]}:{DYNAMIC_SCAN_ET[1]:02d}-{DYNAMIC_SCAN_DEADLINE_ET[0]}:{DYNAMIC_SCAN_DEADLINE_ET[1]:02d} ET dynamic "
+             f"(trade-count ≥{MOST_ACTIVE_MIN_TRADES:,}) + restart rescan")
     log.info(f"  Position size:  Kelly 10-16% by confidence (+{CATALYST_KELLY_BONUS*100:.0f}% strong catalyst, cap {CATALYST_KELLY_MAX*100:.0f}%)")
     # (accurate profit-target line logged further below — trail-only, no fixed target)
     log.info(f"  Sector cap:     Max {MAX_SECTOR_POSITIONS} positions per sector")
@@ -3923,6 +4054,11 @@ def run():
             if not is_market_open():
                 log_every("market_closed", 3600, f"Market closed ({now_et.strftime('%H:%M ET')}) — sleeping (logged hourly)")
                 time.sleep(SCAN_INTERVAL)
+                continue
+
+            # ── Dynamic-universe scan, 9:31-9:35 ET (Oct 12 2026) ──
+            if should_run_dynamic_scan():
+                run_dynamic_scan()
                 continue
 
             # ── Market open — monitor positions ────────────────
@@ -4021,7 +4157,7 @@ def run():
                             f"running one-time emergency rescan"
                         )
                         last_rescan_time = time.time()
-                        run_premarket_scan()
+                        run_premarket_scan(include_dynamic=True)
                     else:
                         log_every("cache_empty", 900,
                             f"  {open_slots} slot(s) available but signal cache is empty — "
