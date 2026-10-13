@@ -3,8 +3,8 @@ SIGNAL Trading Bot
 ==================
 Architecture:
   Pre-market scan (Sunday 8pm ET, or dynamic ~9:20am ET weekdays):
-    → Build up to 55-ticker universe (37 curated + up to 24 dynamic:
-      8 movers + 8 trade-count ≥4,000 + 8 five-day-momentum, scored 9:31-9:35 ET)
+    → Build up to 51-ticker universe (35 curated + up to 16 dynamic:
+      8 movers + 8 five-day-momentum, scored 9:30-9:35 ET; trade-count source removed Oct 13 2026)
     → Every ticker gets a fundamentals call (TA pre-filter removed Sep 30 2026)
     → Run fundamental scan (Claude + web search) on surviving tickers
     → Hard vetoes applied before scoring: ETF/leveraged-product,
@@ -69,6 +69,7 @@ Macro layer:
 
 import os
 import json
+import re
 import time
 import logging
 import requests
@@ -186,14 +187,13 @@ LAST_ENTRY_ET   = (15, 30) # (hour, minute) ET — no new cache entries at or af
 # TA/RS 40% is now recomputed LIVE at the moment of deployment.
 # Oct 12 2026: two-stage morning scan.
 #   9:10 ET  — curated tickers, pre-market (unchanged timing; ~6-7 min)
-#   9:31 ET  — dynamic universe (movers / trade-count / momentum) built from
+#   9:30 ET  — dynamic universe (movers / 5-day momentum) built from
 #              regular-session data and scored, HARD deadline 9:35 ET
 SCAN_START_ET           = (9, 10)  # curated pre-market scan start
 SCAN_WINDOW_MINUTES     = 20       # curated scan may start 9:10-9:29 ET
-DYNAMIC_SCAN_ET         = (9, 31)  # dynamic-universe scan start
+DYNAMIC_SCAN_ET         = (9, 30)  # dynamic-universe scan start (Oct 13 2026: 9:31 → 9:30)
 DYNAMIC_SCAN_DEADLINE_ET = (9, 35) # stop scoring dynamic tickers at this time, whatever is left
 DYNAMIC_SCAN_CALL_MARGIN_SECS = 12  # no new ticker starts within 12s of the deadline
-MOST_ACTIVE_MIN_TRADES  = 4000     # Source 2 threshold (was 50,000 — never filled at scan time)
 FIRST_ENTRY_ET  = (9, 45)  # no new cache entries before this — let the opening range form
 REVALIDATE_AT_DEPLOY = True # re-fetch TA + intraday RS and re-test the gates before every buy
 INTRADAY_RS_MAX = 0.75      # RS measured vs today's OPEN (not prior close), capped ±0.75 — tilts, never decides
@@ -494,6 +494,9 @@ ETF_EXCLUSIONS = {
     # Tradr 2X leveraged ETFs — new series, not recognisable by ticker name
     "CRDU","NVDU","AAPU","AMZU","MSFU","GOGU","METAU","TSLU",
     "AMZD","NVDD","AAPD","MSFD","GOGD","METAD","CRDL",
+    # Oct 13 2026: leveraged single-stock ETFs that reached the dynamic
+    # universe (Oct 7 and Oct 13 logs) before the name check caught them
+    "ASTN","UNHU","UNHG","RAMZ","NBIZ","APLZ","CIEX","CEGX",
 }
 
 # Suffixes that identify leveraged/inverse ETFs not in the exclusion list
@@ -503,12 +506,34 @@ ETF_NAME_KEYWORDS = [
     "leveraged", "inverse", "ultra", "bear", "bull etf",
     "daily etf", "proshares", "direxion", "tradr",
 ]
+# Oct 13 2026: matched as WHOLE WORDS (regex \b), not substrings — the old
+# substring test also matched ordinary company names ("ultra" in Ultra Clean
+# Holdings, "bear" in Build-A-Bear). The word ETF/ETN itself is now the
+# primary signal: every leveraged/inverse product seen so far carries it
+# ("Direxion Daily UNH Bull 2X ETF", "Tradr 2X Short NBIS Daily ETF").
+ETF_NAME_PATTERN = re.compile(
+    r"\b(etf|etn|exchange[- ]traded|2x|3x|leveraged|leverage shares|inverse|"
+    r"proshares|direxion|tradr|daily target)\b"
+)
+
+# Oct 13 2026: listing-exchange rule. In the US, ETFs/ETNs list almost
+# entirely on NYSE Arca ("ARCA") or Cboe BZX ("BATS"); operating companies
+# list on NYSE or Nasdaq. Verified on Alpaca: UNHU and SOXL = ARCA, ASTN =
+# BATS. (The "4-letter NYSE ticker = ETF / 3-letter Nasdaq ticker = ETF"
+# rule was NOT used — it is wrong: ABBV, DECK, EFXT are 4-letter NYSE
+# companies and AMD, HON 3-letter Nasdaq companies.) Nasdaq-listed ETFs such
+# as QQQ are still caught by ETF_EXCLUSIONS / the name pattern.
+ETF_LISTING_EXCHANGES = {"ARCA", "BATS"}
+
+def _asset_exchange(asset) -> str:
+    ex = getattr(asset, "exchange", "") or ""
+    return str(getattr(ex, "value", ex)).upper()
 
 def is_likely_etf(symbol: str) -> bool:
     """
-    Secondary ETF check using Alpaca asset data.
-    Catches new leveraged ETFs not yet in ETF_EXCLUSIONS.
-    Called once per ticker, result cached in fund_cache.
+    Secondary ETF check using Alpaca asset data: listing exchange (NYSE Arca /
+    Cboe BZX) OR an ETF word in the name. Catches new leveraged ETFs not yet
+    in ETF_EXCLUSIONS. Called once per ticker, result cached in fund_cache.
     """
     cache_key = f"etf_check_{symbol}"
     if cache_key in fund_cache:
@@ -518,9 +543,10 @@ def is_likely_etf(symbol: str) -> bool:
     try:
         asset = trade_client.get_asset(symbol)
         name  = (asset.name or "").lower()
-        is_etf = any(kw in name for kw in ETF_NAME_KEYWORDS)
+        exch  = _asset_exchange(asset)
+        is_etf = exch in ETF_LISTING_EXCHANGES or bool(ETF_NAME_PATTERN.search(name))
         if is_etf:
-            log.warning(f"  {symbol}: identified as ETF/leveraged product ('{asset.name}') — blocking")
+            log.warning(f"  {symbol}: identified as ETF/leveraged product ('{asset.name}', listed on {exch}) — blocking")
         fund_cache[cache_key] = (time.time(), is_etf)
         return is_etf
     except Exception:
@@ -539,6 +565,28 @@ SPAC_NAME_KEYWORDS = [
     "blank check", "spac", "special purpose acquisition",
     "capital corp ii", "capital corp iii",  # common serial-SPAC-sponsor naming
 ]
+# Oct 13 2026: whole-word match. The old substring test found "spac" inside
+# "SPACe Exploration Technologies Corp" and blocked SPCX as a SPAC. Same
+# keywords, but each must stand as its own word(s).
+SPAC_NAME_PATTERN = re.compile(
+    r"\b(" + "|".join(re.escape(k).replace(r"\ ", r"[\s-]+") for k in SPAC_NAME_KEYWORDS) + r")\b"
+)
+
+# Oct 13 2026: ticker-suffix rule for SPAC units, warrants and rights.
+# Nasdaq: 5-letter ticker whose 5th letter is U (unit), W (warrant) or R
+# (right), e.g. XYZU / XYZW / XYZR. NYSE: .U / .WS / .WT / .RT (also written
+# with "/" or "-"). The SPAC's common shares use the plain root ticker (e.g.
+# QETA), so the name check below is still needed for those.
+SPAC_SUFFIX_PATTERN = re.compile(r"^[A-Z]{1,5}[./-](U|UN|WS|WT|W|RT|R)$")
+
+def spac_suffix_reason(symbol: str) -> str:
+    sym = (symbol or "").upper()
+    if SPAC_SUFFIX_PATTERN.match(sym):
+        return f"ticker suffix {sym.split('.')[-1].split('/')[-1].split('-')[-1]} = SPAC unit/warrant/right"
+    if len(sym) == 5 and sym.isalpha() and sym[-1] in "UWR":
+        kind = {"U": "unit", "W": "warrant", "R": "right"}[sym[-1]]
+        return f"5-letter ticker ending in {sym[-1]} = SPAC {kind}"
+    return ""
 
 def is_likely_spac(symbol: str) -> bool:
     """
@@ -554,10 +602,16 @@ def is_likely_spac(symbol: str) -> bool:
         _, result = fund_cache[cache_key]
         return result
 
+    why = spac_suffix_reason(symbol)
+    if why:
+        log.warning(f"  {symbol}: identified as SPAC derivative ({why}) — blocking")
+        fund_cache[cache_key] = (time.time(), True)
+        return True
+
     try:
         asset = trade_client.get_asset(symbol)
         name  = (asset.name or "").lower()
-        is_spac = any(kw in name for kw in SPAC_NAME_KEYWORDS)
+        is_spac = bool(SPAC_NAME_PATTERN.search(name))
         if is_spac:
             log.warning(f"  {symbol}: identified as SPAC/blank-check company ('{asset.name}') — blocking")
         fund_cache[cache_key] = (time.time(), is_spac)
@@ -565,6 +619,20 @@ def is_likely_spac(symbol: str) -> bool:
     except Exception:
         fund_cache[cache_key] = (time.time(), False)
         return False
+
+def is_blocked_instrument(symbol: str) -> bool:
+    """Oct 13 2026: ETF + SPAC checks in one call, used by the dynamic-universe
+    sources BEFORE a ticker takes a slot (previously these only ran at scoring,
+    after the 8 slots were filled). Results are cached, so scoring does not
+    repeat the Alpaca lookup."""
+    if symbol in ETF_EXCLUSIONS:
+        return True
+    if is_likely_spac(symbol):     # suffix rule first — no API call needed
+        return True
+    if is_likely_etf(symbol):
+        ETF_EXCLUSIONS.add(symbol)
+        return True
+    return False
 
 # ── Runtime state ──────────────────────────────────────────────
 trades_today:       dict[str, int]   = defaultdict(int)
@@ -1817,7 +1885,10 @@ def earnings_within_3_days(fund: dict) -> tuple[bool, str]:
 # call. A CLEAN result is reused for 7 days; a FLAGGED result for only 1
 # day, so a false flag (AMD/CRWD-style) is re-checked tomorrow instead of
 # blocking the ticker for a week. Failed parses are never cached.
-STRUCTURAL_CACHE_FILE = "/tmp/structural_cache_v2.json"   # v2 (Oct 4 2026): fresh start — v1 held M&A-based flags
+STRUCTURAL_CACHE_FILE = "/tmp/structural_cache_v3.json"   # v3 (Oct 13 2026): fresh start — v2 held undated false flags (MA halt, HON reverse split, CRWD forward split)
+STRUCTURAL_REVERSE_SPLIT_DAYS = 90   # a reverse split counts only if within this many days
+STRUCTURAL_HALT_DAYS          = 7    # a stock-specific volatility halt counts only if this recent
+STRUCTURAL_IPO_DAYS           = 180
 STRUCTURAL_TTL_CLEAN   = 7 * 86400
 STRUCTURAL_TTL_FLAGGED = 1 * 86400
 structural_cache: dict = {}   # {symbol: [epoch, has_risk, reason]}
@@ -1848,6 +1919,29 @@ def cached_structural(symbol: str):
     ts, has_risk, reason = hit
     ttl = STRUCTURAL_TTL_FLAGGED if has_risk else STRUCTURAL_TTL_CLEAN
     return (has_risk, reason) if time.time() - ts < ttl else None
+
+def validate_structural_flag(result: dict, today: str) -> tuple[bool, str]:
+    """Oct 13 2026. Code-side check on a structural 'yes': criteria 2-4 need an
+    event date inside their look-back window. Returns (keep_flag, why_not)."""
+    try:
+        crit = int(result.get("criterion") or 0)
+    except (TypeError, ValueError):
+        crit = 0
+    if crit in (1, 5):
+        return True, ""
+    windows = {2: STRUCTURAL_IPO_DAYS, 3: STRUCTURAL_REVERSE_SPLIT_DAYS, 4: STRUCTURAL_HALT_DAYS}
+    if crit not in windows:
+        return False, f"no valid criterion number ({result.get('criterion')!r})"
+    raw = str(result.get("event_date") or "").strip()
+    try:
+        ev = datetime.strptime(raw[:10], "%Y-%m-%d").date()
+        td = datetime.strptime(today[:10], "%Y-%m-%d").date()
+    except ValueError:
+        return False, f"criterion {crit} without a valid event date ({raw!r})"
+    age = (td - ev).days
+    if age < 0 or age > windows[crit]:
+        return False, f"criterion {crit} event {raw} is {age} days old (window {windows[crit]})"
+    return True, ""
 
 def check_structural_risk(symbol: str, today: str) -> tuple[bool, str]:
     """
@@ -1880,16 +1974,29 @@ def check_structural_risk(symbol: str, today: str) -> tuple[bool, str]:
         return hit
 
     try:
+        # Oct 13 2026: stricter and dated. Haiku flagged MA ("circuit breaker
+        # halt Oct 12" — it traded normally), HON ("reverse split Jun 29") and
+        # CRWD ("forward stock split") on Oct 12-13. Each criterion now has an
+        # explicit look-back window counted from TODAY'S DATE, a forward split
+        # is explicitly not a risk, the model must give the event date, and
+        # the code below rejects any flag whose date is missing or outside
+        # the window.
         prompt = (
-            f"For the stock ticker {symbol} as of {today}, is there any structural "
-            "reason its current price may NOT reflect normal business fundamentals? "
-            "Specifically check: (1) is it a SPAC, blank-check company, or a SPAC "
-            "unit/right/warrant; (2) did it IPO within the last 180 days with a very "
-            "small public float; (3) did it recently do a reverse stock split; (4) was "
-            "trading recently halted for volatility (LULD circuit breaker); (5) is it "
-            "a thinly-traded foreign ADR with very low US daily volume. Mergers and "
-            "acquisitions are NOT structural risk here, whether this company is the "
-            "buyer or the target — do not flag them. "
+            f"Today's date is {today}. For the US-listed stock ticker {symbol}, check "
+            "ONLY these five structural risks, each measured back from today's date: "
+            f"(1) it is a SPAC, blank-check company, or a SPAC unit/right/warrant; "
+            f"(2) it IPO'd within the last {STRUCTURAL_IPO_DAYS} days AND has a very small public float; "
+            f"(3) it completed a REVERSE stock split within the last {STRUCTURAL_REVERSE_SPLIT_DAYS} days "
+            "(a forward split, stock dividend or spin-off is NOT a reverse split and is NOT a risk); "
+            f"(4) trading in THIS stock specifically was halted for volatility (LULD pause) within the "
+            f"last {STRUCTURAL_HALT_DAYS} days (market-wide halts, news-pending halts and ordinary "
+            "price drops do NOT count); "
+            "(5) it is a thinly-traded foreign ADR with very low US daily volume. "
+            "Mergers and acquisitions are NOT structural risk, whether this company is the "
+            "buyer or the target. Only flag a risk you can confirm from a dated source; if you "
+            "cannot find a specific dated event, answer false — do not guess or infer. "
+            "Large, heavily traded companies are almost never structural risks. "
+            "For criteria 2-4, event_date must be the date of the event (YYYY-MM-DD). "
             # Oct 1 2026: Haiku ignored the old "Return ONLY this JSON" line —
             # after searching it wrote a long point-by-point analysis of all
             # six criteria and hit the token cap on ~20 large caps before
@@ -1898,10 +2005,10 @@ def check_structural_risk(symbol: str, today: str) -> tuple[bool, str]:
             "Search as needed, then reply with ONLY one JSON object and nothing "
             "else: no analysis, no explanation, no list of the criteria, no "
             "text before or after it. Format: "
-            '{"structural_risk":false,"reason":""} '
-            "Set structural_risk to true if ANY of the above applies, and give a "
-            "short reason (under 10 words). Your entire reply must be that single "
-            "JSON object."
+            '{"structural_risk":false,"criterion":0,"event_date":"","reason":""} '
+            "Set structural_risk to true only if one of the five applies; criterion is "
+            "its number (1-5), event_date the event date for criteria 2-4, and reason a "
+            "short reason under 10 words. Your entire reply must be that single JSON object."
         )
         response = safe_claude_call(
             purpose=f"structural:{symbol}",
@@ -1915,6 +2022,11 @@ def check_structural_risk(symbol: str, today: str) -> tuple[bool, str]:
             return False, ""   # failed parse — fail open for this call, not cached
         has_risk = bool(result.get("structural_risk", False))
         reason   = result.get("reason") or ""
+        if has_risk:
+            ok, why = validate_structural_flag(result, today)
+            if not ok:
+                log.info(f"  {symbol}: structural flag DISCARDED ({why}) — model said: {reason}")
+                has_risk, reason = False, ""
         if has_risk:
             log.warning(f"  {symbol}: structural risk flagged — {reason} — blocking")
         structural_cache[symbol] = [time.time(), has_risk, reason]
@@ -2116,7 +2228,7 @@ def build_universe(dynamic_only: bool = False) -> list[str]:
                news catalysts. Already used. Filtered to price ≥ $15
                and min gain ≥ 3% to exclude penny stock noise.
 
-    Source 2 — Most active by TRADE COUNT (not volume): trade count
+    Source 2 — REMOVED Oct 13 2026. Was: most active by TRADE COUNT: trade count
                is a better proxy for institutional interest than raw
                volume. High trade count = many separate orders =
                institutional accumulation. Filters out leveraged ETFs
@@ -2129,6 +2241,7 @@ def build_universe(dynamic_only: bool = False) -> list[str]:
     """
     symbols = set(CURATED_TICKERS)
     dynamic_order: list[str] = []   # Oct 12 2026: keeps curated first, then dynamic in source order
+    skipped_instruments: list[str] = []   # Oct 13 2026: ETFs/SPACs skipped before taking a slot
     added   = 0
     headers = {"APCA-API-KEY-ID": ALPACA_KEY, "APCA-API-SECRET-KEY": ALPACA_SECRET}
     DATA_URL = "https://data.alpaca.markets/v1beta1"
@@ -2149,11 +2262,18 @@ def build_universe(dynamic_only: bool = False) -> list[str]:
                 px  = g.get("price", 0)
                 # Oct 12 2026: min-3%-gain gate REMOVED on request — the
                 # fund/TA scoring decides; only the $15 penny filter stays.
+                if added >= 8:
+                    break
                 if (sym.isalpha() and len(sym) <= 5
                         and sym not in ETF_EXCLUSIONS
                         and sym not in symbols
-                        and px >= 15           # no penny stocks
-                        and added < 8):
+                        and px >= 15):         # no penny stocks
+                    # Oct 13 2026: ETF/SPAC checks now run HERE, before the
+                    # ticker takes a slot; a blocked name is skipped and the
+                    # next gainer gets the slot.
+                    if is_blocked_instrument(sym):
+                        skipped_instruments.append(sym)
+                        continue
                     symbols.add(sym)
                     dynamic_order.append(sym)
                     added += 1
@@ -2161,45 +2281,11 @@ def build_universe(dynamic_only: bool = False) -> list[str]:
     except Exception as e:
         log.warning(f"Movers fetch failed: {e}")
 
-    # ── Source 2: Most active by TRADE COUNT ───────────────────
-    # Oct 12 2026: re-added at MOST_ACTIVE_MIN_TRADES = 4,000 (was 50,000,
-    # which almost never filled — at 9:31 even AAPL had ~22k trades). Price
-    # check now one batched snapshot call instead of one call per symbol.
+    # ── Source 2 (most active by trade count) REMOVED Oct 13 2026 ──
+    # On request. At ≥4,000 trades it mostly pulled in leveraged single-stock
+    # ETFs (5 of 8 slots on Oct 13: ASTN, UNHU, UNHG, RAMZ, NBIZ); those
+    # tickers are now in ETF_EXCLUSIONS.
     s2_added = 0
-    try:
-        r = requests.get(
-            f"{DATA_URL}/screener/stocks/most-actives",
-            headers=headers,
-            params={"by": "trades", "top": 50},
-            timeout=10
-        )
-        if r.ok:
-            actives = r.json().get("most_actives", [])
-            picks = [a.get("symbol", "") for a in actives
-                     if a.get("symbol", "").isalpha() and len(a.get("symbol", "")) <= 5
-                     and a.get("symbol", "") not in ETF_EXCLUSIONS
-                     and a.get("symbol", "") not in symbols
-                     and a.get("trade_count", 0) >= MOST_ACTIVE_MIN_TRADES]
-            prices = {}
-            if picks:
-                snap = requests.get(
-                    "https://data.alpaca.markets/v2/stocks/snapshots",
-                    headers=headers, params={"symbols": ",".join(picks), "feed": "sip"},
-                    timeout=10
-                )
-                if snap.ok:
-                    for sym, d in (snap.json() or {}).items():
-                        prices[sym] = ((d or {}).get("latestTrade") or {}).get("p", 0)
-            for sym in picks:
-                if s2_added >= 8:
-                    break
-                if prices.get(sym, 0) >= 15:   # no penny stocks
-                    symbols.add(sym)
-                    dynamic_order.append(sym)
-                    s2_added += 1
-            log.info(f"  Source 2 (trade-count ≥{MOST_ACTIVE_MIN_TRADES:,}): {s2_added} tickers added")
-    except Exception as e:
-        log.warning(f"Most-actives fetch failed: {e}")
 
     # ── Source 3: 5-day momentum — quality mid-cap watchlist ───
     # These are $5B-$50B companies in growth sectors that don't
@@ -2240,17 +2326,24 @@ def build_universe(dynamic_only: bool = False) -> list[str]:
         # Fetch ~8 days of daily bars for the whole watchlist in one call
         watch_syms = [s for s in MOMENTUM_WATCHLIST if s not in symbols and s not in ETF_EXCLUSIONS]
         if watch_syms:
+            # Oct 13 2026 BUG FIX: this called {DATA_URL}/stocks/bars with
+            # DATA_URL = v1beta1 (the screener base), which has no bars
+            # endpoint — every request failed silently and Source 3 never
+            # added a ticker (0 in 30 days of logs). Bars live under v2.
             r = requests.get(
-                f"{DATA_URL}/stocks/bars",
+                "https://data.alpaca.markets/v2/stocks/bars",
                 headers=headers,
                 params={
                     "symbols": ",".join(watch_syms),
                     "timeframe": "1Day",
                     "limit": 10000,
+                    "feed": "sip",
                     "start": (datetime.now(ET) - timedelta(days=8)).strftime("%Y-%m-%d"),
                 },
                 timeout=15
             )
+            if not r.ok:
+                log.warning(f"Momentum bars request failed: HTTP {r.status_code} — {r.text[:200]}")
             if r.ok:
                 bars = r.json().get("bars", {})
                 ranked = []
@@ -2270,6 +2363,9 @@ def build_universe(dynamic_only: bool = False) -> list[str]:
                         break
                     if sym in symbols:
                         continue
+                    if is_blocked_instrument(sym):
+                        skipped_instruments.append(sym)
+                        continue
                     symbols.add(sym)
                     dynamic_order.append(sym)
                     s3_added += 1
@@ -2278,13 +2374,14 @@ def build_universe(dynamic_only: bool = False) -> list[str]:
     except Exception as e:
         log.warning(f"Momentum scan failed: {e}")
 
+    if skipped_instruments:
+        log.info(f"  Skipped before taking a slot (ETF/SPAC): {skipped_instruments}")
     total_dynamic = len(symbols) - len(CURATED_TICKERS)
     if dynamic_only:
         dyn = [s for s in dict.fromkeys(dynamic_order)
                if s.isalpha() and len(s) <= 5 and s not in ETF_EXCLUSIONS]
-        log.info(f"Dynamic universe: {len(dyn)} tickers "
-                 f"[{added} movers, {s2_added} trade-active, {s3_added} momentum]")
-        return dyn[:24]
+        log.info(f"Dynamic universe: {len(dyn)} tickers [{added} movers, {s3_added} momentum]")
+        return dyn[:16]
 
     # Oct 12 2026: ordered (curated first) — previously built from an unordered
     # set and cut at 55, which could silently drop curated tickers.
@@ -2293,9 +2390,9 @@ def build_universe(dynamic_only: bool = False) -> list[str]:
     log.info(
         f"Universe: {len(clean)} tickers "
         f"({len(CURATED_TICKERS)} curated + {total_dynamic} dynamic "
-        f"[{added} movers, {s2_added} trade-active, {s3_added} momentum])"
+        f"[{added} movers, {s3_added} momentum])"
     )
-    return clean[:len(CURATED_TICKERS) + 24]  # curated + up to 8+8+8 dynamic
+    return clean[:len(CURATED_TICKERS) + 16]  # curated + up to 8 movers + 8 momentum
 
 def run_premarket_scan(include_dynamic: bool = False):
     """
@@ -2320,7 +2417,7 @@ def run_premarket_scan(include_dynamic: bool = False):
     log.info("PRE-MARKET SCAN STARTING")
     log.info(f"  Time: {now_et.strftime('%A %Y-%m-%d %H:%M ET')}")
     if include_dynamic:
-        log.info(f"  Universe: {len(CURATED_TICKERS)} curated + up to 24 dynamic (8+8+8) = max {len(CURATED_TICKERS)+24} tickers")
+        log.info(f"  Universe: {len(CURATED_TICKERS)} curated + up to 16 dynamic (8 movers + 8 momentum) = max {len(CURATED_TICKERS)+16} tickers")
     else:
         log.info(f"  Universe: {len(CURATED_TICKERS)} curated (dynamic universe is scored at "
                  f"{DYNAMIC_SCAN_ET[0]}:{DYNAMIC_SCAN_ET[1]:02d} ET)")
@@ -2390,7 +2487,7 @@ def run_premarket_scan(include_dynamic: bool = False):
 dynamic_scan_date = ""   # in-memory; the 9:31-9:35 window prevents re-runs after it
 
 def should_run_dynamic_scan() -> bool:
-    """True once per weekday between DYNAMIC_SCAN_ET (9:31) and the deadline."""
+    """True once per weekday between DYNAMIC_SCAN_ET (9:30) and the deadline."""
     n = datetime.now(ET)
     if n.weekday() >= 5 or dynamic_scan_date == n.strftime("%Y-%m-%d") or api_credit_exhausted:
         return False
@@ -3421,6 +3518,11 @@ def fast_exit_wait(total_seconds: float):
             return
         time.sleep(min(FAST_EXIT_INTERVAL, remaining))
         quick_exit_check()
+        # Oct 13 2026: wake the main loop as soon as the dynamic scan is due
+        # (Oct 13 it was due at 9:31 but only started at 9:32:44, waiting out
+        # the end-of-cycle sleep).
+        if should_run_dynamic_scan():
+            return
 
 def check_profit_targets(positions: dict, quiet: bool = False) -> list[str]:
     """
@@ -3977,10 +4079,10 @@ def run():
 
     log.info("=" * 60)
     log.info("SIGNAL Trading Bot started")
-    log.info(f"  Universe:       {len(CURATED_TICKERS)} curated + up to 24 dynamic (8+8+8) = 55 max")
+    log.info(f"  Universe:       {len(CURATED_TICKERS)} curated + up to 16 dynamic (8 movers + 8 momentum) = {len(CURATED_TICKERS)+16} max")
     log.info(f"  Scan timing:    Sun 8pm ET / Mon-Fri {SCAN_START_ET[0]}:{SCAN_START_ET[1]:02d} ET curated, "
              f"{DYNAMIC_SCAN_ET[0]}:{DYNAMIC_SCAN_ET[1]:02d}-{DYNAMIC_SCAN_DEADLINE_ET[0]}:{DYNAMIC_SCAN_DEADLINE_ET[1]:02d} ET dynamic "
-             f"(trade-count ≥{MOST_ACTIVE_MIN_TRADES:,}) + restart rescan")
+             f"(movers + 5-day momentum) + restart rescan")
     log.info(f"  Position size:  Kelly 10-16% by confidence (+{CATALYST_KELLY_BONUS*100:.0f}% strong catalyst, cap {CATALYST_KELLY_MAX*100:.0f}%)")
     # (accurate profit-target line logged further below — trail-only, no fixed target)
     log.info(f"  Sector cap:     Max {MAX_SECTOR_POSITIONS} positions per sector")
