@@ -125,6 +125,10 @@ FUND_WEIGHT     = 100 - TECH_WEIGHT
 # Raising the floor cuts trade count but concentrates capital in the
 # higher-conviction setups the composite score is actually meant to find.
 MIN_FUND_SCORE  = float(os.environ.get("MIN_FUND_SCORE", "5.2"))  # Oct 7 2026: raw fundScore floor (before the confidence discount) on every entry path — V was bought Oct 6 on fund 2.3 carried by TA
+# Oct 15 2026: confidence floor (Claude's confidence in its fund score, 0-100)
+# on every entry path, in addition to the fund-score floor. New env name on
+# purpose — an old MIN_CONFIDENCE=85 setting may still exist in Render.
+MIN_FUND_CONFIDENCE = float(os.environ.get("MIN_FUND_CONFIDENCE", "69"))  # Oct 15 2026: 70 → 69 on request
 MIN_COMPOSITE   = float(os.environ.get("MIN_COMPOSITE", "3.4"))  # Oct 1 2026: 4.0 → 3.4 (Sonnet 5.5 scores more conservatively; best Oct 1 composites were 3.84-3.94)
 MAX_TRADES_DAY  = int(os.environ.get("MAX_TRADES_PER_DAY", "10"))
 MAX_DRAWDOWN    = float(os.environ.get("MAX_DRAWDOWN_PCT", "0.15"))
@@ -2084,6 +2088,7 @@ def passes_gates(result: dict | None) -> bool:
         and result["signal"] == "BUY"
         and result["composite"] >= MIN_COMPOSITE
         and float(result.get("fundScore", 0) or 0) >= MIN_FUND_SCORE
+        and float(result.get("confidence", 0) or 0) >= MIN_FUND_CONFIDENCE
         and not result.get("blocked_reason")
     )
 
@@ -2102,6 +2107,8 @@ def log_scored_ticker(symbol: str, result: dict | None):
         reasons.append(f"composite < {MIN_COMPOSITE}")
     if float(result.get("fundScore", 0) or 0) < MIN_FUND_SCORE:
         reasons.append(f"fund < {MIN_FUND_SCORE}")
+    if float(result.get("confidence", 0) or 0) < MIN_FUND_CONFIDENCE:
+        reasons.append(f"confidence < {MIN_FUND_CONFIDENCE:.0f}%")
     if result.get("blocked_reason"):
         reasons.append("BLOCKED by " + result["blocked_reason"])
     verdict = "QUALIFIES" if not reasons else "fails: " + ", ".join(reasons)
@@ -2848,6 +2855,32 @@ def register_reentry_cooldown(symbol: str, exit_reason: str, exit_price: float):
 
     save_cooldowns()  # persist across restarts (best-effort)
 
+# Oct 14 2026: share classes of the SAME company are one position. Oct 13 the
+# bot bought GOOGL, Oct 14 a news trigger bought GOOG — ~$21k (~22% of the
+# account) in Alphabet, with every guard treating them as unrelated tickers.
+# Used by the duplicate-position and open-order guards in place_buy() and by
+# the re-entry cooldown check. Only plain-letter tickers are listed (the bot
+# never trades dotted tickers such as BRK.B).
+SHARE_CLASS_GROUPS = [
+    {"GOOG", "GOOGL"},          # Alphabet
+    {"FOX", "FOXA"},            # Fox Corp
+    {"NWS", "NWSA"},            # News Corp
+    {"UA", "UAA"},              # Under Armour
+    {"Z", "ZG"},                # Zillow
+    {"LBRDA", "LBRDK"},         # Liberty Broadband
+    {"LBTYA", "LBTYK"},         # Liberty Global
+    {"FWONA", "FWONK"},         # Liberty Formula One
+    {"BATRA", "BATRK"},         # Atlanta Braves Holdings
+    {"LILA", "LILAK"},          # Liberty Latin America
+]
+
+def same_company_symbols(symbol: str) -> set[str]:
+    """All tickers for the same company as `symbol` (including itself)."""
+    for group in SHARE_CLASS_GROUPS:
+        if symbol in group:
+            return set(group)
+    return {symbol}
+
 def check_reentry_allowed(symbol: str, current_price: float) -> tuple[bool, str]:
     """
     Checks Options 1, 3, 5 before allowing re-entry.
@@ -2858,7 +2891,14 @@ def check_reentry_allowed(symbol: str, current_price: float) -> tuple[bool, str]
     that have genuinely moved on (e.g. AMD $526 → $581 weeks later).
     """
     if symbol not in reentry_cooldown:
-        return True, ""
+        # Oct 14 2026: a cooldown on another share class of the same company
+        # (e.g. GOOGL stopped out) also blocks this one (GOOG).
+        sib = next((x for x in same_company_symbols(symbol)
+                    if x != symbol and x in reentry_cooldown), None)
+        if sib is None:
+            return True, ""
+        allowed, why = check_reentry_allowed(sib, current_price)
+        return allowed, ("" if allowed else f"{why} — same company as {sib}")
 
     cd      = reentry_cooldown[symbol]
     now     = time.time()
@@ -3034,6 +3074,9 @@ def revalidate_candidate(candidate: dict) -> tuple[str, dict | None, str]:
     fund_score = candidate.get("fundScore", 0)
     if float(fund_score or 0) < MIN_FUND_SCORE:
         return "drop", None, f"fund score {float(fund_score or 0):.1f} < {MIN_FUND_SCORE} minimum"
+    if float(candidate.get("confidence", 0) or 0) < MIN_FUND_CONFIDENCE:
+        return "drop", None, (f"confidence {float(candidate.get('confidence', 0) or 0):.0f}% "
+                              f"< {MIN_FUND_CONFIDENCE:.0f}% minimum")
     fund_adj   = confidence_adjusted_fund(fund_score, candidate.get("confidence", 50))
     # Oct 2 2026: the pre-market relative-strength bonus/penalty from the scan
     # (±1.5, vs yesterday's close) is now KEPT at buy time, added to the live
@@ -3152,14 +3195,20 @@ def place_buy(symbol: str, qty: int, composite: float | None = None,
         if symbol in existing:
             log.warning(f"[SKIP] {symbol} already held — duplicate position blocked")
             return False
+        # Oct 14 2026: another share class of the same company counts as held
+        sibs_held = [x for x in same_company_symbols(symbol) if x != symbol and x in existing]
+        if sibs_held:
+            log.warning(f"[SKIP] {symbol}: same company as held {sibs_held} — duplicate company position blocked")
+            return False
 
         # ── Layer 2: Open orders guard ────────────────────────
         # Prevents buying if a pending buy order already exists for same ticker
         try:
             open_orders = trade_client.get_orders()
+            company = same_company_symbols(symbol)
             for o in open_orders:
-                if o.symbol == symbol and o.side.value == "buy":
-                    log.warning(f"[SKIP] {symbol} has pending buy order — duplicate order blocked")
+                if o.symbol in company and o.side.value == "buy":
+                    log.warning(f"[SKIP] {symbol} has pending buy order ({o.symbol}) — duplicate order blocked")
                     return False
         except Exception:
             pass  # if check fails, proceed cautiously
@@ -4110,7 +4159,7 @@ def run():
     log.info(f"  Max drawdown:   {MAX_DRAWDOWN*100:.0f}%")
     log.info(f"  90-day audit:   Volume, TA alignment, win rate")
     log.info(f"  Held-position news review: bearish/material-adverse news on a HELD symbol re-runs fundamentals, can trigger early exit")
-    log.info(f"  Entry gates: composite ≥ {MIN_COMPOSITE}, fund score ≥ {MIN_FUND_SCORE}; no sector-diversity adds; no periodic stale-hold re-check")
+    log.info(f"  Entry gates: composite ≥ {MIN_COMPOSITE}, fund score ≥ {MIN_FUND_SCORE}, confidence ≥ {MIN_FUND_CONFIDENCE:.0f}%; no sector-diversity adds; no periodic stale-hold re-check")
     log.info(f"  Pause:          set PAUSED=true in Render")
     log.info("=" * 60)
 
